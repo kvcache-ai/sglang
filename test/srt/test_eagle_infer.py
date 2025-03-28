@@ -24,6 +24,7 @@ from sglang.test.test_utils import (
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
     run_logprob_check,
 )
@@ -33,7 +34,7 @@ prefill_tolerance = 5e-2
 decode_tolerance: float = 5e-2
 
 
-class TestEAGLEEngine(unittest.TestCase):
+class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
         "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
         "speculative_draft_model_path": DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
@@ -42,7 +43,7 @@ class TestEAGLEEngine(unittest.TestCase):
         "speculative_eagle_topk": 4,
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
     }
     NUM_CONFIGS = 3
 
@@ -158,7 +159,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
         "speculative_num_draft_tokens": 8,
         "speculative_token_map": "thunlp/LLaMA3-Instruct-8B-FR-Spec/freq_32768.pt",
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
@@ -173,13 +174,13 @@ class TestEAGLE3Engine(TestEAGLEEngine):
         "speculative_eagle_topk": 16,
         "speculative_num_draft_tokens": 64,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
+        "cuda_graph_max_bs": 4,
         "dtype": "float16",
     }
     NUM_CONFIGS = 1
 
 
-class TestEAGLEServer(unittest.TestCase):
+class TestEAGLEServer(CustomTestCase):
     PROMPTS = [
         "[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nToday is a sunny day and I like[/INST]"
         '[INST] <<SYS>>\\nYou are a helpful assistant.\\n<</SYS>>\\nWhat are the mental triggers in Jeff Walker\'s Product Launch Formula and "Launch" book?[/INST]',
