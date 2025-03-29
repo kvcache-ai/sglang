@@ -40,11 +40,11 @@ class KVManager:
             0: (np.array([0], dtype=np.int32), None)
         }
         self.server_socket = zmq.Context().socket(zmq.PULL)
-        self.register_to_engine()
+        self.register_buffer_to_engine()
         self.prefill_thread_started = False
         self.decode_thread_started = False
 
-    def register_to_engine(self):
+    def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(self.kv_args.kv_data_ptrs,
                                             self.kv_args.kv_data_lens):
             self.engine.register(kv_data_ptr, kv_data_len)
@@ -73,6 +73,7 @@ class KVManager:
 
             decode_key_layer_ptr = dst_ptrs[layer_id]
             decode_value_layer_ptr = dst_ptrs[layer_num + layer_id]
+            # TODO: Maybe combine multiple contiguous indices into one transfer_sync op
             for prefill_index, decode_index in zip(prefill_indices,
                                                    dst_kv_indices):
                 prefill_key_addr = prefill_key_layer_ptr + prefill_index * key_item_len
@@ -95,7 +96,7 @@ class KVManager:
             0] + prefill_aux_index * aux_item_len
         decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
         # TODO: mooncake transfer engine can do async transfer. Do async later
-        # Not sure about the size of aux data, maybe can transfer it using zm
+        # Not sure about the amount of aux data, maybe transfer it by zmq is more effective
         self.engine.transfer_sync(endpoint, prefill_aux_addr, decode_aux_addr,
                                   aux_item_len)
 

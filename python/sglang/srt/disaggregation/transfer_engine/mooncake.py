@@ -47,7 +47,7 @@ class MooncakeTransferEngine:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run SGLang with MooncakeConnector.") from e
+                "to run SGLang with MooncakeTransferEngine.") from e
 
         self.engine = msa.TransferEngine()
 
@@ -95,8 +95,11 @@ class MooncakeTransferEngine:
     def transfer_sync(self, remote_url: str, buffer: int,
                       peer_buffer_address: int, length: int) -> int:
         """Synchronously transfer data to the specified address."""
-        ret = self.engine.transferSync(remote_url, buffer, peer_buffer_address,
-                                       length)
+
+        write_op = self.engine.TransferOpcode.WRITE
+        ret = self.engine.transferSyncExt(remote_url, buffer,
+                                          peer_buffer_address, length,
+                                          write_op)
         if ret < 0:
             logger.error("Transfer Return Error")
             raise Exception("Transfer Return Error")
