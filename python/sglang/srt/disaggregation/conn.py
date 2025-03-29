@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from typing import Optional, Dict, Tuple
-from sglang.srt.disaggregation.transfer_engine.mooncake_conn import MooncakeTransferEngine
+from sglang.srt.disaggregation.transfer_engine.mooncake import MooncakeTransferEngine
 import threading
 from functools import cache
 
