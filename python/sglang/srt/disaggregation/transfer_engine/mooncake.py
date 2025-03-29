@@ -1,11 +1,11 @@
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
-import zmq
 from typing import Union
 import logging
 import os
 import json
+
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class MooncakeTransferEngineConfig:
@@ -37,18 +37,19 @@ class MooncakeTransferEngineConfig:
                 "The environment variable 'MOONCAKE_CONFIG_PATH' is not set.")
         return MooncakeTransferEngineConfig.from_file(config_file_path)
 
+
 class MooncakeTransferEngine:
+
     def __init__(self):
         try:
-            import mooncake_vllm_adaptor as mva
-            # TODO: will design a specific adapter for sglang later
+            import mooncake_sglang_adaptor as msa
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run vLLM with MooncakeConnector.") from e
+                "to run SGLang with MooncakeConnector.") from e
 
-        self.engine = mva.mooncake_vllm_adaptor()
+        self.engine = msa.TransferEngine()
 
         try:
             self.config = MooncakeTransferEngineConfig.load_from_env()
@@ -91,11 +92,11 @@ class MooncakeTransferEngine:
             self.engine.initializeExt(localhost_name, metadata_server,
                                       protocol, device_name, metadata_backend)
 
-    def transfer_sync(self, remote_url: str, buffer: int, peer_buffer_address: int,
-                      length: int) -> int:
+    def transfer_sync(self, remote_url: str, buffer: int,
+                      peer_buffer_address: int, length: int) -> int:
         """Synchronously transfer data to the specified address."""
-        ret = self.engine.transferSync(remote_url, buffer,
-                                       peer_buffer_address, length)
+        ret = self.engine.transferSync(remote_url, buffer, peer_buffer_address,
+                                       length)
         if ret < 0:
             logger.error("Transfer Return Error")
             raise Exception("Transfer Return Error")
