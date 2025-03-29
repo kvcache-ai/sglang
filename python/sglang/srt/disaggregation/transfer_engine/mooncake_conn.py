@@ -41,6 +41,7 @@ class MooncakeTransferEngine:
     def __init__(self):
         try:
             import mooncake_vllm_adaptor as mva
+            # TODO: will design a specific adapter for sglang later
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "

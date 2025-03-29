@@ -31,6 +31,7 @@ KVSENDER_POLLING_PORT = 17788
 KVRECIVER_POLLING_PORT = 17789
 
 class KVManager:
+    # TODO: make it general and support multiple transfer backend before merging
     def __init__(self, args: KVArgs):
         self.engine = MooncakeTransferEngine()
         self.kv_args = args
@@ -67,10 +68,12 @@ class KVManager:
             for prefill_index, decode_index in zip(prefill_kv_indices, decode_kv_indices):
                 prefill_key_addr = prefill_key_layer_ptr + prefill_index * key_item_len
                 decode_key_addr = decode_key_layer_ptr + decode_index * key_item_len
+                # TODO: mooncake transfer engine can do async transfer. Do async later
                 self.engine.transfer_sync(endpoint, decode_key_addr, prefill_key_addr, key_item_len)
 
                 prefill_value_addr = prefill_value_layer_ptr + prefill_index * value_item_len
                 decode_value_addr = decode_key_layer_ptr + decode_index * value_item_len
+                # TODO: mooncake transfer engine can do async transfer. Do async later
                 self.engine.transfer_sync(endpoint, decode_value_addr, prefill_value_addr, value_item_len)
 
     def get_aux(self, endpoint: str, bootstrap_room: int, prefill_aux_ptrs: list[int], prefill_aux_index: int):
@@ -78,6 +81,8 @@ class KVManager:
         aux_item_len = self.kv_args.aux_data_lens[0]
         decode_aux_addr = self.kv_args.aux_data_ptrs[0] + decode_aux_index * aux_item_len
         prefill_aux_addr = prefill_aux_ptrs[0] + prefill_aux_index * aux_item_len
+        # TODO: mooncake transfer engine can do async transfer. Do async later
+        # Not sure about the size of aux data, maybe can transfer it using zmq
         self.engine.transfer_sync(endpoint, decode_aux_addr, prefill_aux_addr, aux_item_len)
 
     def start_prefill_thread(self):
@@ -187,6 +192,7 @@ class KVSender:
         if self.has_sent is False:
             if self.kv_mgr.has_finished(self.bootstrap_room):
                 self.has_sent = True
+                return KVPoll.Success
             return KVPoll.WaitingForInput
         else:
             return KVPoll.Success
@@ -229,6 +235,7 @@ class KVReceiver:
         if self.has_init is False:
             if self.kv_mgr.has_finished(self.bootstrap_room):
                 self.has_init = True
+                return KVPoll.Success
             return KVPoll.WaitingForInput
         else:
             return KVPoll.Success
