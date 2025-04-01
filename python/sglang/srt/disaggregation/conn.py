@@ -249,6 +249,9 @@ class KVManager:
 
         return self.request_status[bootstrap_room]
 
+    def set_status(self, bootstrap_room: int, status: KVPoll):
+        self.request_status[bootstrap_room] = status
+
     def get_localhost(self):
         return self.engine.get_localhost()
 
@@ -257,6 +260,7 @@ class KVSender:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
+        self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
         self.aux_index = None
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
@@ -287,6 +291,7 @@ class KVReceiver:
             + str(KVSENDER_POLLING_PORT + self.kv_mgr.kv_args.engine_rank)
         )
         self.decode_ip = self.kv_mgr.get_localhost()
+        self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
 
     @cache
     def _connect(self, endpoint: str):
