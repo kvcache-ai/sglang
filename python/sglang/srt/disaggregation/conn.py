@@ -113,6 +113,7 @@ class KVManager:
                 )
                 if status != 0:
                     return status
+        return 0
 
     def send_aux(
         self,
@@ -123,13 +124,13 @@ class KVManager:
     ):
         aux_item_len = self.kv_args.aux_data_lens[0]
         prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
+            self.kv_args.aux_data_ptrs[0] + prefill_aux_index
         )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
+        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index
         # TODO: mooncake transfer engine can do async transfer. Do async later
         # Not sure about the amount of aux data, maybe transfer it by zmq is more effective
         status = self.engine.transfer_sync(
-            endpoint, prefill_aux_addr, decode_aux_addr, aux_item_len
+            endpoint, prefill_aux_addr, decode_aux_addr, 1
         )
         return status
 
@@ -187,11 +188,11 @@ class KVManager:
                 self.transfer_event.clear()
                 bootstrap_room_ready = self.request_pool.keys()
                 bootstrap_room_request = self.waiting_pool.keys()
-                for room in bootstrap_room_request:
-                    if room not in bootstrap_room_ready:
+                for room in list(bootstrap_room_request):
+                    if room not in list(bootstrap_room_ready):
                         continue
                     status = KVPoll.Transferring
-                    self.req_status[room] = status
+                    self.request_status[room] = status
                     (
                         endpoint,
                         dst_ptrs,
@@ -214,7 +215,7 @@ class KVManager:
                         status = KVPoll.Failed
                     else:
                         status = KVPoll.Success
-                    self.req_status[room] = status
+                    self.request_status[room] = status
                     self.sync_status_to_decode_endpoint(endpoint, room)
 
         threading.Thread(target=transfer_thread).start()
@@ -249,6 +250,9 @@ class KVManager:
 
         return self.request_status[bootstrap_room]
 
+    def set_status(self, bootstrap_room: int, status: KVPoll):
+        self.request_status[bootstrap_room] = status
+
     def get_localhost(self):
         return self.engine.get_localhost()
 
@@ -257,6 +261,7 @@ class KVSender:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
+        self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
         self.aux_index = None
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
@@ -287,6 +292,7 @@ class KVReceiver:
             + str(KVSENDER_POLLING_PORT + self.kv_mgr.kv_args.engine_rank)
         )
         self.decode_ip = self.kv_mgr.get_localhost()
+        self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
 
     @cache
     def _connect(self, endpoint: str):
