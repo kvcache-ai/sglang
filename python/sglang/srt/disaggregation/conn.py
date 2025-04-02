@@ -5,6 +5,9 @@ import struct
 import threading
 from functools import cache
 from typing import Dict, Optional, Tuple
+from aiohttp import web
+import threading
+import asyncio
 
 import numpy as np
 import numpy.typing as npt
@@ -113,6 +116,7 @@ class KVManager:
                 )
                 if status != 0:
                     return status
+        return 0
 
     def send_aux(
         self,
@@ -121,7 +125,7 @@ class KVManager:
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
     ):
-        aux_item_len = self.kv_args.aux_data_lens[0]
+        aux_item_len = self.kv_args.aux_item_lens[0]
         prefill_aux_addr = (
             self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
         )
@@ -187,11 +191,11 @@ class KVManager:
                 self.transfer_event.clear()
                 bootstrap_room_ready = self.request_pool.keys()
                 bootstrap_room_request = self.waiting_pool.keys()
-                for room in bootstrap_room_request:
-                    if room not in bootstrap_room_ready:
+                for room in list(bootstrap_room_request):
+                    if room not in list(bootstrap_room_ready):
                         continue
                     status = KVPoll.Transferring
-                    self.req_status[room] = status
+                    self.request_status[room] = status
                     (
                         endpoint,
                         dst_ptrs,
@@ -214,7 +218,7 @@ class KVManager:
                         status = KVPoll.Failed
                     else:
                         status = KVPoll.Success
-                    self.req_status[room] = status
+                    self.request_status[room] = status
                     self.sync_status_to_decode_endpoint(endpoint, room)
 
         threading.Thread(target=transfer_thread).start()
@@ -326,7 +330,83 @@ class KVReceiver:
 
 
 class KVBootstrapServer:
+    def __init__(self, port: int):
+        self.port = port
+        self.app = web.Application()
+        self.store = dict()
+        self.lock = asyncio.Lock()
+        self._setup_routes()
+    
+    def run(self):
+        self.thread = threading.Thread(target=self._run_server, daemon=True)
+        self.thread.start()
 
-    def __init__(self, port: int): ...
+    def _setup_routes(self):
+        self.app.router.add_route('*', '/metadata', self._handle_metadata)
+
+    async def _handle_metadata(self, request: web.Request):
+        key = request.query.get('key', '')
+
+        if request.method == 'GET':
+            return await self._handle_get(key)
+        elif request.method == 'PUT':
+            return await self._handle_put(key, request)
+        elif request.method == 'DELETE':
+            return await self._handle_delete(key)
+        return web.Response(text='Method not allowed', status=405,
+                          content_type='application/json')
+
+    async def _handle_get(self, key):
+        async with self.lock:
+            value = self.store.get(key)
+        if value is None:
+            return web.Response(text='metadata not found', status=404,
+                              content_type='application/json')
+        return web.Response(body=value, status=200,
+                          content_type='application/json')
+
+    async def _handle_put(self, key, request):
+        data = await request.read()
+        async with self.lock:
+            self.store[key] = data
+        return web.Response(text='metadata updated', status=200,
+                          content_type='application/json')
+
+    async def _handle_delete(self, key):
+        async with self.lock:
+            if key not in self.store:
+                return web.Response(text='metadata not found', status=404,
+                                  content_type='application/json')
+            del self.store[key]
+        return web.Response(text='metadata deleted', status=200,
+                          content_type='application/json')
+    def _run_server(self):
+        try:
+            # Event Loop
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            
+            self._runner = web.AppRunner(self.app)
+            self._loop.run_until_complete(self._runner.setup())
+            
+            site = web.TCPSite(self._runner, port=self.port)
+            self._loop.run_until_complete(site.start())
+            self._loop.run_forever()
+        except Exception as e:
+            print(f"Server error: {str(e)}")
+        finally:
+            # Cleanup
+            self._loop.run_until_complete(self._runner.cleanup())
+            self._loop.close()
+
+    def close(self):
+        """Shuttedown"""
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            print("Stopping server loop...")
+        
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
+            print("Server thread stopped")
 
     def poll(self) -> KVPoll: ...
