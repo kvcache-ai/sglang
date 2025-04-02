@@ -125,15 +125,15 @@ class KVManager:
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
     ):
-        aux_item_len = self.kv_args.aux_data_lens[0]
+        aux_item_len = self.kv_args.aux_item_lens[0]
         prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index
+            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
         )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index
+        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
         # TODO: mooncake transfer engine can do async transfer. Do async later
         # Not sure about the amount of aux data, maybe transfer it by zmq is more effective
         status = self.engine.transfer_sync(
-            endpoint, prefill_aux_addr, decode_aux_addr, 1
+            endpoint, prefill_aux_addr, decode_aux_addr, aux_item_len
         )
         return status
 
