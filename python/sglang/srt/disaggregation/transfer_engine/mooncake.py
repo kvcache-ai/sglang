@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MooncakeTransferEngineConfig:
-    localhost_name: str
+    local_hostname: str
     metadata_backend: Union[str, None]
     metadata_server: str
     protocol: str
@@ -21,7 +21,7 @@ class MooncakeTransferEngineConfig:
         with open(file_path) as fin:
             config = json.load(fin)
         return MooncakeTransferEngineConfig(
-            localhost_name=config.get("localhost_name", None),
+            local_hostname=config.get("local_hostname", None),
             metadata_backend=config.get("metadata_backend", None),
             metadata_server=config.get("metadata_server"),
             protocol=config.get("protocol", "rdma"),
@@ -66,7 +66,7 @@ class MooncakeTransferEngine:
         self.config = MooncakeTransferEngineConfig.load_from_env()
 
         self.initialize(
-            self.config.localhost_name,
+            self.config.local_hostname,
             self.config.metadata_server,
             self.config.protocol,
             self.config.device_name,
@@ -81,7 +81,7 @@ class MooncakeTransferEngine:
 
     def initialize(
         self,
-        localhost_name: str,
+        local_hostname: str,
         metadata_server: str,
         protocol: str,
         device_name: str,
@@ -90,7 +90,7 @@ class MooncakeTransferEngine:
         """Initialize the mooncake instance."""
         if metadata_backend is None:
             self.engine.initialize(
-                localhost_name, metadata_server, protocol, device_name
+                local_hostname, metadata_server, protocol, device_name
             )
         else:
             supported_backend = ["etcd", "redis"]
@@ -102,7 +102,7 @@ class MooncakeTransferEngine:
                 )
 
             self.engine.initializeExt(
-                localhost_name, metadata_server, protocol, device_name, metadata_backend
+                local_hostname, metadata_server, protocol, device_name, metadata_backend
             )
 
     def transfer_sync(
@@ -120,4 +120,4 @@ class MooncakeTransferEngine:
         return ret
 
     def get_localhost(self):
-        return self.config.localhost_name
+        return self.config.local_hostname
