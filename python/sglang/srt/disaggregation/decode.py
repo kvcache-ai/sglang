@@ -29,6 +29,7 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.disaggregation.conn import KVArgs, KVManager, KVPoll, KVReceiver
 from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
     ReqToMetadataIdxAllocator,
     poll_and_all_reduce,
 )
@@ -87,6 +88,7 @@ class DecodePreallocQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
+        self.disaggregation_mode = DisaggregationMode("decode")
 
         self.num_reserved_decode_tokens = 512
 
@@ -115,7 +117,7 @@ class DecodePreallocQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args, "Decode")
+        kv_manager = KVManager(kv_args, self.disaggregation_mode)
         return kv_manager
 
     def add(self, req: Req) -> None:

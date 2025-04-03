@@ -14,6 +14,7 @@ import numpy.typing as npt
 import zmq
 
 from sglang.srt.disaggregation.transfer_engine.mooncake import MooncakeTransferEngine
+from sglang.srt.disaggregation.utils import DisaggregationMode
 
 logger = logging.getLogger(__name__)
 
@@ -45,20 +46,22 @@ KVRECIVER_POLLING_PORT = 17789
 
 class KVManager:
     # TODO: make it general and support multiple transfer backend before merging
-    def __init__(self, args: KVArgs, pd_role: str):
+    def __init__(self, args: KVArgs, disaggregation_mode: DisaggregationMode):
         self.engine = MooncakeTransferEngine()
         self.kv_args = args
-        self.role = pd_role
+        self.disaggregation_mode = disaggregation_mode
         self.request_pool: RequestPoolType = {}
         self.request_status: Dict[int, KVPoll] = {}
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
-        if pd_role == "Prefill":
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.waiting_pool: WaitingPoolType = {}
             self.transfer_event = threading.Event()
             self.start_prefill_thread()
-        else:
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.start_decode_thread()
+        else:
+            raise ValueError(f"Unsupported DisaggregationMode: {self.disaggregation_mode}")
 
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
@@ -138,6 +141,8 @@ class KVManager:
         return status
 
     def sync_status_to_decode_endpoint(self, remote: str, room: int):
+        if ":" in remote:
+            remote = remote.split(":")[0]
         self._connect(
                     "tcp://"
                     + remote
@@ -244,11 +249,11 @@ class KVManager:
     ):
         self.request_pool[bootstrap_room] = (kv_indices, aux_index)
         self.request_status[bootstrap_room] = KVPoll.WaitingForInput
-        if self.role == "Prefill":
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_event.set()
 
     def check_status(self, bootstrap_room: int):
-        if self.role == "Decode" and self.request_status[bootstrap_room] == KVPoll.Success:
+        if self.disaggregation_mode == DisaggregationMode.DECODE and self.request_status[bootstrap_room] == KVPoll.Success:
             self.request_pool.pop(bootstrap_room)
 
         return self.request_status[bootstrap_room]
