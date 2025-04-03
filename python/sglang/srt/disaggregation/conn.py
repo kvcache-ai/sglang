@@ -82,7 +82,7 @@ class KVManager:
 
     def send_kvcache(
         self,
-        endpoint: str,
+        mooncake_session_id: str,
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
@@ -102,7 +102,7 @@ class KVManager:
                 decode_key_addr = decode_key_layer_ptr + decode_index * key_item_len
                 # TODO: mooncake transfer engine can do async transfer. Do async later
                 status = self.engine.transfer_sync(
-                    endpoint, prefill_key_addr, decode_key_addr, key_item_len
+                    mooncake_session_id, prefill_key_addr, decode_key_addr, key_item_len
                 )
                 if status != 0:
                     return status
@@ -115,7 +115,7 @@ class KVManager:
                 )
                 # TODO: mooncake transfer engine can do async transfer. Do async later
                 status = self.engine.transfer_sync(
-                    endpoint, prefill_value_addr, decode_value_addr, value_item_len
+                    mooncake_session_id, prefill_value_addr, decode_value_addr, value_item_len
                 )
                 if status != 0:
                     return status
@@ -123,7 +123,7 @@ class KVManager:
 
     def send_aux(
         self,
-        endpoint: str,
+        mooncake_session_id: str,
         prefill_aux_index: int,
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
@@ -136,7 +136,7 @@ class KVManager:
         # TODO: mooncake transfer engine can do async transfer. Do async later
         # Not sure about the amount of aux data, maybe transfer it by zmq is more effective
         status = self.engine.transfer_sync(
-            endpoint, prefill_aux_addr, decode_aux_addr, aux_item_len
+            mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
         )
         return status
 
@@ -163,6 +163,7 @@ class KVManager:
             while True:
                 (
                     endpoint,
+                    mooncake_session_id,
                     bootstrap_room,
                     dst_ptrs,
                     dst_kv_indices,
@@ -172,6 +173,7 @@ class KVManager:
                 if bootstrap_room.decode("ascii") == "None":
                     continue
                 endpoint = endpoint.decode("ascii")
+                mooncake_session_id = mooncake_session_id.decode("ascii")
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 dst_ptrs = list(struct.unpack(f"{len(dst_ptrs)//8}q", dst_ptrs))
                 dst_kv_indices = np.frombuffer(dst_kv_indices, dtype=np.int32)
@@ -181,6 +183,7 @@ class KVManager:
                 dst_aux_index = int(dst_aux_index.decode("ascii"))
                 self.waiting_pool[bootstrap_room] = (
                     endpoint,
+                    mooncake_session_id,
                     dst_ptrs,
                     dst_kv_indices,
                     dst_aux_ptrs,
@@ -203,6 +206,7 @@ class KVManager:
                     self.request_status[room] = status
                     (
                         endpoint,
+                        mooncake_session_id,
                         dst_ptrs,
                         dst_kv_indices,
                         dst_aux_ptrs,
@@ -213,12 +217,12 @@ class KVManager:
                         prefill_kv_indices,
                         prefill_aux_index,
                     ) = self.request_pool.pop(room)
-                    ret = self.send_kvcache(endpoint, prefill_kv_indices, dst_ptrs, dst_kv_indices)
+                    ret = self.send_kvcache(mooncake_session_id, prefill_kv_indices, dst_ptrs, dst_kv_indices)
                     if ret != 0:
                         status = KVPoll.Failed
                         self.sync_status_to_decode_endpoint(endpoint, room)
                         continue
-                    ret = self.send_aux(endpoint, prefill_aux_index, dst_aux_ptrs, dst_aux_index)
+                    ret = self.send_aux(mooncake_session_id, prefill_aux_index, dst_aux_ptrs, dst_aux_index)
                     if ret != 0:
                         status = KVPoll.Failed
                     else:
@@ -264,6 +268,9 @@ class KVManager:
     def get_localhost(self):
         return self.engine.get_localhost()
 
+    def get_session_id(self):
+        return self.engine.get_session_id()
+
 class KVSender:
 
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
@@ -300,6 +307,7 @@ class KVReceiver:
             + str(KVSENDER_POLLING_PORT + self.kv_mgr.kv_args.engine_rank)
         )
         self.decode_ip = self.kv_mgr.get_localhost()
+        self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
 
     @cache
@@ -319,6 +327,7 @@ class KVReceiver:
         self._connect("tcp://" + self.prefill_server_url).send_multipart(
             [
                 self.decode_ip.encode("ascii"),
+                self.session_id.encode("ascii"),
                 str(self.bootstrap_room).encode("ascii"),
                 packed_kv_data_ptrs,
                 kv_indices.tobytes(),

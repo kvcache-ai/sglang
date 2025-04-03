@@ -88,7 +88,6 @@ class DecodePreallocQueue:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.bootstrap_port = bootstrap_port
-        self.disaggregation_mode = DisaggregationMode("decode")
 
         self.num_reserved_decode_tokens = 512
 
@@ -117,7 +116,7 @@ class DecodePreallocQueue:
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
         kv_args.ib_device = "mock-ib-device"
-        kv_manager = KVManager(kv_args, self.disaggregation_mode)
+        kv_manager = KVManager(kv_args, DisaggregationMode("decode"))
         return kv_manager
 
     def add(self, req: Req) -> None:
