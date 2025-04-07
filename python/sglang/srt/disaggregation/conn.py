@@ -46,6 +46,7 @@ def group_concurrent_contiguous(
 
 class KVArgs:
     engine_rank: int
+    tp_size: int
     kv_data_ptrs: list[int]
     kv_data_lens: list[int]
     kv_item_lens: list[int]
@@ -70,6 +71,50 @@ WaitingPoolType = Dict[
 KVSENDER_POLLING_PORT = 17788
 KVRECEIVER_POLLING_PORT = 27788
 
+class RPCRequest:
+    def __init__(self, message_type):
+        self.message_type = message_type
+
+    def encode(self):
+        raise NotImplementedError("Subclasses must implement encode()")
+
+class StartupRequest(RPCRequest):
+    def __init__(
+        self, identity, role, serve_ip, serve_port, tp_rank, tp_size, zmq_port
+    ):
+        super().__init__("STARTUP")
+        self.identity = identity
+        self.role = role
+        self.serve_ip = serve_ip
+        self.serve_port = serve_port
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.zmq_port = zmq_port
+
+    def encode(self):
+        return pickle.dumps(
+            {
+                "type": self.message_type,
+                "identity": self.identity,
+                "role": self.role,
+                "serve_ip": self.serve_ip,
+                "serve_port": self.serve_port,
+                "tp_rank": self.tp_rank,
+                "tp_size": self.tp_size,
+                "zmq_port": self.zmq_port,
+            }
+        )
+
+class RegisterRequest(RPCRequest):
+    def __init__(self, session_id, decode_ip):
+        super().__init__("REGISTER")
+        self.decode_ip = decode_ip
+
+    def encode(self):
+        return pickle.dumps({
+            "type": self.message_type,
+            "decode_ip": self.decode_ip,
+        })
 
 class KVManager:
     # TODO: make it general and support multiple transfer backend before merging
@@ -332,16 +377,33 @@ class KVManager:
 
 
 class KVSender:
-
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
         self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
         self.aux_index = None
+        self.bootstrap_server_url = bootstrap_addr
+
+    @cache
+    def _connect_router(self, endpoint: str):
+        socket = zmq.Context().socket(zmq.DEALER)
+        self.identity = str(uuid.uuid4()).encode()
+        socket.setsockopt(zmq.IDENTITY, self.identity)
+        socket.connect(endpoint)
+        return socket
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.aux_index = aux_index
         self.num_kv_indices = num_kv_indices
+        # Send rank and tp size to bootstrap server (prefill node)
+        self._connect_router("tcp://" + self.bootstrap_server_url).send_multipart(
+            [
+                "Prefill".encode("ascii"),
+                str(self.identity).encode("ascii"),
+                str(self.kv_mgr.engine_rank).encode("ascii"),
+                str(self.kv_mgr.tp_size).encode("ascii"),
+            ]
+        )
 
     def send(self, kv_indices: npt.NDArray[np.int64]):
         self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, self.aux_index)
@@ -354,21 +416,28 @@ class KVSender:
 
 
 class KVReceiver:
-
     def __init__(
         self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: Optional[int] = None
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
-        self.prefill_server_url = (
-            bootstrap_addr.split(":")[0]
-            + ":"
-            + str(KVSENDER_POLLING_PORT + self.kv_mgr.kv_args.engine_rank)
-        )
         self.decode_ip = self.kv_mgr.get_localhost()
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
+        self.bootstrap_addr = bootstrap_addr
+        self.prefill_engine_rank = None
+        self.prefill_tp_size = None
+        self.decode_port = KVRECEIVER_POLLING_PORT
+        self.zmq_port = 0
+
+    @cache
+    def _connect_bootstrap(self, endpoint: str):
+        socket = zmq.Context().socket(zmq.DEALER)
+        self.identity = str(uuid.uuid4()).encode()
+        socket.setsockopt(zmq.IDENTITY, self.identity)
+        socket.connect(endpoint)
+        return socket
 
     @cache
     def _connect(self, endpoint: str):
@@ -377,12 +446,59 @@ class KVReceiver:
         return socket
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+        # REGISTER to bootstrap server to fetch prefill
+        startup_req = StartupRequest(
+            identity=self.identity,
+            role="Decode",
+            serve_ip=self.decode_ip,
+            serve_port=self.decode_port,
+            tp_rank=self.kv_mgr.engine_rank,
+            tp_size=self.kv_mgr.tp_size,
+            zmq_port=0,
+        )
+
+        self.socket = self._connect_bootstrap("tcp://" + self.bootstrap_addr)
+        self.socket.send_multipart([startup_req.encode()])
+
+        # Start listen clients thread
+        self.zmq_thread = threading.Thread(target=self._listen_server)
+        self.zmq_thread.start()
+        self.zmq_thread.join()
+
+    def _listen_server(self):
+        # Receive messages from bootstrap server
+        (
+            identity,
+            role,
+            engine_rank,
+            tp_size,
+            dst_kv_indices,
+            dst_aux_ptrs,
+            dst_aux_index,
+        ) = self.router_socket.recv_multipart()
+        role = role.decode("ascii")
+        if role == "Prefill":
+            self.prefill_engine_rank = int(engine_rank.decode("ascii"))
+            self.prefill_tp_size = int(tp_size.decode("ascii"))
+            self.handshake_prefill_server(kv_indices, aux_index)
+
+    def handshake_prefill_server(
+        self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None
+    ):
         self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, aux_index)
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
         )
         packed_aux_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+        )
+        # TODO(yuan-luo): need to correct here. the prefill_engine_rank should be
+        # calculated based on p/d tp_size.
+        sender_polling_port = int(self.prefill_addr.split(":")[1]) - 1
+        self.prefill_server_url = (
+            self.bootstrap_addr.split(":")[0]
+            + ":"
+            + str(sender_polling_port + self.prefill_engine_rank)
         )
         self._connect("tcp://" + self.prefill_server_url).send_multipart(
             [
@@ -402,21 +518,100 @@ class KVReceiver:
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
 
+class PortPool:
+    def __init__(self, start_port, end_port):
+        self.start_port = start_port
+        self.end_port = end_port
+        self.available_ports = set(range(start_port, end_port + 1))
+        self.lock = threading.Lock()
+
+    def allocate_port(self):
+        with self.lock:
+            if not self.available_ports:
+                raise Exception("No available ports in the pool")
+            port = self.available_ports.pop()
+            return Port
+
+    def release_port(self, port):
+        with self.lock:
+            if port < self.start_port or port > self.end_port:
+                raise Exception(f"Port {port} out of range")
+            self.available_ports.add(port)
+
+    def get_available_ports(self):
+        with self.lock:
+            return len(self.available_ports)
 
 class KVBootstrapServer:
     def __init__(self, port: int):
+        self.route_port = port
         self.port = port
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
         self._setup_routes()
 
+        self.context = zmq.Context()
+
+        # Route socket to communicate with Dealer which is prefill or decode
+        self.router_socket = self.context.socket(zmq.ROUTER)
+        self.router_socket.bind(f"tcp://*:{self.route_port}")
+
+        self.prefill_engine_rank = None
+        self.prefill_tp_size = None
+
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
-        self.run()
-
-    def run(self):
         self.thread.start()
+
+        # Start listen clients thread
+        self.zmq_thread = threading.Thread(target=self._listen_clients, daemon=True)
+        self.zmq_thread.start()
+
+        # Decode port pool, hard-coded the port range for now
+        self.decode_port_pool = PortPool(35000, 35500)
+
+        self.tp_sizes = {}
+
+    def _listen_dealers(self):
+        while True:
+            client_id, message = self.router_socket.recv_multipart()
+
+            request_data = pickle.loads(message)
+            if request_data["type"] == "STARTUP":
+                identity = request_data["identity"]
+                role = request_data["role"]
+                tp_size = request_data["tp_size"]
+
+            role = role.decode("ascii")
+            engine_rank = int(engine_rank.decode("ascii"))
+            tp_size = int(tp_size.decode("ascii"))
+            # TODO(yuan-luo): construct a topology map for a prefill rank
+            # to locate a decode rank
+            self.tp_sizes[role] = int(tp_size)
+            if role == "Prefill":
+                self._handle_prefill(engine_rank, tp_size)
+            elif role == "Decode":
+                self._handle_decode()
+
+    def _handle_prefill(self, engine_rank, tp_size):
+        """Handle Prefill message"""
+        self.prefill_engine_rank = engine_rank
+        self.prefill_tp_size = tp_size
+
+    def _handle_decode(self):
+        """Handle Decode message"""
+        if self.prefill_engine_rank is None or self.prefill_tp_size is None:
+            print("Error: Metadata not yet received from Prefill.")
+            self.router_socket.send_multipart([identity, b"Error: Metadata not ready"])
+        else:
+            self.router_socket.send_multipart(
+                [
+                    "Decode".encode("ascii"),
+                    str(prefill_engine_rank).encode("ascii"),
+                    str(prefill_tp_size).encode("ascii"),
+                ]
+            )
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/metadata", self._handle_metadata)
@@ -492,5 +687,9 @@ class KVBootstrapServer:
         if self.thread.is_alive():
             self.thread.join(timeout=2)
             logger.info("Server thread stopped")
+
+        if self.zmq_thread.is_alive():
+            self.zmq_thread.join(timeout=2)
+            logger.info("Server zmq thread stopped")
 
     def poll(self) -> KVPoll: ...
