@@ -356,7 +356,10 @@ class Req:
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
+        bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        prefill_host: Optional[str] = None,
+        prefill_port: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -487,7 +490,10 @@ class Req:
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_port: int = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.prefill_host: str = prefill_host
+        self.prefill_port: int = prefill_port
         self.disagg_kv_sender: Optional[KVSender] = None
 
         # used for warmup because we don't have a pair yet when init

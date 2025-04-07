@@ -193,7 +193,6 @@ class ServerArgs:
 
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
-    disaggregation_bootstrap_port: int = 8998
 
     def __post_init__(self):
         # Expert parallelism
@@ -1156,12 +1155,6 @@ class ServerArgs:
             default="null",
             choices=["null", "prefill", "decode"],
             help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
-        )
-        parser.add_argument(
-            "--disaggregation-bootstrap-port",
-            type=int,
-            default=ServerArgs.disaggregation_bootstrap_port,
-            help="Bootstrap server port on the prefill server. Default is 8998.",
         )
 
     @classmethod
