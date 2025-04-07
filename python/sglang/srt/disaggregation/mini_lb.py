@@ -29,12 +29,18 @@ class MiniLoadBalancer:
         parsed_url = urllib.parse.urlparse(prefill_server)
         hostname = parsed_url.hostname
         bootstrap_host = f"{hostname}"
+        bootstrap_port = int(parsed_url.port) + 1
+        prefill_host = f"{hostname}"
+        prefill_port = int(parsed_url.port)
 
         modified_request = request_data.copy()
         modified_request.update(
             {
                 "bootstrap_host": bootstrap_host,
+                "bootstrap_port": bootstrap_port,
                 "bootstrap_room": random.randint(0, 2**63 - 1),
+                "prefill_host": prefill_host,
+                "prefill_port": prefill_port,
             }
         )
 

@@ -98,6 +98,7 @@ class DecodePreallocQueue:
     def _init_kv_manager(self) -> KVManager:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
+        kv_args.tp_size = self.tp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -124,8 +125,9 @@ class DecodePreallocQueue:
 
         kv_receiver = KVReceiver(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
+            prefill_addr=f"{req.prefill_host}:{req.prefill_port}"
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
 

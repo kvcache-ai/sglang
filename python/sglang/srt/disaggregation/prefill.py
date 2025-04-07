@@ -54,7 +54,6 @@ class PrefillBootstrapQueue:
         aux_dtype: torch.dtype,
         tp_rank: int,
         tp_size: int,
-        bootstrap_port: int,
         gloo_group: ProcessGroup,
     ):
         self.token_to_kv_pool = token_to_kv_pool
@@ -67,7 +66,6 @@ class PrefillBootstrapQueue:
         self.kv_manager = self._init_kv_manager()
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
-        self.bootstrap_port = bootstrap_port
 
     def allocate_token_id(self, idx: int, token_id: int):
         assert token_id >= 0, f"token_id: {token_id} is negative"
@@ -77,6 +75,7 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> KVManager:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
+        kv_args.tp_size = self.tp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -102,8 +101,9 @@ class PrefillBootstrapQueue:
     def add(self, req: Req) -> None:
         req.disagg_kv_sender = KVSender(
             mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
+            prefill_addr=f"{req.prefill_host}:{req.prefill_port}"
         )
         self._process_req(req)
         self.queue.append(req)

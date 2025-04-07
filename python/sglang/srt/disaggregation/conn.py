@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 class KVArgs:
     engine_rank: int
+    tp_size: int
     kv_data_ptrs: list[int]
     kv_data_lens: list[int]
     kv_item_lens: list[int]
@@ -149,6 +150,7 @@ class KVManager:
     def sync_status_to_decode_endpoint(self, remote: str, room: int):
         if ":" in remote:
             remote = remote.split(":")[0]
+        # TODO(yuan-luo): change the receiver rank port to configurable
         self._connect(
             "tcp://"
             + remote
@@ -299,10 +301,26 @@ class KVSender:
         self.bootstrap_room = bootstrap_room
         self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
         self.aux_index = None
+        self.bootstrap_server_url = bootstrap_addr
+
+    @cache
+    def _connect_router(self, endpoint: str):
+        socket = zmq.Context().socket(zmq.DEALER)
+        self.identity = str(uuid.uuid4()).encode()
+        socket.setsockopt(zmq.IDENTITY, self.identity)
+        socket.connect(endpoint)
+        return socket
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.aux_index = aux_index
         self.num_kv_indices = num_kv_indices
+        self._connect_router("tcp://" + self.bootstrap_server_url).send_multipart(
+            [
+                "Prefill".encode("ascii"),
+                str(self.kv_mgr.engine_rank).encode("ascii"),
+                str(self.kv_mgr.tp_size).encode("ascii"),
+            ]
+        )
 
     def send(self, kv_indices: npt.NDArray[np.int32]):
         self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, self.aux_index)
@@ -317,19 +335,26 @@ class KVSender:
 class KVReceiver:
 
     def __init__(
-        self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: Optional[int] = None
+        self, mgr: KVManager, bootstrap_addr: str, prefill_addr: str, bootstrap_room: Optional[int] = None
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
+        self.prefill_addr = prefill_addr
         self.kv_mgr = mgr
-        self.prefill_server_url = (
-            bootstrap_addr.split(":")[0]
-            + ":"
-            + str(KVSENDER_POLLING_PORT + self.kv_mgr.kv_args.engine_rank)
-        )
         self.decode_ip = self.kv_mgr.get_localhost()
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.set_status(bootstrap_room, KVPoll.WaitingForInput)
+        self.bootstrap_addr = bootstrap_addr
+        self.prefill_engine_rank = None
+        self.prefill_tp_size = None
+
+    @cache
+    def _connect_router(self, endpoint: str):
+        socket = zmq.Context().socket(zmq.DEALER)
+        self.identity = str(uuid.uuid4()).encode()
+        socket.setsockopt(zmq.IDENTITY, self.identity)
+        socket.connect(endpoint)
+        return socket
 
     @cache
     def _connect(self, endpoint: str):
@@ -338,12 +363,40 @@ class KVReceiver:
         return socket
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+        self._connect("tcp://" + self.bootstrap_addr).send_multipart(
+            [
+                "Decode".encode("ascii"),
+                str(0).encode("ascii"),
+                str(0).encode("ascii"),
+            ]
+        )
+        # Start listen clients thread
+        self.zmq_thread = threading.Thread(target=self._listen_server, daemon=True)  # ZMQ communication thread
+        self.zmq_thread.start()
+
+    def _listen_server(self):
+        while True:
+            # Receive messages from bootstrap server (Prefill)
+            (role, engine_rank, tp_size) = self.router_socket.recv_multipart()
+            role = role.decode("ascii")
+            if role == "Decode":
+                self.prefill_engine_rank = int(engine_rank.decode("ascii"))
+                self.prefill_tp_size = int(tp_size.decode("ascii"))
+                self.handshake_prefill_server(kv_indices, aux_index)
+
+    def handshake_prefill_server(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         self.kv_mgr.enqueue_request(self.bootstrap_room, kv_indices, aux_index)
         packed_kv_data_ptrs = b"".join(
             struct.pack("q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
         )
         packed_aux_data_ptrs = b"".join(
             struct.pack("q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+        )
+        sender_polling_port = int(self.prefill_addr.split(":")[1]) - 1
+        self.prefill_server_url = (
+            self.bootstrap_addr.split(":")[0]
+            + ":"
+            + str(sender_polling_port + self.prefill_engine_rank)
         )
         self._connect("tcp://" + self.prefill_server_url).send_multipart(
             [
@@ -366,18 +419,55 @@ class KVReceiver:
 
 class KVBootstrapServer:
     def __init__(self, port: int):
-        self.port = port
+        self.route_port = port
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
         self._setup_routes()
 
+        self.context = zmq.Context()
+
+        # ROUTER socket to communicate with Prefill and Decode
+        self.router_socket = self.context.socket(zmq.ROUTER)
+        self.router_socket.bind(f"tcp://*:{self.route_port}")
+
+        self.prefill_engine_rank = None
+        self.prefill_tp_size = None
+
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
-        self.run()
-
-    def run(self):
         self.thread.start()
+
+    def _listen_clients(self):
+        while True:
+            # Receive messages from clients (Prefill or Decode)
+            (role, engine_rank, tp_size) = self.router_socket.recv_multipart()
+            role = role.decode("ascii")
+            engine_rank = int(engine_rank.decode("ascii"))
+            tp_size = int(tp_size.decode("ascii"))
+            if role == "Prefill":
+                self._handle_prefill(engine_rank, tp_size)
+            elif role == "Decode":
+                self._handle_decode()
+
+    def _handle_prefill(self, engine_rank, tp_size):
+        """Handle Prefill message"""
+        self.prefill_engine_rank = engine_rank
+        self.prefill_tp_size = tp_size
+
+    def _handle_decode(self):
+        """Handle Decode message"""
+        if self.prefill_engine_rank is None or self.prefill_tp_size is None:
+            print("Error: Metadata not yet received from Prefill.")
+            self.router_socket.send_multipart([identity, b"Error: Metadata not ready"])
+        else:
+            self.router_socket.send_multipart(
+                [
+                    "Decode".encode("ascii"),
+                    str(prefill_engine_rank).encode("ascii"),
+                    str(prefill_tp_size).encode("ascii"),
+                ]
+            )
 
     def _setup_routes(self):
         self.app.router.add_route("*", "/metadata", self._handle_metadata)
