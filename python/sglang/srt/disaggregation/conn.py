@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import struct
 import threading
 from functools import cache
@@ -10,7 +11,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 import zmq
-import random
 from aiohttp import web
 
 from sglang.srt.disaggregation.transfer_engine.mooncake import MooncakeTransferEngine
@@ -74,12 +74,14 @@ WaitingPoolType = Dict[
 # KVSENDER_POLLING_PORT = 17788
 # KVRECEIVER_POLLING_PORT = 27788
 
+
 class RPCRequest:
     def __init__(self, message_type):
         self.message_type = message_type
 
     def encode(self):
         raise NotImplementedError("Subclasses must implement encode()")
+
 
 class RegisterRequest(RPCRequest):
     def __init__(
@@ -107,6 +109,7 @@ class RegisterRequest(RPCRequest):
                 "zmq_port": self.zmq_port,
             }
         )
+
 
 class KVManager:
     # TODO: make it general and support multiple transfer backend before merging
@@ -227,12 +230,7 @@ class KVManager:
     def sync_status_to_decode_endpoint(self, remote: str, dst_port: int, room: int):
         if ":" in remote:
             remote = remote.split(":")[0]
-        self._connect(
-            "tcp://"
-            + remote
-            + ":"
-            + str(dst_port)
-        ).send_multipart(
+        self._connect("tcp://" + remote + ":" + str(dst_port)).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(self.request_status[room]).encode("ascii"),
@@ -478,9 +476,7 @@ class KVReceiver:
             sender_port = self.kv_mgr.connection_pool[self.kv_mgr.engine_rank]
 
         self.prefill_server_url = (
-            self.bootstrap_addr.split(":")[0]
-            + ":"
-            + str(sender_port)
+            self.bootstrap_addr.split(":")[0] + ":" + str(sender_port)
         )
         self.handshake_prefill_server(kv_indices, aux_index)
 
@@ -513,6 +509,7 @@ class KVReceiver:
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
 
+
 class KVBootstrapServer:
     def __init__(self, port: int):
         self.route_port = port
@@ -536,6 +533,15 @@ class KVBootstrapServer:
         # Start listen clients thread
         self.zmq_thread = threading.Thread(target=self._listen_dealers)
         self.zmq_thread.start()
+
+        self.context = zmq.Context()
+
+        # Route socket to communicate with Dealer which is prefill or decode
+        self.router_socket = self.context.socket(zmq.ROUTER)
+        self.router_socket.bind(f"tcp://*:{self.route_port}")
+
+        self.prefill_engine_rank = None
+        self.prefill_tp_size = None
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
