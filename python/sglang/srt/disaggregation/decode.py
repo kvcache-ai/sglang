@@ -100,6 +100,7 @@ class DecodePreallocQueue:
         kv_args = KVArgs()
         kv_args.engine_rank = self.tp_rank
         kv_args.tp_size = self.tp_size
+        kv_args.bootstrap_port = self.bootstrap_port
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
