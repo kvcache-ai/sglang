@@ -117,7 +117,7 @@ def normalize_pci_addr(pci_addr):
     return pci_addr  # Return original format
 
 
-def find_best_roce_for_gpu(gpu_no, prefix="mlx"):
+def find_best_rdma_device_for_gpu(gpu_no, prefix="mlx"):
     """
     Find the most affinity RoCE network card for a given GPU.
     
