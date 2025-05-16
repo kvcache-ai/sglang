@@ -387,10 +387,10 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk = token_id is not None
 
         if (not last_chunk) and (
-            end_idx % page_size != 0
+            (end_idx - start_idx) % page_size != 0
         ):  # todo: remove the second condition
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
-            end_idx = end_idx - end_idx % page_size
+            end_idx = start_idx + ((end_idx - start_idx) // page_size) * page_size
 
         # Update next start_send_idx
         req.start_send_idx = end_idx
