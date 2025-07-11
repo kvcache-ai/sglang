@@ -1412,7 +1412,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             self._loop.close()
 
     def close(self):
-        """Shutdown"""
+        """Shutdown server"""
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
             logger.info("Stopping server loop...")
