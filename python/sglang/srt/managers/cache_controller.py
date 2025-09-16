@@ -308,6 +308,45 @@ class HiCacheController:
                 self.storage_backend = HiCacheHF3FS.from_env_config(
                     bytes_per_page, dtype, self.storage_config
                 )
+            elif storage_backend == "dynamic":
+                import importlib
+                
+                # Get module path and class name from extra_config
+                if not self.storage_config.extra_config:
+                    raise ValueError("extra_config must be provided for dynamic storage backend")
+                
+                module_path = self.storage_config.extra_config.get("module_path")
+                class_name = self.storage_config.extra_config.get("class_name")
+                
+                if not module_path or not class_name:
+                    raise ValueError(
+                        "Both 'module_path' and 'class_name' must be specified in extra_config "
+                        "for dynamic storage backend"
+                    )
+                
+                # Dynamically load the module and class
+                try:
+                    module = importlib.import_module(module_path)
+                    storage_class = getattr(module, class_name)
+                    
+                    # Instantiate the storage backend with storage_config
+                    self.storage_backend = storage_class(self.storage_config)
+                    
+                    # Verify the backend implements the required interface
+                    if not hasattr(self.storage_backend, 'get') or not hasattr(self.storage_backend, 'set'):
+                        raise ValueError(
+                            f"Class {class_name} from module {module_path} does not implement "
+                            "required HiCacheStorage interface methods"
+                        )
+                        
+                    logger.info(f"Successfully loaded dynamic storage backend: {class_name} from {module_path}")
+                    
+                except ImportError as e:
+                    raise ValueError(f"Failed to import module {module_path}: {e}")
+                except AttributeError as e:
+                    raise ValueError(f"Failed to find class {class_name} in module {module_path}: {e}")
+                except Exception as e:
+                    raise ValueError(f"Failed to instantiate dynamic storage backend: {e}")
             else:
                 raise NotImplementedError(
                     f"Unsupported storage backend: {storage_backend}"
