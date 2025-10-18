@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import suppress
 from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, cast
 
@@ -40,7 +39,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 try:
@@ -135,8 +134,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if CompressedTensorsConfig.DeepSeekFP8Config is not None:
                 return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-            if "MOE_AMX_WEIGHT_PATH" in os.environ:
-                return UnquantizedLinearMethod()
+
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()

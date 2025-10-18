@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import enum
 import logging
-import os
 import re
 from enum import Enum
 from typing import TYPE_CHECKING, List
@@ -28,10 +27,14 @@ from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    _is_equal_or_regex_match,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
@@ -74,6 +77,72 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def get_scheme_for_prefix(
+    target_scheme_map: dict, prefix: str = None, fallback_key: str = "Linear"
+) -> dict:
+    """
+    Match a key in target_scheme_map based on the given prefix.
+
+    Matching rules:
+    1. If prefix is None, directly use fallback_key (for backward compatibility)
+    2. Use _is_equal_or_regex_match to check if prefix matches any key
+       - If a key starts with "re:", treat it as a regex pattern
+       - Otherwise, check for exact match
+    3. If multiple keys match, raise an error
+    4. If no keys match, try using the fallback_key
+    5. If the fallback_key also doesn't exist, raise an error
+
+    Args:
+        target_scheme_map: The scheme mapping from quantization config
+        prefix: The module prefix (e.g., "model.layers.0.mlp"), None to use fallback_key directly
+        fallback_key: The default fallback key, defaults to "Linear"
+
+    Returns:
+        The matched scheme dictionary
+
+    Raises:
+        ValueError: When multiple keys match or no keys match
+    """
+    # If prefix is None, directly use fallback_key for backward compatibility
+    if prefix is None:
+        if fallback_key in target_scheme_map:
+            return target_scheme_map[fallback_key]
+        else:
+            raise ValueError(
+                f"Fallback key '{fallback_key}' not found in target_scheme_map. "
+                f"Available keys: {list(target_scheme_map.keys())}"
+            )
+
+    matched_keys = []
+
+    # Use _is_equal_or_regex_match to check each key
+    for key in target_scheme_map.keys():
+        if _is_equal_or_regex_match(prefix, key):
+            matched_keys.append(key)
+
+    if len(matched_keys) > 1:
+        raise ValueError(
+            f"Prefix '{prefix}' matched multiple keys in target_scheme_map: {matched_keys}. "
+            f"Please ensure only one key matches."
+        )
+    elif len(matched_keys) == 1:
+        return target_scheme_map[matched_keys[0]]
+    else:
+        # No match, try fallback
+        if fallback_key in target_scheme_map:
+            logger.warning(
+                f"Prefix '{prefix}' did not match any key in target_scheme_map. "
+                f"Falling back to '{fallback_key}'."
+            )
+            return target_scheme_map[fallback_key]
+        else:
+            raise ValueError(
+                f"Prefix '{prefix}' did not match any key in target_scheme_map, "
+                f"and fallback key '{fallback_key}' is also not found. "
+                f"Available keys: {list(target_scheme_map.keys())}"
+            )
+
+
 def _mask_topk_ids_cpu_experts(topk_ids: torch.Tensor, num_gpu_experts: int):
     """Mask topk_ids >= num_gpu_experts by setting them to -1."""
     topk_ids[topk_ids >= num_gpu_experts] = -1
@@ -113,27 +182,30 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
     ) -> "CompressedTensorsMoEMethod":
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
-        match = re.search(r"(\d+)\.mlp", prefix)
-        if not match:
-            raise ValueError(
-                f"Unable to extract layer number from prefix '{prefix}'. "
-                f"Expected format: '<layer_number>.mlp'"
+
+        if envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set():
+            match = re.search(r"(\d+)\.mlp", prefix)
+            if not match:
+                raise ValueError(
+                    f"Unable to extract layer number from prefix '{prefix}'. "
+                    f"Expected format: '<layer_number>.mlp'"
+                )
+            layer_number = int(match.group(1))
+            return CompressedTensorsWNA16AMXEPMoEMethod(
+                quant_config, layer_number, prefix
             )
-        layer_number = int(match.group(1))
 
-        if os.environ.get("MOE_AMX_WEIGHT_PATH") is not None:
-            return CompressedTensorsWNA16AMXEPMoEMethod(quant_config, layer_number)
-
-        weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
-        input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
+        scheme = get_scheme_for_prefix(quant_config.target_scheme_map, prefix)
+        weight_quant = scheme.get("weights")
+        input_quant = scheme.get("input_activations")
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             if not VLLM_AVAILABLE:
                 raise ImportError(
                     "vllm is not installed, to use CompressedTensorsWNA16MoEMethod, please install vllm."
                 )
-            return CompressedTensorsWNA16MoEMethod(quant_config)
+            return CompressedTensorsWNA16MoEMethod(quant_config, prefix)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
-            return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
+            return CompressedTensorsW8A8Fp8MoEMethod(quant_config, prefix)
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
@@ -142,12 +214,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
-    def __init__(self, quant_config: CompressedTensorsConfig):
+    def __init__(self, quant_config: CompressedTensorsConfig, prefix: str = None):
         self.quant_config = quant_config
-        self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
-        self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
-            "input_activations"
-        )
+        scheme = get_scheme_for_prefix(self.quant_config.target_scheme_map, prefix)
+        self.weight_quant = scheme.get("weights")
+        self.input_quant = scheme.get("input_activations")
 
         self.static_input_scales = not self.input_quant.dynamic
 
@@ -397,11 +468,17 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
-    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
+    def __init__(
+        self,
+        quant_config: CompressedTensorsConfig,
+        prefix: str = None,
+        num_gpu_experts=-1,
+    ):
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        scheme = get_scheme_for_prefix(self.quant_config.target_scheme_map, prefix)
+        config = scheme.get("weights")
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
@@ -716,7 +793,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         topk_weights, topk_ids, router_logits = topk_output
 
-        output = torch.ops.vllm.fused_marlin_moe(
+        output = fused_marlin_moe(
             x,
             layer.w13_weight_packed,
             layer.w2_weight_packed,
@@ -731,6 +808,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             sort_indices2=layer.w2_g_idx_sort_indices,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
+            expert_map=torch.empty(1, device=x.device),
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -744,7 +822,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         layer_idx,
         num_gpu_experts,
         cpuinfer,
-        subpool_count,
+        threadpool_count,
         amx_weight_path,
         chunked_prefill_size,
     ):
@@ -763,7 +841,7 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
         self.amx_weight_path = amx_weight_path
         self.chunked_prefill_size = chunked_prefill_size
         self.cpuinfer = cpuinfer
-        self.subpool_count = subpool_count
+        self.threadpool_count = threadpool_count
         self.amx_wrapper = None
 
     def create_weights(
@@ -790,9 +868,10 @@ class CompressedTensorsWNA16AMXMoEMethod(CompressedTensorsMoEMethod):
             moe_intermediate_size=self.moe_intermediate_size,
             num_gpu_experts=self.num_gpu_experts,
             cpuinfer_threads=self.cpuinfer,
-            subpool_count=self.subpool_count,
+            threadpool_count=self.threadpool_count,
             amx_weight_path=self.amx_weight_path,
             chunked_prefill_size=self.chunked_prefill_size,
+            amx_method=envs.SGLANG_KT_AMX_METHOD.value,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -885,30 +964,25 @@ def override_config(
     cls,
     num_gpu_experts,
     cpuinfer,
-    subpool_count,
+    threadpool_count,
     amx_weight_path,
     amx_method,
     chunked_prefill_size,
-    enable_defer,
-    cpu_embed,
 ):
     """Override MOE configuration via environment variables."""
-    # Mapping of config parameters to environment variable names
-    config_map = {
-        "MOE_NUM_GPU_EXPERTS": num_gpu_experts,
-        "MOE_CPUINFER": cpuinfer,
-        "SUBPOOL_COUNT": subpool_count,
-        "MOE_AMX_WEIGHT_PATH": amx_weight_path,
-        "AMX_METHOD": amx_method,
-        "CPU_EMBED": cpu_embed,
-        "MOE_CHUNKED_PREFILL_SIZE": chunked_prefill_size,
-        "MOE_ENABLE_DEFER": enable_defer,
-    }
-
-    # Set environment variables, converting values to strings
-    for env_key, value in config_map.items():
-        if value is not None:
-            os.environ[env_key] = str(value)
+    # Set environment variables using envs utility class
+    if num_gpu_experts is not None:
+        envs.SGLANG_KT_MOE_NUM_GPU_EXPERTS.set(num_gpu_experts)
+    if cpuinfer is not None:
+        envs.SGLANG_KT_MOE_CPUINFER.set(cpuinfer)
+    if threadpool_count is not None:
+        envs.SGLANG_KT_THREADPOOL_COUNT.set(threadpool_count)
+    if amx_weight_path is not None:
+        envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.set(amx_weight_path)
+    if amx_method is not None:
+        envs.SGLANG_KT_AMX_METHOD.set(amx_method)
+    if chunked_prefill_size is not None:
+        envs.SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE.set(chunked_prefill_size)
 
 
 class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
@@ -917,36 +991,35 @@ class CompressedTensorsWNA16AMXEPMoEMethod(CompressedTensorsMoEMethod):
         self,
         quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
         layer_idx,
+        prefix: str = None,
     ):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         if (
-            "MOE_NUM_GPU_EXPERTS" not in os.environ
-            or "MOE_CPUINFER" not in os.environ
-            or "MOE_AMX_WEIGHT_PATH" not in os.environ
+            not envs.SGLANG_KT_MOE_NUM_GPU_EXPERTS.is_set()
+            or not envs.SGLANG_KT_MOE_CPUINFER.is_set()
+            or not envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.is_set()
         ):
             raise RuntimeError(
-                "the following arguments are required: --amx-weight-path, --cpuinfer, --num-gpu-experts"
+                "the following arguments are required: --kt-amx-weight-path, --kt-cpuinfer, --kt-num-gpu-experts"
             )
-        self.num_gpu_experts = int(os.environ.get("MOE_NUM_GPU_EXPERTS"))
-        cpuinfer = int(os.environ.get("MOE_CPUINFER"))
-        subpool_count = int(os.environ.get("SUBPOOL_COUNT"))
-        amx_weight_path = os.environ.get("MOE_AMX_WEIGHT_PATH")
-        chunked_prefill_size = int(os.environ.get("MOE_CHUNKED_PREFILL_SIZE"))
-        self.enable_defer = (
-            os.environ.get("MOE_ENABLE_DEFER", "False").lower() == "true"
-        )
+        self.num_gpu_experts = envs.SGLANG_KT_MOE_NUM_GPU_EXPERTS.value
+        cpuinfer = envs.SGLANG_KT_MOE_CPUINFER.value
+        threadpool_count = envs.SGLANG_KT_THREADPOOL_COUNT.value
+        amx_weight_path = envs.SGLANG_KT_MOE_AMX_WEIGHT_PATH.value
+        chunked_prefill_size = envs.SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE.value
+
         self.AMX_method = CompressedTensorsWNA16AMXMoEMethod(
             quant_config,
             layer_idx,
             self.num_gpu_experts,
             cpuinfer,
-            subpool_count,
+            threadpool_count,
             amx_weight_path,
             chunked_prefill_size,
         )
         self.marlin_method = CompressedTensorsWNA16MoEMethod(
-            quant_config, self.num_gpu_experts
+            quant_config, prefix, self.num_gpu_experts
         )
         self.layer_id = layer_idx
 

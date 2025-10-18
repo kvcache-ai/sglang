@@ -195,15 +195,6 @@ class ServerArgs:
     revision: Optional[str] = None
     model_impl: str = "auto"
 
-    # Ktransformers
-    amx_weight_path: Optional[str] = None
-    amx_method: Optional[str] = None
-    cpu_embed: Optional[str] = None
-    cpuinfer: Optional[int] = None
-    subpool_count: Optional[int] = None
-    num_gpu_experts: Optional[int] = None
-    enable_defer: bool = False
-
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
@@ -395,6 +386,13 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
     # LMCache
     enable_lmcache: bool = False
+
+    # Ktransformers
+    kt_amx_weight_path: Optional[str] = None
+    kt_amx_method: Optional[str] = None
+    kt_cpuinfer: Optional[int] = None
+    kt_threadpool_count: Optional[int] = None
+    kt_num_gpu_experts: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -612,14 +610,12 @@ class ServerArgs:
 
         override_config(
             CompressedTensorsWNA16AMXEPMoEMethod,
-            self.num_gpu_experts,
-            self.cpuinfer,
-            self.subpool_count,
-            self.amx_weight_path,
-            self.amx_method,
+            self.kt_num_gpu_experts,
+            self.kt_cpuinfer,
+            self.kt_threadpool_count,
+            self.kt_amx_weight_path,
+            self.kt_amx_method,
             self.chunked_prefill_size,
-            self.enable_defer,
-            self.cpu_embed,
         )
 
     def _handle_missing_default_values(self):
@@ -1467,45 +1463,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-
-        # Ktransformer server args
-        parser.add_argument(
-            "--amx-weight-path",
-            type=str,
-            help="The path of the quantized expert weights for amx kernel. A local folder.",
-        )
-        parser.add_argument(
-            "--amx-method",
-            type=str,
-            default="AMXINT4",
-            help="Quantization formats for CPU execution.",
-        )
-        parser.add_argument(
-            "--cpu-embed",
-            action="store_true",
-            help="Enable moving embed_token to cpu",
-        )
-        parser.add_argument(
-            "--cpuinfer",
-            type=int,
-            help="The number of CPUInfer threads.",
-        )
-        parser.add_argument(
-            "--subpool-count",
-            type=int,
-            default=2,
-            help="The number of NUMA nodes.",
-        )
-        parser.add_argument(
-            "--num-gpu-experts",
-            type=int,
-            help="The number of GPU experts.",
-        )
-        parser.add_argument(
-            "--enable-defer",
-            action="store_true",
-            help="Enable Expert Deferral.",
-        )
 
         # Model and tokenizer
         parser.add_argument(
@@ -2662,6 +2619,35 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+
+        # Ktransformer server args
+        parser.add_argument(
+            "--kt-amx-weight-path",
+            type=str,
+            help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--kt-amx-method",
+            type=str,
+            default="AMXINT4",
+            help="[ktransformers parameter] Quantization formats for CPU execution.",
+        )
+        parser.add_argument(
+            "--kt-cpuinfer",
+            type=int,
+            help="[ktransformers parameter] The number of CPUInfer threads.",
+        )
+        parser.add_argument(
+            "--kt-threadpool-count",
+            type=int,
+            default=2,
+            help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-num-gpu-experts",
+            type=int,
+            help="[ktransformers parameter] The number of GPU experts.",
         )
 
         # Double Sparsity
