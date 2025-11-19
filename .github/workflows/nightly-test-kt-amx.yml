@@ -1,0 +1,138 @@
+name: Nightly KT-AMX Test
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-kt-amx-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================== 1 GPU tests ====================================================
+  nightly-kt-1gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: kt-amx-1gpu
+    continue-on-error: true
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Install KT-Kernel
+        run: |
+          bash scripts/ci/ci_install_kt_kernel.sh
+
+      - name: Run KT-AMX nightly tests (1 GPU)
+        timeout-minutes: 180
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-kt-1gpu
+
+  # =============================================== 4 GPU tests ====================================================
+  nightly-kt-4gpu:
+    needs: [nightly-kt-1gpu]
+    if: always() && !cancelled() && github.repository == 'sgl-project/sglang'
+    runs-on: kt-amx-4gpu
+    continue-on-error: true
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Install KT-Kernel
+        run: |
+          bash scripts/ci/ci_install_kt_kernel.sh
+
+      - name: Run KT-AMX nightly tests (4 GPU)
+        timeout-minutes: 120
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-kt-4gpu
+
+  # =============================================== 8 GPU tests ====================================================
+  nightly-kt-8gpu:
+    needs: [nightly-kt-4gpu]
+    if: always() && !cancelled() && github.repository == 'sgl-project/sglang'
+    runs-on: kt-amx-8gpu
+    continue-on-error: true
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Install KT-Kernel
+        run: |
+          bash scripts/ci/ci_install_kt_kernel.sh
+
+      - name: Run KT-AMX nightly tests (8 GPU)
+        timeout-minutes: 150
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-kt-8gpu
+
+  # =============================================== finish ====================================================
+  nightly-test-kt-amx-finish:
+    needs: [nightly-kt-1gpu, nightly-kt-4gpu, nightly-kt-8gpu]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          # Convert the 'needs' context to a JSON string
+          json_needs='${{ toJson(needs) }}'
+
+          # Get a list of all job names from the JSON keys
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          echo "============================================"
+          echo "Nightly KT-AMX Test Summary"
+          echo "============================================"
+
+          has_failure=false
+
+          for job in $job_names; do
+            # For each job, extract its result
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+
+            # Print the job name and its result
+            echo "$job: $result"
+
+            # Track failures (but don't exit immediately for nightly tests)
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              has_failure=true
+            fi
+          done
+
+          echo "============================================"
+
+          if [ "$has_failure" = true ]; then
+            echo "⚠️  Some nightly tests failed or were cancelled"
+            echo "This is a nightly test - failures are tracked but don't block development"
+            exit 1
+          else
+            echo "✓ All nightly tests completed successfully"
+            exit 0
+          fi

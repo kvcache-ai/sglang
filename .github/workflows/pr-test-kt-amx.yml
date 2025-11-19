@@ -1,0 +1,110 @@
+name: PR KT-AMX Test
+
+on:
+  pull_request:
+    branches:
+      - main
+      - amx_main
+    types: [synchronize, labeled]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-kt-amx-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================== check changes ====================================================
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      kt_amx: ${{ steps.filter.outputs.kt_amx }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Fail if the PR does not have the 'run-ci' label
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'run-ci')
+        run: |
+          echo "This pull request does not have the 'run-ci' label. Failing the workflow."
+          exit 1
+
+      - name: Fail if the PR is a draft
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        run: |
+          echo "This pull request is a draft. Failing the workflow."
+          exit 1
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            kt_amx:
+              - "python/sglang/srt/models/**"
+              - "python/sglang/srt/layers/**"
+              - "test/srt/kt/**"
+              - "scripts/ci/ci_install_kt_kernel.sh"
+              - "scripts/ci/run_kt_tests_local.sh"
+              - ".github/workflows/pr-test-kt-amx.yml"
+              - ".github/workflows/nightly-test-kt-amx.yml"
+
+  # =============================================== KT-AMX tests ====================================================
+  per-commit-kt-1gpu:
+    needs: [check-changes]
+    if: always() && !failure() && !cancelled() &&
+      (needs.check-changes.outputs.kt_amx == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: kt-amx-1gpu
+    continue-on-error: false
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/ci_install_dependency.sh
+
+      - name: Install KT-Kernel
+        run: |
+          bash scripts/ci/ci_install_kt_kernel.sh
+
+      - name: Run KT-AMX per-commit tests (1 GPU)
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-kt-1gpu
+
+  # =============================================== finish ====================================================
+  pr-test-kt-amx-finish:
+    needs: [check-changes, per-commit-kt-1gpu]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          # Convert the 'needs' context to a JSON string
+          json_needs='${{ toJson(needs) }}'
+
+          # Get a list of all job names from the JSON keys
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            # For each job, extract its result
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+
+            # Print the job name and its result
+            echo "$job: $result"
+
+            # Check for failure or cancellation and exit if found
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+
+          # If the loop completes, all jobs were successful
+          echo "All jobs completed successfully"
+          exit 0

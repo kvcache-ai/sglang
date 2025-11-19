@@ -536,6 +536,58 @@ suites.update(suite_xeon)
 suites.update(suite_ascend)
 suites.update(suite_xpu)
 
+# KT-Kernel (KTransformers) AMX CPU Inference Tests
+# Following the test suite design from docs/ci/kt-amx-work-plan.md
+suite_kt_amx = {
+    # Per-commit tests: Only basic tests for fast feedback (~15 min)
+    # Purpose: Quick validation, prevent breaking changes
+    "per-commit-kt-1gpu": [
+        TestFile(
+            "kt/test_kt_basic.py", 10
+        ),  # Contains TestKTBasic1GPU, TestKTBasic4GPU, TestKTBasic8GPU
+        TestFile(
+            "kt/test_kt_long_context.py", 15
+        ),  # Long context handling (~32K tokens)
+    ],
+    # Nightly tests: Comprehensive testing (basic + performance + correctness)
+    # Purpose: Full validation, performance monitoring, regression detection
+    "nightly-kt-1gpu": [
+        # Basic tests
+        TestFile("kt/test_kt_basic.py", 30),  # All basic tests (1/4/8 GPU)
+        TestFile(
+            "kt/test_kt_long_context.py", 40
+        ),  # Long context handling with performance metrics
+        # Performance tests
+        TestFile("kt/test_kt_performance.py", 40),  # Throughput performance (1/4/8 GPU)
+        # Correctness tests
+        TestFile(
+            "kt/test_kt_correctness.py", 30
+        ),  # GSM8K accuracy (1 GPU only by default)
+    ],
+    "nightly-kt-4gpu": [
+        # Basic tests
+        TestFile("kt/test_kt_basic.py", 30),
+        TestFile(
+            "kt/test_kt_long_context.py", 40
+        ),  # Long context handling with performance metrics
+        # Performance tests
+        TestFile("kt/test_kt_performance.py", 40),  # Throughput performance (1/4/8 GPU)
+    ],
+    "nightly-kt-8gpu": [
+        # Basic tests
+        TestFile("kt/test_kt_basic.py", 30),
+        TestFile(
+            "kt/test_kt_long_context.py", 40
+        ),  # Long context handling with performance metrics
+        # Performance tests
+        TestFile(
+            "kt/test_kt_performance.py", 50
+        ),  # Throughput performance with success criteria (>150 tok/s)
+    ],
+}
+
+suites.update(suite_kt_amx)
+
 
 def auto_partition(files, rank, size):
     """
