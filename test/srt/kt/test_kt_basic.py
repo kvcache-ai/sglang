@@ -6,19 +6,19 @@ Tests basic inference workflow with different GPU configurations.
 
 import unittest
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    CustomTestCase,
-    popen_launch_server,
-)
-
-from .utils import (
+from kt.utils import (
     TEST_PROMPTS,
     get_kt_env,
     get_kt_model_paths,
     get_kt_server_args,
     run_inference,
+)
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    CustomTestCase,
+    popen_launch_server,
 )
 
 

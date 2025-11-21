@@ -11,6 +11,8 @@ import unittest
 from datetime import datetime
 from types import SimpleNamespace
 
+from kt.utils import get_kt_env, get_kt_model_paths, get_kt_server_args
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -19,8 +21,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-
-from .utils import get_kt_env, get_kt_model_paths, get_kt_server_args
 
 
 def save_correctness_results(

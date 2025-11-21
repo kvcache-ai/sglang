@@ -10,6 +10,8 @@ import os
 import unittest
 from datetime import datetime
 
+from kt.utils import get_kt_env, get_kt_model_paths, get_kt_server_args
+
 from sglang.bench_serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -19,8 +21,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-
-from .utils import get_kt_env, get_kt_model_paths, get_kt_server_args
 
 
 def save_performance_results(
