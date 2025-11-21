@@ -53,7 +53,7 @@ jobs:
     needs: [check-changes]
     if: always() && !failure() && !cancelled() &&
       (needs.check-changes.outputs.kt_amx == 'true' || github.event_name == 'workflow_dispatch')
-    runs-on: self-hosted
+    runs-on: kt-amx-1gpu
     continue-on-error: false
     steps:
       - name: Cleanup
