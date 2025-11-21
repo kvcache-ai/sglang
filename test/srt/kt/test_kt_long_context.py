@@ -7,11 +7,16 @@ Measures prefill latency, decode throughput, and total performance.
 
 import json
 import os
+import sys
 import time
 import unittest
 from datetime import datetime
 
 import psutil
+
+# Add test/srt to path for kt module imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from kt.utils import get_kt_env, get_kt_model_paths, get_kt_server_args
 
 from sglang.srt.utils import kill_process_tree

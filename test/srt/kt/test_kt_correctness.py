@@ -7,9 +7,13 @@ does not significantly degrade model reasoning capability.
 
 import json
 import os
+import sys
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
+
+# Add test/srt to path for kt module imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kt.utils import get_kt_env, get_kt_model_paths, get_kt_server_args
 
