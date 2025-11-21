@@ -4,7 +4,12 @@ Basic tests for KT-kernel integration
 Tests basic inference workflow with different GPU configurations.
 """
 
+import os
+import sys
 import unittest
+
+# Add test/srt to path for kt module imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kt.utils import (
     TEST_PROMPTS,
