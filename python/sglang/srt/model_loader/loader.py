@@ -14,6 +14,7 @@ import os
 import socket
 import threading
 import time
+import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, suppress
 from typing import (
@@ -112,6 +113,25 @@ if TYPE_CHECKING:
 _is_npu = is_npu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
 # which contains the complete mapping of quantization config choices
+
+_KT_ROOT_MODEL_ATTR = "_kt_root_model"
+
+
+def _attach_root_model_reference(model: nn.Module) -> None:
+    """Annotate every module with a reference to the root model.
+
+    This makes it possible for auxiliary components (e.g. KT fallback) to
+    rediscover the owning model object without relying on model-specific
+    wiring or modifying individual model implementations.
+    """
+    root_ref = weakref.ref(model)
+
+    for module in model.modules():
+        try:
+            object.__setattr__(module, _KT_ROOT_MODEL_ATTR, root_ref)
+        except Exception:
+            # Some custom module types may forbid attribute assignment; skip them.
+            pass
 
 
 @contextmanager
@@ -260,7 +280,9 @@ def _initialize_model(
         kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
         kwargs["model_path"] = model_config.model_path
 
-    return model_class(**kwargs)
+    model = model_class(**kwargs)
+    _attach_root_model_reference(model)
+    return model
 
 
 class BaseModelLoader(ABC):
@@ -485,8 +507,20 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        # Apply the prefix and annotate tensors with their checkpoint key so that
+        # downstream components can recover the original name when re-loading
+        # weights (e.g. during KT full-GPU fallback).
+
+        def prefixed_iterator():
+            for name, tensor in weights_iterator:
+                full_name = source.prefix + name
+                try:
+                    setattr(tensor, "_checkpoint_name", full_name)
+                except Exception:
+                    pass
+                yield full_name, tensor
+
+        return prefixed_iterator()
 
     def _get_all_weights(
         self,
@@ -555,6 +589,7 @@ class DefaultModelLoader(BaseModelLoader):
             **model_kwargs,
             trust_remote_code=True,
         )
+        _attach_root_model_reference(model)
         # Handle both legacy modelopt_quant and unified quantization flags
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Legacy approach
