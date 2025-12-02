@@ -163,10 +163,6 @@ class FusedMoE(torch.nn.Module):
         is_gated: bool = True,
     ):
         super().__init__()
-        # Store the weight prefix so downstream loaders can infer the
-        # checkpoint namespace for this layer when materializing weights on
-        # demand.
-        self.weight_prefix = prefix
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -232,17 +228,10 @@ class FusedMoE(torch.nn.Module):
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
             if quant_config is not None:
-
-                def method_factory(target_layer: "FusedMoE"):
-                    return quant_config.get_quant_method(target_layer, prefix)
-
+                gpu_method = quant_config.get_quant_method(self, prefix)
             else:
-
-                def method_factory(_target_layer: "FusedMoE"):
-                    return UnquantizedFusedMoEMethod(self.use_triton_kernels)
-
-            gpu_method = method_factory(self)
-            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config, method_factory)
+                gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
             if quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
@@ -548,8 +537,6 @@ class FusedMoE(torch.nn.Module):
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
-        if getattr(self, "_kt_force_global_loading", False):
-            global_expert_location_metadata = None
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
