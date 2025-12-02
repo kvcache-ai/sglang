@@ -7,12 +7,22 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 (using any quantization method) and CPU experts (using AMX/AVX instructions).
 """
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+import copy
+import ctypes
+import logging
+import time
+from dataclasses import dataclass, replace
+from multiprocessing import shared_memory
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import get_compiler_backend
 
@@ -32,6 +42,9 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class KTConfig:
     """Configuration for KTransformers heterogeneous computing CPU part.
@@ -45,6 +58,7 @@ class KTConfig:
         chunked_prefill_size: Chunk size for prefill computation
         method: CPU computation method (e.g., "int4")
         num_layers: Total number of layers in the model (optional)
+        gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
     """
 
     layer_idx: int
@@ -56,6 +70,219 @@ class KTConfig:
     max_deferred_experts_per_token: int
     method: str
     num_layers: Optional[int] = None
+    gpu_prefill_token_threshold: Optional[int] = None
+
+
+_SHARED_FULL_CONTEXT = None
+
+
+class SharedFullContext:
+    def __init__(
+        self,
+        layer: torch.nn.Module,
+        init_args: tuple,
+        global_num_experts: int,
+        moe_runner_config: "MoeRunnerConfig",
+    ):
+        self._build_layers(layer, init_args, global_num_experts, moe_runner_config)
+
+        # Capture original tensors to support restoration before loading
+        self.original_params = {
+            name: param for name, param in self.gpu_layer.named_parameters()
+        }
+        self.original_buffers = {
+            name: buf for name, buf in self.gpu_layer.named_buffers()
+        }
+
+        # Create CPU buffers once for weight loading (shared across layers)
+        self._create_cpu_buffers()
+
+    def _build_layers(self, layer, init_args, global_num_experts, moe_runner_config):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        hidden_size, intermediate_size_per_partition, params_dtype = init_args
+        target_device = next(layer.parameters()).device
+
+        # Create gpu_layer as a shallow copy, then override specific attributes
+        self.gpu_layer = copy.copy(layer)
+        # Clear module state that shouldn't be shared
+        self.gpu_layer._parameters = {}
+        self.gpu_layer._buffers = {}
+        self.gpu_layer._modules = {}
+
+        # Override expert counts for full GPU execution
+        self.gpu_layer.num_experts = global_num_experts
+        self.gpu_layer.num_local_experts = global_num_experts
+        self.gpu_layer.num_gpu_experts = global_num_experts
+
+        # Create quant_method for gpu_layer
+        if self.gpu_layer.quant_config is not None:
+            self.gpu_method = self.gpu_layer.quant_config.get_quant_method(
+                self.gpu_layer, prefix=""
+            )
+        else:
+            self.gpu_method = UnquantizedFusedMoEMethod(
+                self.gpu_layer.use_triton_kernels
+            )
+        self.gpu_layer.quant_method = self.gpu_method
+
+        self.gpu_method.create_weights(
+            layer=self.gpu_layer,
+            num_experts=global_num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+        )
+
+        # Move all parameters to target device
+        for param in self.gpu_layer.parameters():
+            if param.device != target_device:
+                param.data = param.data.to(target_device)
+
+        # Create runner config
+        runner_config = replace(moe_runner_config, num_local_experts=global_num_experts)
+        self.gpu_layer.moe_runner_config = runner_config
+        self.gpu_method.create_moe_runner(self.gpu_layer, runner_config)
+
+    # Weight names for shared memory buffers
+    WEIGHT_NAMES = [
+        "w13_weight_packed",
+        "w13_weight_scale",
+        "w2_weight_packed",
+        "w2_weight_scale",
+    ]
+
+    def _create_cpu_buffers(self):
+        """Create CPU buffers in POSIX shared memory and register as pinned memory."""
+        self.cpu_buffers = {}
+        self.shm_handles: Dict[str, shared_memory.SharedMemory] = {}
+        tp_rank = get_tensor_model_parallel_rank()
+
+        for name in self.WEIGHT_NAMES:
+            gpu_tensor = getattr(self.gpu_layer, name)
+            nbytes = gpu_tensor.numel() * gpu_tensor.element_size()
+            shm_name = f"kt_buf_{name}_r{tp_rank}"
+            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=nbytes)
+            self.shm_handles[name] = shm
+
+            cpu_buffer = torch.frombuffer(shm.buf, dtype=gpu_tensor.dtype).reshape(
+                gpu_tensor.shape
+            )
+
+            # Register as pinned memory for fast DMA
+            if torch.cuda.is_available():
+                torch.cuda.cudart().cudaHostRegister(cpu_buffer.data_ptr(), nbytes, 0)
+
+            self.cpu_buffers[name] = cpu_buffer
+
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group().device_group)
+
+        self.all_rank_buffer_ptrs = self._collect_all_rank_buffer_pointers()
+
+        # Unlink shared memory after all ranks have collected pointers.
+        # The memory remains accessible as long as we hold references via mmap.
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group().device_group)
+        for shm in self.shm_handles.values():
+            shm.unlink()
+
+    def _collect_all_rank_buffer_pointers(self) -> Dict[str, List[int]]:
+        """Collect CPU buffer pointers from all ranks."""
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+        buffer_names = list(self.cpu_buffers.keys())
+        all_rank_ptrs: Dict[str, List[int]] = {name: [] for name in buffer_names}
+        self._opened_shm_refs: Dict[str, shared_memory.SharedMemory] = {}
+
+        for rank in range(tp_world_size):
+            for name in buffer_names:
+                if rank == tp_rank:
+                    ptr = self.cpu_buffers[name].data_ptr()
+                elif tp_rank == 0:
+                    shm_name = f"kt_buf_{name}_r{rank}"
+                    try:
+                        shm = shared_memory.SharedMemory(name=shm_name)
+                        self._opened_shm_refs[f"{name}_r{rank}"] = shm
+                        ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+                    except FileNotFoundError:
+                        logger.error(
+                            "Rank %d: Failed to open shared memory '%s'",
+                            tp_rank,
+                            shm_name,
+                        )
+                        ptr = 0
+                else:
+                    ptr = 0
+                all_rank_ptrs[name].append(ptr)
+
+        return all_rank_ptrs
+
+    def _copy_cpu_to_gpu_buffers(self):
+        """Copy data from shared memory (pinned) directly to GPU."""
+        for name, cpu_buffer in self.cpu_buffers.items():
+            gpu_tensor = getattr(self.gpu_layer, name)
+            gpu_tensor.copy_(cpu_buffer, non_blocking=True)
+            tmp = (
+                gpu_tensor.reshape(
+                    gpu_tensor.size(0), gpu_tensor.size(2), gpu_tensor.size(1)
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            gpu_tensor.copy_(tmp, non_blocking=True)
+
+    def load(self, layer_idx, wrapper):
+        """Load weights from disk to GPU via shared memory."""
+        for name, param in self.original_params.items():
+            setattr(self.gpu_layer, name, param)
+        for name, buf in self.original_buffers.items():
+            self.gpu_layer.register_buffer(name, buf)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        tp_rank = get_tensor_model_parallel_rank()
+        t0 = time.perf_counter()
+
+        if tp_rank == 0 and wrapper is not None:
+            wrapper.submit_write_weight_scale_to_buffer(
+                get_tensor_model_parallel_world_size(),
+                self.gpu_layer.num_experts,
+                self.all_rank_buffer_ptrs["w13_weight_packed"],
+                self.all_rank_buffer_ptrs["w13_weight_scale"],
+                self.all_rank_buffer_ptrs["w2_weight_packed"],
+                self.all_rank_buffer_ptrs["w2_weight_scale"],
+            )
+            wrapper.sync_write_weight_scale_to_buffer()
+
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group().device_group)
+        write_time = (time.perf_counter() - t0) * 1000.0
+
+        t1 = time.perf_counter()
+        self._copy_cpu_to_gpu_buffers()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        copy_time = (time.perf_counter() - t1) * 1000.0
+
+        t2 = time.perf_counter()
+        if hasattr(self.gpu_method, "process_weights_after_loading"):
+            self.gpu_method.process_weights_after_loading(self.gpu_layer)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        process_time = (time.perf_counter() - t2) * 1000.0
+
+        logger.info(
+            "KT fallback: layer %d rank %d write=%.2f ms copy=%.2f ms process=%.2f ms",
+            layer_idx,
+            tp_rank,
+            write_time,
+            copy_time,
+            process_time,
+        )
 
 
 def create_kt_config_from_server_args(
@@ -73,14 +300,9 @@ def create_kt_config_from_server_args(
     if server_args.kt_weight_path is None:
         return None
 
-    # Try to get num_layers from model config
-    num_layers = None
-    try:
-        hf_config = server_args.get_hf_config()
-        num_layers = getattr(hf_config, "num_hidden_layers", None)
-    except Exception:
-        # If we can't get the config, num_layers will be None
-        pass
+    # Get num_layers from model config
+    hf_config = server_args.get_hf_config()
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -92,6 +314,7 @@ def create_kt_config_from_server_args(
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
+        gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
     )
 
 
@@ -156,11 +379,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        # KT wrapper will be initialized in create_weights
+        self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
+        self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
-
-        # Store parameters needed for KT initialization
-        self._layer_params = None
 
     def create_weights(
         self,
@@ -182,8 +403,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs: Additional weight attributes
         """
         self.global_num_experts = num_experts
-        self.hidden_size = hidden_size
-        self.intermediate_size_per_partition = intermediate_size_per_partition
+        self._full_init_args = (
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+        )
 
         # Get required parameters from layer object
         # top_k: number of experts selected per token
@@ -344,6 +568,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+
+        # Check for full GPU fallback
+        if (
+            self.gpu_prefill_token_threshold > 0
+            and num_tokens >= self.gpu_prefill_token_threshold
+        ):
+            ctx = self._build_full_context(layer)
+            return ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
 
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
@@ -391,3 +624,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
 
         return getattr(self.gpu_method, name)
+
+    def _build_full_context(self, layer: torch.nn.Module) -> "SharedFullContext":
+        global _SHARED_FULL_CONTEXT
+
+        if _SHARED_FULL_CONTEXT is None:
+            _SHARED_FULL_CONTEXT = SharedFullContext(
+                layer=layer,
+                init_args=self._full_init_args,
+                global_num_experts=self.global_num_experts,
+                moe_runner_config=self.moe_runner_config,
+            )
+
+        _SHARED_FULL_CONTEXT.load(
+            layer_idx=self.kt_config.layer_idx,
+            wrapper=self.wrapper,
+        )
+        return _SHARED_FULL_CONTEXT
