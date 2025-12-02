@@ -453,7 +453,7 @@ class ServerArgs:
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
-    kt_prefill_token_threshold: Optional[int] = None
+    kt_gpu_prefill_token_threshold: Optional[int] = None
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -3306,9 +3306,9 @@ class ServerArgs:
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
         parser.add_argument(
-            "--kt-prefill-token-threshold",
+            "--kt-gpu-prefill-token-threshold",
             type=int,
-            default=ServerArgs.kt_prefill_token_threshold,
+            default=ServerArgs.kt_gpu_prefill_token_threshold,
             help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
         )
 
