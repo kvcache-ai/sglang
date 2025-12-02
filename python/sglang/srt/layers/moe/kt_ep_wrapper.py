@@ -58,7 +58,7 @@ class KTConfig:
         chunked_prefill_size: Chunk size for prefill computation
         method: CPU computation method (e.g., "int4")
         num_layers: Total number of layers in the model (optional)
-        prefill_token_threshold: token threshold for enabling full GPU fallback
+        gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
     """
 
     layer_idx: int
@@ -70,7 +70,7 @@ class KTConfig:
     max_deferred_experts_per_token: int
     method: str
     num_layers: Optional[int] = None
-    prefill_token_threshold: Optional[int] = None
+    gpu_prefill_token_threshold: Optional[int] = None
 
 
 _SHARED_FULL_CONTEXT = None
@@ -314,7 +314,7 @@ def create_kt_config_from_server_args(
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
-        prefill_token_threshold=server_args.kt_prefill_token_threshold,
+        gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
     )
 
 
@@ -379,7 +379,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        self.prefill_token_threshold = kt_config.prefill_token_threshold or 0
+        self.gpu_prefill_token_threshold = kt_config.gpu_prefill_token_threshold or 0
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
@@ -572,8 +572,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Check for full GPU fallback
         if (
-            self.prefill_token_threshold > 0
-            and num_tokens >= self.prefill_token_threshold
+            self.gpu_prefill_token_threshold > 0
+            and num_tokens >= self.gpu_prefill_token_threshold
         ):
             ctx = self._build_full_context(layer)
             return ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
