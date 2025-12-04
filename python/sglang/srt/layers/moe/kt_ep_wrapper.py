@@ -221,18 +221,22 @@ class SharedFullContext:
         return all_rank_ptrs
 
     def _copy_cpu_to_gpu_buffers(self):
-        """Copy data from shared memory (pinned) directly to GPU."""
+        """Copy data from shared memory (pinned) directly to GPU.
+
+        Process one expert at a time to reduce temporary GPU memory usage
+        from O(num_experts * dim1 * dim2) to O(dim1 * dim2).
+        """
         for name, cpu_buffer in self.cpu_buffers.items():
             gpu_tensor = getattr(self.gpu_layer, name)
             gpu_tensor.copy_(cpu_buffer, non_blocking=True)
-            tmp = (
-                gpu_tensor.reshape(
-                    gpu_tensor.size(0), gpu_tensor.size(2), gpu_tensor.size(1)
-                )
-                .transpose(1, 2)
-                .contiguous()
-            )
-            gpu_tensor.copy_(tmp, non_blocking=True)
+            # Pre-allocate tmp buffer for single expert to avoid repeated allocation
+            num_experts = gpu_tensor.size(0)
+            dim1, dim2 = gpu_tensor.size(1), gpu_tensor.size(2)
+            tmp = torch.empty(dim1, dim2, dtype=gpu_tensor.dtype, device=gpu_tensor.device)
+            for i in range(num_experts):
+                # Transpose by reshaping and copying with transposed strides
+                tmp.copy_(gpu_tensor[i].reshape(dim2, dim1).T, non_blocking=True)
+                gpu_tensor[i].copy_(tmp, non_blocking=True)
 
     def load(self, layer_idx, wrapper):
         """Load weights from disk to GPU via shared memory."""
