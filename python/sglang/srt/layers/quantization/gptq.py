@@ -89,6 +89,33 @@ def gptq_marlin_moe_repack(
     return output
 
 
+def gptq_marlin_moe_repack_inplace(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    num_experts = b_q_weight.shape[0]
+    assert size_k % 16 == 0
+
+    # 对每个专家进行处理
+    for e in range(num_experts):
+        # 先获取gptq_marlin_repack的结果
+        tmp = gptq_marlin_repack(b_q_weight[e], perm[e], size_k, size_n, num_bits)
+
+        # 将tmp调整成与b_q_weight的形状匹配
+        tmp_reshaped = tmp.view(b_q_weight[e].shape)
+
+        # 将tmp_reshaped原地赋值回b_q_weight[e]
+        b_q_weight[e] = tmp_reshaped
+
+    b_q_weight.set_(
+        b_q_weight.view(num_experts, size_k // 16, size_n * (num_bits // 2))
+    )
+    return b_q_weight
+
+
 @dataclass
 class MarlinLinearLayerConfig:
     full_weight_shape: tuple[int, int]  # [in, out]

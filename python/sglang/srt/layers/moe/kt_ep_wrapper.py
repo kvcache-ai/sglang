@@ -228,11 +228,14 @@ class SharedFullContext:
         """
         for name, cpu_buffer in self.cpu_buffers.items():
             gpu_tensor = getattr(self.gpu_layer, name)
+            gpu_tensor.set_(gpu_tensor.view(cpu_buffer.shape))
             gpu_tensor.copy_(cpu_buffer, non_blocking=True)
             # Pre-allocate tmp buffer for single expert to avoid repeated allocation
             num_experts = gpu_tensor.size(0)
             dim1, dim2 = gpu_tensor.size(1), gpu_tensor.size(2)
-            tmp = torch.empty(dim1, dim2, dtype=gpu_tensor.dtype, device=gpu_tensor.device)
+            tmp = torch.empty(
+                dim1, dim2, dtype=gpu_tensor.dtype, device=gpu_tensor.device
+            )
             for i in range(num_experts):
                 # Transpose by reshaping and copying with transposed strides
                 tmp.copy_(gpu_tensor[i].reshape(dim2, dim1).T, non_blocking=True)

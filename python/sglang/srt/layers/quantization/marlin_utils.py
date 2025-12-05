@@ -343,6 +343,20 @@ def marlin_moe_permute_scales(
     return output
 
 
+def marlin_moe_permute_scales_inplace(
+    s: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+):
+    num_experts = s.shape[0]
+
+    for e in range(num_experts):
+        permuted_s = marlin_permute_scales(s[e], size_k, size_n, group_size)
+        s[e] = permuted_s.view(s[e].shape)
+    return s
+
+
 def marlin_zero_points(
     zp: torch.Tensor, size_k: int, size_n: int, num_bits: int
 ) -> torch.Tensor:
