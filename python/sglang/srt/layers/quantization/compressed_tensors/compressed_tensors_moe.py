@@ -26,10 +26,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack_inplace
-from sglang.srt.layers.quantization.marlin_utils import (
-    marlin_moe_permute_scales_inplace,
-)
+from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
+from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
@@ -583,71 +581,39 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
 
-        # marlin_w13_qweight = gptq_marlin_moe_repack(
-        #     layer.w13_weight_packed,
-        #     layer.w13_g_idx_sort_indices,
-        #     layer.w13_weight_packed.shape[1] * self.packed_factor,
-        #     layer.w13_weight_packed.shape[2],
-        #     self.num_bits,
-        # )
-        # replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
-
-        # marlin_w2_qweight = gptq_marlin_moe_repack(
-        #     layer.w2_weight_packed,
-        #     layer.w2_g_idx_sort_indices,
-        #     layer.w2_weight_packed.shape[1] * self.packed_factor,
-        #     layer.w2_weight_packed.shape[2],
-        #     self.num_bits,
-        # )
-        # replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
-
-        # # Repack scales
-        # marlin_w13_scales = marlin_moe_permute_scales(
-        #     layer.w13_weight_scale,
-        #     layer.w13_weight_packed.shape[2],
-        #     layer.w13_weight_scale.shape[2],
-        #     self.group_size,
-        # )
-        # replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
-
-        # marlin_w2_scales = marlin_moe_permute_scales(
-        #     layer.w2_weight_scale,
-        #     layer.w2_weight_scale.shape[1]
-        #     * (self.group_size if self.group_size != -1 else self.packed_factor),
-        #     layer.w2_weight_scale.shape[2],
-        #     self.group_size,
-        # )
-        # replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
-
-        gptq_marlin_moe_repack_inplace(
+        marlin_w13_qweight = gptq_marlin_moe_repack(
             layer.w13_weight_packed,
             layer.w13_g_idx_sort_indices,
             layer.w13_weight_packed.shape[1] * self.packed_factor,
             layer.w13_weight_packed.shape[2],
             self.num_bits,
         )
-        gptq_marlin_moe_repack_inplace(
+        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
+        marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
             layer.w2_weight_packed.shape[1] * self.packed_factor,
             layer.w2_weight_packed.shape[2],
             self.num_bits,
         )
-
-        marlin_moe_permute_scales_inplace(
+        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
+        # Repack scales
+        marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
             layer.w13_weight_packed.shape[2],
             layer.w13_weight_scale.shape[2],
             self.group_size,
         )
+        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
 
-        marlin_moe_permute_scales_inplace(
+        marlin_w2_scales = marlin_moe_permute_scales(
             layer.w2_weight_scale,
             layer.w2_weight_scale.shape[1]
             * (self.group_size if self.group_size != -1 else self.packed_factor),
             layer.w2_weight_scale.shape[2],
             self.group_size,
         )
+        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
