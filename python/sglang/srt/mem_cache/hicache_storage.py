@@ -178,6 +178,10 @@ class HiCacheStorage(ABC):
     def get_stats(self):
         return None
 
+    def delete(self) -> None:
+        """Hook to tear down backend-specific resources during shutdown."""
+        pass
+
 
 class HiCacheFile(HiCacheStorage):
 
