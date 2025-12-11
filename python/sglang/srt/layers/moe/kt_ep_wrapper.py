@@ -24,7 +24,11 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+from sglang.srt.utils import get_compiler_backend, is_cuda
+
+if is_cuda():
+    from sgl_kernel import gptq_marlin_repack
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -220,26 +224,116 @@ class SharedFullContext:
 
         return all_rank_ptrs
 
-    def _copy_cpu_to_gpu_buffers(self):
-        """Copy data from shared memory (pinned) directly to GPU.
+    def _copy_and_postprocess_pipelined(self):
+        """Copy and postprocess weights with pipelining for better overlap.
 
-        Process one expert at a time to reduce temporary GPU memory usage
-        from O(num_experts * dim1 * dim2) to O(dim1 * dim2).
+        Extracted from CompressedTensorsWNA16MoEMethod.process_weights_after_loading
+        in python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+
+        Pipeline: copy(expert e) runs in parallel with postprocess(expert e-1)
         """
-        for name, cpu_buffer in self.cpu_buffers.items():
-            gpu_tensor = getattr(self.gpu_layer, name)
-            gpu_tensor.set_(gpu_tensor.view(cpu_buffer.shape))
-            gpu_tensor.copy_(cpu_buffer, non_blocking=True)
-            # Pre-allocate tmp buffer for single expert to avoid repeated allocation
-            num_experts = gpu_tensor.size(0)
-            dim1, dim2 = gpu_tensor.size(1), gpu_tensor.size(2)
-            tmp = torch.empty(
-                dim1, dim2, dtype=gpu_tensor.dtype, device=gpu_tensor.device
+        layer = self.gpu_layer
+        method = self.gpu_method
+
+        num_bits = method.num_bits
+        packed_factor = method.packed_factor
+        group_size = method.group_size
+        actorder = getattr(method, "actorder", None)
+        num_experts = layer.num_experts
+        device = layer.w13_weight_packed.device
+
+        # Create empty g_idx tensors for non-grouped actorder
+        if actorder != "group":
+            for name in [
+                "w13_weight_g_idx",
+                "w2_weight_g_idx",
+                "w13_g_idx_sort_indices",
+                "w2_g_idx_sort_indices",
+            ]:
+                setattr(
+                    layer,
+                    name,
+                    torch.nn.Parameter(
+                        torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                        requires_grad=False,
+                    ),
+                )
+
+        # Prepare weight tensors
+        weight_infos = []
+        for name in self.WEIGHT_NAMES:
+            cpu_buf = self.cpu_buffers[name]
+            gpu_t = getattr(layer, name)
+            gpu_t.set_(gpu_t.view(cpu_buf.shape))
+            weight_infos.append((cpu_buf, gpu_t))
+
+        w13_p, w13_s = layer.w13_weight_packed, layer.w13_weight_scale
+        w2_p, w2_s = layer.w2_weight_packed, layer.w2_weight_scale
+        w13_k, w13_n = w13_p.shape[1] * packed_factor, w13_p.shape[2]
+        w2_k, w2_n = w2_p.shape[1] * packed_factor, w2_p.shape[2]
+        w2_sk = w2_s.shape[1] * (group_size if group_size != -1 else packed_factor)
+        perm = torch.empty(0, dtype=torch.int32, device=device)
+
+        # Tmp buffers for transpose
+        tmp_bufs = [
+            torch.empty(t.size(1), t.size(2), dtype=t.dtype, device=device)
+            for _, t in weight_infos
+        ]
+
+        def postprocess_expert(e):
+            # Transpose
+            for (_, gpu_t), tmp in zip(weight_infos, tmp_bufs):
+                d1, d2 = gpu_t.size(1), gpu_t.size(2)
+                tmp.copy_(gpu_t[e].reshape(d2, d1).T, non_blocking=True)
+                gpu_t[e].copy_(tmp, non_blocking=True)
+            # Repack weights
+            w13_p[e].copy_(
+                gptq_marlin_repack(w13_p[e], perm, w13_k, w13_n, num_bits).view(
+                    w13_p[e].shape
+                )
             )
-            for i in range(num_experts):
-                # Transpose by reshaping and copying with transposed strides
-                tmp.copy_(gpu_tensor[i].reshape(dim2, dim1).T, non_blocking=True)
-                gpu_tensor[i].copy_(tmp, non_blocking=True)
+            w2_p[e].copy_(
+                gptq_marlin_repack(w2_p[e], perm, w2_k, w2_n, num_bits).view(
+                    w2_p[e].shape
+                )
+            )
+            # Permute scales
+            w13_s[e].copy_(
+                marlin_permute_scales(w13_s[e], w13_n, w13_s.shape[2], group_size).view(
+                    w13_s[e].shape
+                )
+            )
+            w2_s[e].copy_(
+                marlin_permute_scales(w2_s[e], w2_sk, w2_s.shape[2], group_size).view(
+                    w2_s[e].shape
+                )
+            )
+
+        # Pipeline: copy(e) || postprocess(e-1)
+        copy_stream = torch.cuda.Stream(device=device)
+        post_stream = torch.cuda.Stream(device=device)
+        events = [torch.cuda.Event() for _ in range(num_experts)]
+
+        for e in range(num_experts):
+            with torch.cuda.stream(copy_stream):
+                for cpu_buf, gpu_t in weight_infos:
+                    gpu_t[e].copy_(cpu_buf[e], non_blocking=True)
+                events[e].record(copy_stream)
+
+            if e > 0:
+                with torch.cuda.stream(post_stream):
+                    post_stream.wait_event(events[e - 1])
+                    postprocess_expert(e - 1)
+
+        with torch.cuda.stream(post_stream):
+            post_stream.wait_event(events[-1])
+            postprocess_expert(num_experts - 1)
+
+        torch.cuda.current_stream(device).wait_stream(post_stream)
+
+        # Reshape to final shape
+        w13_p.set_(w13_p.view(num_experts, w13_k // 16, w13_n * (num_bits // 2)))
+        w2_p.set_(w2_p.view(num_experts, w2_k // 16, w2_n * (num_bits // 2)))
 
     def load(self, layer_idx, wrapper):
         """Load weights from disk to GPU via shared memory."""
@@ -270,25 +364,17 @@ class SharedFullContext:
         write_time = (time.perf_counter() - t0) * 1000.0
 
         t1 = time.perf_counter()
-        self._copy_cpu_to_gpu_buffers()
+        self._copy_and_postprocess_pipelined()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        copy_time = (time.perf_counter() - t1) * 1000.0
-
-        t2 = time.perf_counter()
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
-            self.gpu_method.process_weights_after_loading(self.gpu_layer)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        process_time = (time.perf_counter() - t2) * 1000.0
+        copy_postprocess_time = (time.perf_counter() - t1) * 1000.0
 
         logger.info(
-            "KT fallback: layer %d rank %d write=%.2f ms copy=%.2f ms process=%.2f ms",
+            "KT fallback: layer %d rank %d write=%.2f ms copy+postprocess=%.2f ms",
             layer_idx,
             tp_rank,
             write_time,
-            copy_time,
-            process_time,
+            copy_postprocess_time,
         )
 
 
@@ -583,7 +669,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and num_tokens >= self.gpu_prefill_token_threshold
         ):
             ctx = self._build_full_context(layer)
-            return ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
+
+            t_compute = time.perf_counter()
+            result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            compute_time = (time.perf_counter() - t_compute) * 1000.0
+            logger.info(
+                "KT fallback: layer %d rank %d compute=%.2f ms",
+                self.kt_config.layer_idx,
+                self.tp_rank,
+                compute_time,
+            )
+            return result
 
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
