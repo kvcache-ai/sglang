@@ -425,6 +425,79 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+    def _clear_queue(self, queue: Optional[Queue]):
+        if queue is None:
+            return
+        try:
+            queue.queue.clear()
+        except AttributeError:
+            while True:
+                try:
+                    queue.get_nowait()
+                except Empty:
+                    break
+
+    def stop_storage_threads(self, timeout: Optional[float] = None) -> bool:
+        """Stop prefetch and backup threads gracefully."""
+
+        if not self.enable_storage:
+            return True
+
+        logger.info("Stopping HiCache storage threads.")
+        self.stop_event.set()
+
+        success = True
+        for thread in (
+            getattr(self, "prefetch_thread", None),
+            getattr(self, "backup_thread", None),
+        ):
+            if thread is None:
+                continue
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning("Thread %s failed to stop in time", thread.name)
+                success = False
+
+        self.prefetch_thread = None
+        self.backup_thread = None
+
+        self._clear_queue(getattr(self, "prefetch_queue", None))
+        self._clear_queue(getattr(self, "backup_queue", None))
+        self._clear_queue(getattr(self, "prefetch_revoke_queue", None))
+        self._clear_queue(getattr(self, "ack_backup_queue", None))
+        self._clear_queue(getattr(self, "host_mem_release_queue", None))
+        self._clear_queue(getattr(self, "prefetch_buffer", None))
+
+        self.stop_event.clear()
+        return success
+
+    def delete_storage_backend(self, timeout: Optional[float] = None) -> bool:
+        """Stop HiCache storage threads and delete the backend instance."""
+
+        if not self.enable_storage:
+            logger.debug("HiCache storage backend is already disabled.")
+            return True
+
+        stop_success = self.stop_storage_threads(timeout=timeout)
+
+        backend = getattr(self, "storage_backend", None)
+        delete_success = True
+        if backend is not None:
+            delete_fn = getattr(backend, "delete", None)
+            if callable(delete_fn):
+                try:
+                    delete_fn()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to delete storage backend cleanly: %s", exc
+                    )
+                    delete_success = False
+            self.storage_backend = None
+
+        self.prefetch_tokens_occupied = 0
+        self.enable_storage = False
+        return stop_success and delete_success
+
     def write(
         self,
         device_indices: torch.Tensor,
