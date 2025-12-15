@@ -568,6 +568,15 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
+        if not self.enable_storage or not hasattr(self, 'storage_backend') or self.storage_backend is None:
+            logger.warning("Storage is not enabled or not available for prefetch operation.")
+            # Return a dummy prefetch operation that is already terminated
+            operation = PrefetchOperation(
+                request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            )
+            operation.mark_terminate()
+            return operation
+            
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
@@ -588,6 +597,9 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
+        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+            logger.warning("Storage backend is not available for prefetch operation.")
+            return
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
@@ -603,11 +615,18 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+            logger.warning("Storage backend is not available for prefetch operation.")
+            return
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
+            return
+        # Check if page_data is a list (expected) or an integer (error code)
+        if isinstance(page_data, int):
+            logger.warning(f"Prefetch operation {operation.request_id} failed with error code: {page_data}")
             return
         for i in range(len(hash_values)):
             if page_data[i] is None:
@@ -617,10 +636,12 @@ class HiCacheController:
                 break
             # Must set the data before increasing the completed tokens.
             # Otherwise this page may be read before being set.
-            self.mem_pool_host.set_from_flat_data_page(
-                host_indices[i * self.page_size],
-                page_data[i],
-            )
+            data_to_set = page_data[i]
+            if data_to_set is not None:
+                self.mem_pool_host.set_from_flat_data_page(
+                    host_indices[i * self.page_size],
+                    data_to_set,
+                )
             if not operation.increment(self.page_size):
                 break  # Operation terminated by controller
 
@@ -673,6 +694,10 @@ class HiCacheController:
         return False
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+            logger.warning("Storage backend is not available for hit query.")
+            return [], 0
+            
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -709,8 +734,8 @@ class HiCacheController:
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
-        aux_thread = threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
-        aux_thread.start()
+        self.aux_thread = threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
+        self.aux_thread.start()
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
@@ -763,6 +788,10 @@ class HiCacheController:
         """
         Write KV caches from host memory to storage backend.
         """
+        if not self.enable_storage or not hasattr(self, 'storage_backend') or self.storage_backend is None:
+            logger.warning("Storage is not enabled or not available for write operation.")
+            return -1
+            
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
@@ -771,6 +800,9 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
+        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+            logger.warning("Storage backend is not available for page set operation.")
+            return False
         data = [
             self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
@@ -778,6 +810,9 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
+        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+            logger.warning("Storage backend is not available for page set operation.")
+            return False
         return all(
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
@@ -821,3 +856,76 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def shutdown_storage(self):
+        """
+        Safely shutdown the prefetch and backup threads and delete the storage backend.
+        This method ensures all threads are properly stopped before deleting the storage backend.
+        """
+        if not self.enable_storage:
+            logger.info("Storage is not enabled, nothing to shutdown.")
+            return
+
+        # Set the stop event to signal threads to stop
+        self.stop_event.set()
+
+        # Clear all queues to unblock any waiting threads
+        try:
+            while True:
+                self.prefetch_queue.get_nowait()
+        except Empty:
+            pass
+
+        try:
+            while True:
+                self.backup_queue.get_nowait()
+        except Empty:
+            pass
+
+        try:
+            while True:
+                if hasattr(self, 'prefetch_buffer'):
+                    self.prefetch_buffer.get_nowait()
+                else:
+                    break
+        except Empty:
+            pass
+
+        # Wait for the main threads to finish
+        if hasattr(self, 'prefetch_thread') and self.prefetch_thread.is_alive():
+            self.prefetch_thread.join()
+
+        if hasattr(self, 'backup_thread') and self.backup_thread.is_alive():
+            self.backup_thread.join()
+
+        # Wait for the auxiliary thread too
+        if hasattr(self, 'aux_thread') and self.aux_thread.is_alive():
+            self.aux_thread.join()
+
+        # Clean up all storage-related queues and resources
+        if hasattr(self, 'prefetch_queue'):
+            self.prefetch_queue.queue.clear()
+        if hasattr(self, 'backup_queue'):
+            self.backup_queue.queue.clear()
+        if hasattr(self, 'prefetch_revoke_queue'):
+            self.prefetch_revoke_queue.queue.clear()
+        if hasattr(self, 'ack_backup_queue'):
+            self.ack_backup_queue.queue.clear()
+        if hasattr(self, 'host_mem_release_queue'):
+            self.host_mem_release_queue.queue.clear()
+        # Note: prefetch_buffer is created inside prefetch_thread_func and is a simple Queue
+        # It will be handled by the thread termination process
+
+        # Delete the storage backend safely
+        if hasattr(self, 'storage_backend') and self.storage_backend is not None:
+            # If the storage backend has a cleanup method, call it
+            if hasattr(self.storage_backend, 'clear'):
+                try:
+                    self.storage_backend.clear()
+                except Exception as e:
+                    logger.warning(f"Error clearing storage backend: {e}")
+            # Delete the reference to the storage backend
+            del self.storage_backend
+            self.storage_backend = None
+
+        logger.info("Storage subsystem has been safely shutdown.")
