@@ -320,6 +320,7 @@ class HiCacheController:
 
             if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
                 self.storage_backend_type == "dynamic"
+                and self.storage_config.extra_config
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
                 self.page_get_func = self._page_get_zero_copy
@@ -568,15 +569,21 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
-        if not self.enable_storage or not hasattr(self, 'storage_backend') or self.storage_backend is None:
-            logger.warning("Storage is not enabled or not available for prefetch operation.")
+        if (
+            not self.enable_storage
+            or not hasattr(self, "storage_backend")
+            or self.storage_backend is None
+        ):
+            logger.warning(
+                "Storage is not enabled or not available for prefetch operation."
+            )
             # Return a dummy prefetch operation that is already terminated
             operation = PrefetchOperation(
                 request_id, host_indices, new_input_tokens, last_hash, prefix_keys
             )
             operation.mark_terminate()
             return operation
-            
+
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
@@ -597,7 +604,7 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
-        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+        if not hasattr(self, "storage_backend") or self.storage_backend is None:
             logger.warning("Storage backend is not available for prefetch operation.")
             return
         results = self.storage_backend.batch_get_v1(
@@ -615,7 +622,7 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
-        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+        if not hasattr(self, "storage_backend") or self.storage_backend is None:
             logger.warning("Storage backend is not available for prefetch operation.")
             return
         dummy_page_dst = [
@@ -626,7 +633,9 @@ class HiCacheController:
             return
         # Check if page_data is a list (expected) or an integer (error code)
         if isinstance(page_data, int):
-            logger.warning(f"Prefetch operation {operation.request_id} failed with error code: {page_data}")
+            logger.warning(
+                f"Prefetch operation {operation.request_id} failed with error code: {page_data}"
+            )
             return
         for i in range(len(hash_values)):
             if page_data[i] is None:
@@ -694,10 +703,10 @@ class HiCacheController:
         return False
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+        if not hasattr(self, "storage_backend") or self.storage_backend is None:
             logger.warning("Storage backend is not available for hit query.")
             return [], 0
-            
+
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -734,7 +743,9 @@ class HiCacheController:
         Manage prefetching operations from storage backend to host memory.
         """
         self.prefetch_buffer = Queue()
-        self.aux_thread = threading.Thread(target=self.prefetch_io_aux_func, daemon=True)
+        self.aux_thread = threading.Thread(
+            target=self.prefetch_io_aux_func, daemon=True
+        )
         self.aux_thread.start()
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
@@ -788,10 +799,16 @@ class HiCacheController:
         """
         Write KV caches from host memory to storage backend.
         """
-        if not self.enable_storage or not hasattr(self, 'storage_backend') or self.storage_backend is None:
-            logger.warning("Storage is not enabled or not available for write operation.")
+        if (
+            not self.enable_storage
+            or not hasattr(self, "storage_backend")
+            or self.storage_backend is None
+        ):
+            logger.warning(
+                "Storage is not enabled or not available for write operation."
+            )
             return -1
-            
+
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
@@ -800,7 +817,7 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
-        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+        if not hasattr(self, "storage_backend") or self.storage_backend is None:
             logger.warning("Storage backend is not available for page set operation.")
             return False
         data = [
@@ -810,7 +827,7 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
-        if not hasattr(self, 'storage_backend') or self.storage_backend is None:
+        if not hasattr(self, "storage_backend") or self.storage_backend is None:
             logger.warning("Storage backend is not available for page set operation.")
             return False
         return all(
@@ -884,7 +901,7 @@ class HiCacheController:
 
         try:
             while True:
-                if hasattr(self, 'prefetch_buffer'):
+                if hasattr(self, "prefetch_buffer"):
                     self.prefetch_buffer.get_nowait()
                 else:
                     break
@@ -892,34 +909,34 @@ class HiCacheController:
             pass
 
         # Wait for the main threads to finish
-        if hasattr(self, 'prefetch_thread') and self.prefetch_thread.is_alive():
+        if hasattr(self, "prefetch_thread") and self.prefetch_thread.is_alive():
             self.prefetch_thread.join()
 
-        if hasattr(self, 'backup_thread') and self.backup_thread.is_alive():
+        if hasattr(self, "backup_thread") and self.backup_thread.is_alive():
             self.backup_thread.join()
 
         # Wait for the auxiliary thread too
-        if hasattr(self, 'aux_thread') and self.aux_thread.is_alive():
+        if hasattr(self, "aux_thread") and self.aux_thread.is_alive():
             self.aux_thread.join()
 
         # Clean up all storage-related queues and resources
-        if hasattr(self, 'prefetch_queue'):
+        if hasattr(self, "prefetch_queue"):
             self.prefetch_queue.queue.clear()
-        if hasattr(self, 'backup_queue'):
+        if hasattr(self, "backup_queue"):
             self.backup_queue.queue.clear()
-        if hasattr(self, 'prefetch_revoke_queue'):
+        if hasattr(self, "prefetch_revoke_queue"):
             self.prefetch_revoke_queue.queue.clear()
-        if hasattr(self, 'ack_backup_queue'):
+        if hasattr(self, "ack_backup_queue"):
             self.ack_backup_queue.queue.clear()
-        if hasattr(self, 'host_mem_release_queue'):
+        if hasattr(self, "host_mem_release_queue"):
             self.host_mem_release_queue.queue.clear()
         # Note: prefetch_buffer is created inside prefetch_thread_func and is a simple Queue
         # It will be handled by the thread termination process
 
         # Delete the storage backend safely
-        if hasattr(self, 'storage_backend') and self.storage_backend is not None:
+        if hasattr(self, "storage_backend") and self.storage_backend is not None:
             # If the storage backend has a cleanup method, call it
-            if hasattr(self.storage_backend, 'clear'):
+            if hasattr(self.storage_backend, "clear"):
                 try:
                     self.storage_backend.clear()
                 except Exception as e:
@@ -929,3 +946,135 @@ class HiCacheController:
             self.storage_backend = None
 
         logger.info("Storage subsystem has been safely shutdown.")
+
+    def reinit_storage(
+        self,
+        storage_backend: Optional[str] = None,
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+        prefetch_threshold: Optional[int] = None,
+    ):
+        """
+        Reinitialize the storage backend with new parameters.
+        
+        This method safely shuts down the current storage backend (if active) and
+        initializes a new one with the provided parameters. It handles all the
+        necessary cleanup and thread management to ensure a smooth transition.
+        
+        Args:
+            storage_backend: Type of storage backend to use (e.g., 'hf3fs', 'mooncake', 'eic', 'dynamic').
+                           If None, storage functionality will be disabled.
+            model_name: Name of the model to use for storage configuration.
+                       If None, will use the original model name if available.
+            storage_backend_extra_config: Extra configuration dictionary for the storage backend.
+            prefetch_threshold: Prefetch threshold value in number of tokens.
+                               If None, will use default value of 256.
+        
+        Raises:
+            ValueError: If the storage backend creation fails due to invalid parameters.
+            Exception: If there are issues during the reinitialization process.
+        """
+        logger.info("Starting storage reinitialization process...")
+        
+        # First, shutdown existing storage if enabled
+        if self.enable_storage:
+            logger.info("Shutting down existing storage backend...")
+            self.shutdown_storage()
+        
+        # If no storage backend is provided, disable storage functionality
+        if storage_backend is None:
+            self.enable_storage = False
+            logger.info("Storage has been disabled as no backend was specified.")
+            return
+
+        # Validate the provided storage backend type
+        valid_backends = ["hf3fs", "mooncake", "eic", "dynamic"]
+        if storage_backend not in valid_backends:
+            logger.warning(f"Unknown storage backend type: {storage_backend}. Valid types: {valid_backends}")
+        
+        # Set up new storage configuration
+        self.storage_backend_type = storage_backend
+        from sglang.srt.mem_cache.hicache_storage import get_hash_str
+        
+        self.get_hash_str = get_hash_str
+        self.storage_config = self._generate_storage_config(
+            model_name or self._get_original_model_name(), storage_backend_extra_config
+        )
+        
+        # for MLA models, only one rank needs to backup the KV cache
+        self.backup_skip = (
+            self.storage_config.is_mla_model
+            # todo: load balancing
+            and self.storage_config.tp_rank != 0
+        )
+
+        # Use storage backend factory for dynamic backend creation
+        from sglang.srt.mem_cache.storage import StorageBackendFactory
+
+        try:
+            self.storage_backend = StorageBackendFactory.create_backend(
+                storage_backend, self.storage_config, self.mem_pool_host
+            )
+        except ValueError as e:
+            logger.error(f"Failed to create storage backend: {e}")
+            raise ValueError(f"Failed to create storage backend: {e}") from e
+
+        self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+
+        self.enable_storage = True
+        # Update prefetch threshold if provided, otherwise use default value
+        self.prefetch_threshold = max(
+            prefetch_threshold or self._get_original_prefetch_threshold(), self.page_size
+        )
+        self.prefetch_capacity_limit = int(
+            0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
+        )
+        # granularity of batch storage IO operations, in number of pages
+        self.storage_batch_size = 128
+        # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
+        self.prefetch_tokens_occupied = 0
+
+        # Select the get and set functions based on storage type
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
+
+        if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
+            self.storage_backend_type == "dynamic"
+            and self.storage_config.extra_config
+            and bool(self.storage_config.extra_config.get("interface_v1", 0))
+        ):
+            self.page_get_func = self._page_get_zero_copy
+            self.page_set_func = self._page_set_zero_copy
+
+        # Initialize queues for the new storage backend
+        self.prefetch_queue = Queue()
+        self.backup_queue = Queue()
+        self.prefetch_revoke_queue = Queue()
+        self.ack_backup_queue = Queue()
+        self.host_mem_release_queue = Queue()
+
+        # Create and start threads for the new storage backend
+        self.prefetch_thread = threading.Thread(
+            target=self.prefetch_thread_func, daemon=True
+        )
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, daemon=True
+        )
+        self.prefetch_thread.start()
+        self.backup_thread.start()
+
+        # Reset stop event if it was set during shutdown
+        self.stop_event.clear()
+
+        logger.info(f"Storage subsystem has been successfully reinitialized with backend: {storage_backend}")
+
+    def _get_original_model_name(self):
+        """Helper method to get the original model name if available."""
+        # This would typically be stored during initial initialization
+        # For now, return None which will use the default
+        return None
+
+    def _get_original_prefetch_threshold(self):
+        """Helper method to get the original prefetch threshold if available."""
+        # Return default value since original value is not stored as instance variable
+        return 256
