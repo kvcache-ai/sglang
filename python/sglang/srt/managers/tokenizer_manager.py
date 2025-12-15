@@ -1836,6 +1836,69 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             completion_tokens = recv_obj.completion_tokens[i]
             meta_info["decode_throughput"] = completion_tokens / decode_time
 
+    async def reinit_hicache_storage(
+        self,
+        storage_backend: Optional[str] = None,
+        model_name: Optional[str] = None,
+        storage_backend_extra_config: Optional[dict] = None,
+        prefetch_threshold: Optional[int] = None,
+    ):
+        """
+        Reinitialize the HiCache storage backend with new parameters.
+
+        Args:
+            storage_backend: Type of storage backend to use (e.g., 'hf3fs', 'mooncake', 'eic', 'dynamic')
+            model_name: Name of the model (if different from original)
+            storage_backend_extra_config: Extra configuration for the storage backend
+            prefetch_threshold: Prefetch threshold value (if different from original)
+        """
+        if (
+            hasattr(self, "tree_cache")
+            and self.tree_cache is not None
+            and hasattr(self.tree_cache, "cache_controller")
+            and self.tree_cache.cache_controller is not None
+        ):
+            # Access the HiCacheController through the tree cache
+            hicache_controller = self.tree_cache.cache_controller
+            await hicache_controller.reinit_storage(
+                storage_backend=storage_backend,
+                model_name=model_name,
+                storage_backend_extra_config=storage_backend_extra_config,
+                prefetch_threshold=prefetch_threshold,
+            )
+            return {
+                "success": True,
+                "message": "HiCache storage backend reinitialized successfully",
+            }
+        else:
+            return {
+                "success": False,
+                "message": "HiCacheController is not available in the system",
+            }
+
+    async def shutdown_hicache_storage(self):
+        """
+        Shutdown the HiCache storage backend and stop all related threads.
+        """
+        if (
+            hasattr(self, "tree_cache")
+            and self.tree_cache is not None
+            and hasattr(self.tree_cache, "cache_controller")
+            and self.tree_cache.cache_controller is not None
+        ):
+            # Access the HiCacheController through the tree cache
+            hicache_controller = self.tree_cache.cache_controller
+            await hicache_controller.shutdown_storage()
+            return {
+                "success": True,
+                "message": "HiCache storage backend shut down successfully",
+            }
+        else:
+            return {
+                "success": False,
+                "message": "HiCacheController is not available in the system",
+            }
+
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]

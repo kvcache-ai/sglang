@@ -506,7 +506,7 @@ class HiCacheController:
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:
-            raise ValueError(f"Unsupported io backend")
+            raise ValueError(f"Unsupported io backend: {self.io_backend}")
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
@@ -956,11 +956,11 @@ class HiCacheController:
     ):
         """
         Reinitialize the storage backend with new parameters.
-        
+
         This method safely shuts down the current storage backend (if active) and
         initializes a new one with the provided parameters. It handles all the
         necessary cleanup and thread management to ensure a smooth transition.
-        
+
         Args:
             storage_backend: Type of storage backend to use (e.g., 'hf3fs', 'mooncake', 'eic', 'dynamic').
                            If None, storage functionality will be disabled.
@@ -969,18 +969,18 @@ class HiCacheController:
             storage_backend_extra_config: Extra configuration dictionary for the storage backend.
             prefetch_threshold: Prefetch threshold value in number of tokens.
                                If None, will use default value of 256.
-        
+
         Raises:
             ValueError: If the storage backend creation fails due to invalid parameters.
             Exception: If there are issues during the reinitialization process.
         """
         logger.info("Starting storage reinitialization process...")
-        
+
         # First, shutdown existing storage if enabled
         if self.enable_storage:
             logger.info("Shutting down existing storage backend...")
             self.shutdown_storage()
-        
+
         # If no storage backend is provided, disable storage functionality
         if storage_backend is None:
             self.enable_storage = False
@@ -990,17 +990,19 @@ class HiCacheController:
         # Validate the provided storage backend type
         valid_backends = ["hf3fs", "mooncake", "eic", "dynamic"]
         if storage_backend not in valid_backends:
-            logger.warning(f"Unknown storage backend type: {storage_backend}. Valid types: {valid_backends}")
-        
+            logger.warning(
+                f"Unknown storage backend type: {storage_backend}. Valid types: {valid_backends}"
+            )
+
         # Set up new storage configuration
         self.storage_backend_type = storage_backend
         from sglang.srt.mem_cache.hicache_storage import get_hash_str
-        
+
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
             model_name or self._get_original_model_name(), storage_backend_extra_config
         )
-        
+
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
@@ -1024,7 +1026,8 @@ class HiCacheController:
         self.enable_storage = True
         # Update prefetch threshold if provided, otherwise use default value
         self.prefetch_threshold = max(
-            prefetch_threshold or self._get_original_prefetch_threshold(), self.page_size
+            prefetch_threshold or self._get_original_prefetch_threshold(),
+            self.page_size,
         )
         self.prefetch_capacity_limit = int(
             0.8 * (self.mem_pool_host.size - self.mem_pool_device.size)
@@ -1066,7 +1069,9 @@ class HiCacheController:
         # Reset stop event if it was set during shutdown
         self.stop_event.clear()
 
-        logger.info(f"Storage subsystem has been successfully reinitialized with backend: {storage_backend}")
+        logger.info(
+            f"Storage subsystem has been successfully reinitialized with backend: {storage_backend}"
+        )
 
     def _get_original_model_name(self):
         """Helper method to get the original model name if available."""

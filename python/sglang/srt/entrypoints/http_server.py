@@ -690,6 +690,150 @@ async def clear_hicache_storage_backend():
     )
 
 
+@app.post("/reinit_hicache_storage_backend")
+async def reinit_hicache_storage_backend(
+    storage_backend: Optional[str] = None,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    prefetch_threshold: Optional[int] = None,
+):
+    """
+    Reinitialize the HiCache storage backend with new parameters.
+
+    Args:
+        storage_backend: Type of storage backend to use (e.g., 'hf3fs', 'mooncake', 'eic', 'dynamic')
+        model_name: Name of the model (if different from original)
+        storage_backend_extra_config: Extra configuration for the storage backend
+        prefetch_threshold: Prefetch threshold value (if different from original)
+    """
+    try:
+        result = await _global_state.tokenizer_manager.reinit_hicache_storage(
+            storage_backend=storage_backend,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            prefetch_threshold=prefetch_threshold,
+        )
+
+        return ORJSONResponse(
+            content=result,
+            status_code=(
+                HTTPStatus.OK if result["success"] else HTTPStatus.INTERNAL_SERVER_ERROR
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Error reinitializing HiCache storage backend: {e}")
+        return ORJSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
+@app.post("/shutdown_hicache_storage_backend")
+async def shutdown_hicache_storage_backend():
+    """
+    Shutdown the HiCache storage backend and stop all related threads.
+    """
+    try:
+        # Check if the tree cache has a cache controller with storage functionality
+        if (
+            hasattr(_global_state.tokenizer_manager, "tree_cache")
+            and _global_state.tokenizer_manager.tree_cache is not None
+            and hasattr(_global_state.tokenizer_manager.tree_cache, "cache_controller")
+            and _global_state.tokenizer_manager.tree_cache.cache_controller is not None
+        ):
+            # Access the HiCacheController through the tree cache
+            hicache_controller = (
+                _global_state.tokenizer_manager.tree_cache.cache_controller
+            )
+            await hicache_controller.shutdown_storage()
+            message = "HiCache storage backend shut down successfully"
+        else:
+            # If HiCache is not available, try to find it in scheduler directly
+            scheduler_obj = _global_state.tokenizer_manager
+            if hasattr(scheduler_obj, "cache_controller"):
+                await scheduler_obj.cache_controller.shutdown_storage()
+                message = "HiCache storage backend shut down successfully"
+            else:
+                return ORJSONResponse(
+                    content={
+                        "success": False,
+                        "message": "HiCacheController is not available in the system",
+                    },
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
+        return ORJSONResponse(
+            content={"success": True, "message": message},
+            status_code=HTTPStatus.OK,
+        )
+    except Exception as e:
+        logger.error(f"Error shutting down HiCache storage backend: {e}")
+        return ORJSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
+@app.post("/reinit_hicache_storage_backend")
+async def reinit_hicache_storage_backend(
+    storage_backend: Optional[str] = None,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    prefetch_threshold: Optional[int] = None,
+):
+    """
+    Reinitialize the HiCache storage backend with new parameters.
+
+    Args:
+        storage_backend: Type of storage backend to use (e.g., 'hf3fs', 'mooncake', 'eic', 'dynamic')
+        model_name: Name of the model (if different from original)
+        storage_backend_extra_config: Extra configuration for the storage backend
+        prefetch_threshold: Prefetch threshold value (if different from original)
+    """
+    try:
+        result = await _global_state.tokenizer_manager.reinit_hicache_storage(
+            storage_backend=storage_backend,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            prefetch_threshold=prefetch_threshold,
+        )
+
+        return ORJSONResponse(
+            content=result,
+            status_code=(
+                HTTPStatus.OK if result["success"] else HTTPStatus.INTERNAL_SERVER_ERROR
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Error reinitializing HiCache storage backend: {e}")
+        return ORJSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
+@app.post("/shutdown_hicache_storage_backend")
+async def shutdown_hicache_storage_backend():
+    """
+    Shutdown the HiCache storage backend and stop all related threads.
+    """
+    try:
+        result = await _global_state.tokenizer_manager.shutdown_hicache_storage()
+
+        return ORJSONResponse(
+            content=result,
+            status_code=(
+                HTTPStatus.OK if result["success"] else HTTPStatus.INTERNAL_SERVER_ERROR
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Error shutting down HiCache storage backend: {e}")
+        return ORJSONResponse(
+            content={"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile_async(obj: Optional[ProfileReqInput] = None):
     """Start profiling."""
