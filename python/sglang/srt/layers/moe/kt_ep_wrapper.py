@@ -10,6 +10,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
 import copy
 import ctypes
 import logging
+import os
 import time
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
@@ -159,25 +160,47 @@ class SharedFullContext:
     ]
 
     def _create_cpu_buffers(self):
-        """Create CPU buffers in POSIX shared memory and register as pinned memory."""
+        """Create CPU buffers in POSIX shared memory and register as pinned memory.
+
+        Uses double buffering (2 experts) to reduce memory usage while maintaining
+        pipeline efficiency: write(e+1) || copy(e) only needs 2 buffers.
+        """
+        # Set NUMA local allocation policy to allocate on local NUMA node
+        libnuma = ctypes.CDLL("libnuma.so.1")
+        if libnuma.numa_available() < 0:
+            raise RuntimeError("NUMA is not available on this system")
+        libnuma.numa_set_localalloc()
+
         self.cpu_buffers = {}
         self.shm_handles: Dict[str, shared_memory.SharedMemory] = {}
         tp_rank = get_tensor_model_parallel_rank()
+        num_experts = self.gpu_layer.num_experts
 
         for name in self.WEIGHT_NAMES:
             gpu_tensor = getattr(self.gpu_layer, name)
-            nbytes = gpu_tensor.numel() * gpu_tensor.element_size()
+            # Only allocate 2 experts worth of buffer (double buffering)
+            expert_shape = gpu_tensor.shape[1:]  # Shape per expert
+            expert_nbytes = (
+                gpu_tensor.numel() // num_experts * gpu_tensor.element_size()
+            )
+            double_buf_nbytes = expert_nbytes * 2
+
             shm_name = f"kt_buf_{name}_r{tp_rank}"
-            shm = shared_memory.SharedMemory(name=shm_name, create=True, size=nbytes)
+            shm = shared_memory.SharedMemory(
+                name=shm_name, create=True, size=double_buf_nbytes
+            )
             self.shm_handles[name] = shm
 
+            # Shape: [2, ...expert_shape...]
             cpu_buffer = torch.frombuffer(shm.buf, dtype=gpu_tensor.dtype).reshape(
-                gpu_tensor.shape
+                (2,) + expert_shape
             )
 
             # Register as pinned memory for fast DMA
             if torch.cuda.is_available():
-                torch.cuda.cudart().cudaHostRegister(cpu_buffer.data_ptr(), nbytes, 0)
+                torch.cuda.cudart().cudaHostRegister(
+                    cpu_buffer.data_ptr(), double_buf_nbytes, 0
+                )
 
             self.cpu_buffers[name] = cpu_buffer
 
@@ -224,14 +247,20 @@ class SharedFullContext:
 
         return all_rank_ptrs
 
-    def _copy_and_postprocess_pipelined(self):
-        """Copy and postprocess weights with pipelining for better overlap.
+    def _prepare_weight(self, wrapper):
+        """Prepare weights by writing from KT, copying to GPU, and postprocessing.
 
-        Extracted from CompressedTensorsWNA16MoEMethod.process_weights_after_loading
+        Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+
+        Postprocessing extracted from CompressedTensorsWNA16MoEMethod.process_weights_after_loading
         in python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors_moe.py
-
-        Pipeline: copy(expert e) runs in parallel with postprocess(expert e-1)
         """
+        # Bind Python thread to specific CPU core (last cores for each rank)
+        tp_rank = get_tensor_model_parallel_rank()
+        num_cpus = os.cpu_count()
+        target_cpu = num_cpus - 1 - tp_rank
+        os.sched_setaffinity(0, {target_cpu})
+
         layer = self.gpu_layer
         method = self.gpu_method
 
@@ -259,12 +288,14 @@ class SharedFullContext:
                     ),
                 )
 
-        # Prepare weight tensors
+        # Prepare weight tensors (cpu_buf is double-buffered with shape [2, ...])
         weight_infos = []
         for name in self.WEIGHT_NAMES:
-            cpu_buf = self.cpu_buffers[name]
-            gpu_t = getattr(layer, name)
-            gpu_t.set_(gpu_t.view(cpu_buf.shape))
+            cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
+            gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
+            # Reshape gpu_t to match expert shape for per-expert copy
+            expert_shape = cpu_buf.shape[1:]
+            gpu_t.set_(gpu_t.view((num_experts,) + expert_shape))
             weight_infos.append((cpu_buf, gpu_t))
 
         w13_p, w13_s = layer.w13_weight_packed, layer.w13_weight_scale
@@ -309,15 +340,82 @@ class SharedFullContext:
                 )
             )
 
-        # Pipeline: copy(e) || postprocess(e-1)
+        # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
         copy_stream = torch.cuda.Stream(device=device)
         post_stream = torch.cuda.Stream(device=device)
         events = [torch.cuda.Event() for _ in range(num_experts)]
 
+        # Prepare write pipeline (rank 0 only)
+        tp_world_size = get_tensor_model_parallel_world_size()
+        do_write = tp_rank == 0 and wrapper is not None
+
+        if do_write:
+            # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
+            w13_packed_buf = self.cpu_buffers["w13_weight_packed"]
+            w13_scale_buf = self.cpu_buffers["w13_weight_scale"]
+            w2_packed_buf = self.cpu_buffers["w2_weight_packed"]
+            w2_scale_buf = self.cpu_buffers["w2_weight_scale"]
+
+            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
+            w13_packed_expert_nbytes = (
+                w13_packed_buf.numel() // 2 * w13_packed_buf.element_size()
+            )
+            w13_scale_expert_nbytes = (
+                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+            )
+            w2_packed_expert_nbytes = (
+                w2_packed_buf.numel() // 2 * w2_packed_buf.element_size()
+            )
+            w2_scale_expert_nbytes = (
+                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+            )
+
+            def submit_write_expert(expert_id):
+                # Use expert_id % 2 for double buffering slot selection
+                slot = expert_id % 2
+                w13_packed_ptrs = [
+                    ptr + slot * w13_packed_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight_packed"]
+                ]
+                w13_scale_ptrs = [
+                    ptr + slot * w13_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight_scale"]
+                ]
+                w2_packed_ptrs = [
+                    ptr + slot * w2_packed_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight_packed"]
+                ]
+                w2_scale_ptrs = [
+                    ptr + slot * w2_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight_scale"]
+                ]
+                wrapper.submit_write_weight_scale_to_buffer(
+                    tp_world_size,
+                    expert_id,
+                    w13_packed_ptrs,
+                    w13_scale_ptrs,
+                    w2_packed_ptrs,
+                    w2_scale_ptrs,
+                )
+
+            # Submit expert 0 ahead of time
+            submit_write_expert(0)
+
         for e in range(num_experts):
+            # Sync write for expert e, submit write for expert e+1
+            if do_write:
+                wrapper.sync_write_weight_scale_to_buffer()
+                if e + 1 < num_experts:
+                    submit_write_expert(e + 1)
+
+            # Barrier to ensure all ranks see the written data
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
             with torch.cuda.stream(copy_stream):
+                slot = e % 2  # Double buffering
                 for cpu_buf, gpu_t in weight_infos:
-                    gpu_t[e].copy_(cpu_buf[e], non_blocking=True)
+                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[e].record(copy_stream)
 
             if e > 0:
@@ -348,34 +446,20 @@ class SharedFullContext:
         tp_rank = get_tensor_model_parallel_rank()
         t0 = time.perf_counter()
 
-        if tp_rank == 0 and wrapper is not None:
-            wrapper.submit_write_weight_scale_to_buffer(
-                get_tensor_model_parallel_world_size(),
-                self.gpu_layer.num_experts,
-                self.all_rank_buffer_ptrs["w13_weight_packed"],
-                self.all_rank_buffer_ptrs["w13_weight_scale"],
-                self.all_rank_buffer_ptrs["w2_weight_packed"],
-                self.all_rank_buffer_ptrs["w2_weight_scale"],
-            )
-            wrapper.sync_write_weight_scale_to_buffer()
+        # Write, copy, and postprocess are pipelined together:
+        # write(e+1) || copy(e) || postprocess(e-1)
+        self._prepare_weight(wrapper)
 
-        if dist.is_initialized():
-            dist.barrier(group=get_tp_group().device_group)
-        write_time = (time.perf_counter() - t0) * 1000.0
-
-        t1 = time.perf_counter()
-        self._copy_and_postprocess_pipelined()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        copy_postprocess_time = (time.perf_counter() - t1) * 1000.0
+        total_time = (time.perf_counter() - t0) * 1000.0
 
-        logger.info(
-            "KT fallback: layer %d rank %d write=%.2f ms copy+postprocess=%.2f ms",
-            layer_idx,
-            tp_rank,
-            write_time,
-            copy_postprocess_time,
-        )
+        if tp_rank == 0:
+            logger.info(
+                "KT fallback: layer %d prepare weight = %.2f ms",
+                layer_idx,
+                total_time,
+            )
 
 
 def create_kt_config_from_server_args(
@@ -675,12 +759,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             compute_time = (time.perf_counter() - t_compute) * 1000.0
-            logger.info(
-                "KT fallback: layer %d rank %d compute=%.2f ms",
-                self.kt_config.layer_idx,
-                self.tp_rank,
-                compute_time,
-            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "KT fallback: layer %d compute = %.2f ms",
+                    self.kt_config.layer_idx,
+                    compute_time,
+                )
             return result
 
         # Step 1: Submit CPU expert computation (non-blocking)
