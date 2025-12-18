@@ -12,6 +12,7 @@ import ctypes
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -176,6 +177,18 @@ class SharedFullContext:
         tp_rank = get_tensor_model_parallel_rank()
         num_experts = self.gpu_layer.num_experts
 
+        # Generate unique ID on rank 0 and broadcast to all ranks
+        if tp_rank == 0:
+            self.shm_unique_id = uuid.uuid4().hex[:8]
+        else:
+            self.shm_unique_id = None
+        if dist.is_initialized():
+            unique_id_list = [self.shm_unique_id]
+            dist.broadcast_object_list(
+                unique_id_list, src=0, group=get_tp_group().cpu_group
+            )
+            self.shm_unique_id = unique_id_list[0]
+
         for name in self.WEIGHT_NAMES:
             gpu_tensor = getattr(self.gpu_layer, name)
             # Only allocate 2 experts worth of buffer (double buffering)
@@ -185,7 +198,7 @@ class SharedFullContext:
             )
             double_buf_nbytes = expert_nbytes * 2
 
-            shm_name = f"kt_buf_{name}_r{tp_rank}"
+            shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
             shm = shared_memory.SharedMemory(
                 name=shm_name, create=True, size=double_buf_nbytes
             )
@@ -229,7 +242,7 @@ class SharedFullContext:
                 if rank == tp_rank:
                     ptr = self.cpu_buffers[name].data_ptr()
                 elif tp_rank == 0:
-                    shm_name = f"kt_buf_{name}_r{rank}"
+                    shm_name = f"kt_buf_{name}_r{rank}_{self.shm_unique_id}"
                     try:
                         shm = shared_memory.SharedMemory(name=shm_name)
                         self._opened_shm_refs[f"{name}_r{rank}"] = shm
