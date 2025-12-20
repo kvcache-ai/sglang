@@ -134,6 +134,9 @@ class SharedFullContext:
             )
         self.gpu_layer.quant_method = self.gpu_method
 
+        # Detect quantization type for weight loading
+        self.is_fp8_quant = self._detect_fp8_quant()
+
         self.gpu_method.create_weights(
             layer=self.gpu_layer,
             num_experts=global_num_experts,
@@ -147,17 +150,54 @@ class SharedFullContext:
             if param.device != target_device:
                 param.data = param.data.to(target_device)
 
-        # Create runner config
-        runner_config = replace(moe_runner_config, num_local_experts=global_num_experts)
+        # Create runner config - update both num_experts and num_local_experts for full GPU fallback
+        runner_config = replace(
+            moe_runner_config,
+            num_experts=global_num_experts,
+            num_local_experts=global_num_experts,
+        )
         self.gpu_layer.moe_runner_config = runner_config
         self.gpu_method.create_moe_runner(self.gpu_layer, runner_config)
 
-    # Weight names for shared memory buffers
-    WEIGHT_NAMES = [
+    def _detect_fp8_quant(self) -> bool:
+        """Detect if the quantization method is FP8 block quant.
+
+        Returns:
+            True if FP8 block quant, False otherwise (INT4 Marlin, etc.)
+        """
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        method = self.gpu_method
+        # Check for Fp8MoEMethod with block_quant
+        if isinstance(method, Fp8MoEMethod) and getattr(method, "block_quant", False):
+            return True
+
+        # Check for CompressedTensorsW8A8Fp8MoEMethod with block_quant
+        method_name = method.__class__.__name__
+        if "W8A8Fp8" in method_name and getattr(method, "block_quant", False):
+            return True
+
+        return False
+
+    @property
+    def weight_names(self) -> list:
+        """Get weight names based on quantization type."""
+        return self.WEIGHT_NAMES_FP8 if self.is_fp8_quant else self.WEIGHT_NAMES_INT4
+
+    # Weight names for shared memory buffers (INT4 Marlin format)
+    WEIGHT_NAMES_INT4 = [
         "w13_weight_packed",
         "w13_weight_scale",
         "w2_weight_packed",
         "w2_weight_scale",
+    ]
+
+    # Weight names for FP8 block quant format
+    WEIGHT_NAMES_FP8 = [
+        "w13_weight",
+        "w13_weight_scale_inv",
+        "w2_weight",
+        "w2_weight_scale_inv",
     ]
 
     def _create_cpu_buffers(self):
@@ -189,7 +229,7 @@ class SharedFullContext:
             )
             self.shm_unique_id = unique_id_list[0]
 
-        for name in self.WEIGHT_NAMES:
+        for name in self.weight_names:
             gpu_tensor = getattr(self.gpu_layer, name)
             # Only allocate 2 experts worth of buffer (double buffering)
             expert_shape = gpu_tensor.shape[1:]  # Shape per expert
@@ -260,8 +300,8 @@ class SharedFullContext:
 
         return all_rank_ptrs
 
-    def _prepare_weight(self, wrapper):
-        """Prepare weights by writing from KT, copying to GPU, and postprocessing.
+    def _prepare_weight_int4(self, wrapper):
+        """Prepare INT4 Marlin weights by writing from KT, copying to GPU, and postprocessing.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
 
@@ -303,7 +343,7 @@ class SharedFullContext:
 
         # Prepare weight tensors (cpu_buf is double-buffered with shape [2, ...])
         weight_infos = []
-        for name in self.WEIGHT_NAMES:
+        for name in self.WEIGHT_NAMES_INT4:
             cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
             gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
             # Reshape gpu_t to match expert shape for per-expert copy
@@ -446,6 +486,142 @@ class SharedFullContext:
         w13_p.set_(w13_p.view(num_experts, w13_k // 16, w13_n * (num_bits // 2)))
         w2_p.set_(w2_p.view(num_experts, w2_k // 16, w2_n * (num_bits // 2)))
 
+    def _prepare_weight_fp8(self, wrapper):
+        """Prepare FP8 block quant weights by writing from KT and copying to GPU.
+
+        Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+
+        FP8 block quant is simpler than INT4 Marlin:
+        - No transpose needed (weight layout is already correct)
+        - No marlin_repack needed (only INT4 Marlin needs this)
+        - No permute_scales needed (only Marlin format needs this)
+
+        The postprocess stage is a no-op for FP8 but provides pipeline synchronization
+        to ensure copy(e-2) completes before write(e) overwrites the same slot.
+
+        Optional DeepGemm ue8m0 conversion is handled after all experts are loaded.
+        """
+        # Bind Python thread to specific CPU core (last cores for each rank)
+        tp_rank = get_tensor_model_parallel_rank()
+        num_cpus = os.cpu_count()
+        target_cpu = num_cpus - 1 - tp_rank
+        os.sched_setaffinity(0, {target_cpu})
+
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_weight.device
+
+        # Prepare weight tensors (cpu_buf is double-buffered with shape [2, ...])
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_FP8:
+            cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
+            gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
+            weight_infos.append((cpu_buf, gpu_t))
+
+        # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+        copy_stream = torch.cuda.Stream(device=device)
+        post_stream = torch.cuda.Stream(device=device)
+        events = [torch.cuda.Event() for _ in range(num_experts)]
+
+        def postprocess_expert(e):
+            # FP8 doesn't need actual postprocessing (no repack/permute).
+            # This function provides a pipeline synchronization point and
+            # can be extended for future FP8-specific processing if needed.
+            pass
+
+        # Prepare write pipeline (rank 0 only)
+        tp_world_size = get_tensor_model_parallel_world_size()
+        do_write = tp_rank == 0 and wrapper is not None
+
+        if do_write:
+            # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
+            w13_weight_buf = self.cpu_buffers["w13_weight"]
+            w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+            w2_weight_buf = self.cpu_buffers["w2_weight"]
+            w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+
+            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
+            w13_weight_expert_nbytes = (
+                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+            )
+            w13_scale_expert_nbytes = (
+                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+            )
+            w2_weight_expert_nbytes = (
+                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+            )
+            w2_scale_expert_nbytes = (
+                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+            )
+
+            def submit_write_expert(expert_id):
+                # Use expert_id % 2 for double buffering slot selection
+                slot = expert_id % 2
+                w13_weight_ptrs = [
+                    ptr + slot * w13_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                ]
+                w13_scale_ptrs = [
+                    ptr + slot * w13_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
+                ]
+                w2_weight_ptrs = [
+                    ptr + slot * w2_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                ]
+                w2_scale_ptrs = [
+                    ptr + slot * w2_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
+                ]
+                wrapper.submit_write_weight_scale_to_buffer(
+                    tp_world_size,
+                    expert_id,
+                    w13_weight_ptrs,
+                    w13_scale_ptrs,
+                    w2_weight_ptrs,
+                    w2_scale_ptrs,
+                )
+
+            # Submit expert 0 ahead of time
+            submit_write_expert(0)
+
+        for e in range(num_experts):
+            # Sync write for expert e, submit write for expert e+1
+            if do_write:
+                wrapper.sync_write_weight_scale_to_buffer()
+                if e + 1 < num_experts:
+                    # Before writing to slot (e+1)%2, ensure copy from that slot is complete.
+                    # Since (e+1)%2 == (e-1)%2 for e >= 1, we need to wait for copy(e-1).
+                    if e > 0:
+                        events[e - 1].synchronize()
+                    submit_write_expert(e + 1)
+
+            # Barrier to ensure all ranks see the written data
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            with torch.cuda.stream(copy_stream):
+                slot = e % 2  # Double buffering
+                for cpu_buf, gpu_t in weight_infos:
+                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                events[e].record(copy_stream)
+
+            # Postprocess expert e-1: provides pipeline structure for future extensions
+            if e > 0:
+                with torch.cuda.stream(post_stream):
+                    post_stream.wait_event(events[e - 1])
+                    postprocess_expert(e - 1)
+
+        # Process last expert
+        with torch.cuda.stream(post_stream):
+            post_stream.wait_event(events[-1])
+            postprocess_expert(num_experts - 1)
+
+        torch.cuda.current_stream(device).wait_stream(post_stream)
+
+    # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
+    # The conversion is handled separately in the normal weight loading path.
+
     def load(self, layer_idx, wrapper):
         """Load weights from disk to GPU via shared memory."""
         for name, param in self.original_params.items():
@@ -453,15 +629,19 @@ class SharedFullContext:
         for name, buf in self.original_buffers.items():
             self.gpu_layer.register_buffer(name, buf)
 
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
         tp_rank = get_tensor_model_parallel_rank()
         t0 = time.perf_counter()
 
-        # Write, copy, and postprocess are pipelined together:
-        # write(e+1) || copy(e) || postprocess(e-1)
-        self._prepare_weight(wrapper)
+        # Select appropriate prepare_weight method based on quantization type
+        if self.is_fp8_quant:
+            self._prepare_weight_fp8(wrapper)
+        else:
+            # INT4 Marlin format: write(e+1) || copy(e) || postprocess(e-1)
+            self._prepare_weight_int4(wrapper)
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
