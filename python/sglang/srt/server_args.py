@@ -26,6 +26,8 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+import orjson
+
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -63,7 +65,7 @@ from sglang.srt.utils.common import (
     wait_port_available,
     xpu_has_xmx_support,
 )
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -4452,6 +4454,17 @@ class ServerArgs:
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
+
+    def get_hf_config(self):
+        kwargs = {}
+        hf_config = get_config(
+            self.model_path,
+            trust_remote_code=self.trust_remote_code,
+            revision=self.revision,
+            model_override_args=orjson.loads(self.json_model_override_args),
+            **kwargs,
+        )
+        return hf_config
 
     def get_model_config(self):
         # Lazy init to avoid circular import
