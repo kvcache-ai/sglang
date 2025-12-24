@@ -14,6 +14,7 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -362,6 +363,67 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         return B
 
 
+class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
+    """LoRA support for ReplicatedLinear layers.
+
+    ReplicatedLinear is used in DeepSeek-V2 for layers like kv_a_proj_with_mqa
+    where weights are replicated across all TP ranks (not sharded).
+    """
+
+    def __init__(
+        self,
+        base_layer: ReplicatedLinear,
+        lora_backend: BaseLoRABackend,
+    ) -> None:
+        super().__init__(base_layer, lora_backend)
+        # For replicated linear, output is not sharded, so we use a simple offset
+        self.output_offset = torch.tensor(
+            [0, self.base_layer.output_size],
+            dtype=torch.int32,
+            device=next(self.base_layer.parameters()).device,
+        )
+
+    def set_lora_info(
+        self,
+        A_buffer: torch.Tensor,
+        B_buffer: torch.Tensor,
+    ):
+        self.set_lora = True
+        self.A_buffer = A_buffer
+        self.B_buffer = B_buffer
+
+    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
+        lora_output = self.lora_backend.run_lora_b_sgemm(
+            x=lora_a_output,
+            weights=self.B_buffer,
+            output_offset=self.output_offset,
+            base_output=base_output,
+        )
+        return lora_output
+
+    def forward(self, input_: torch.Tensor):
+        # duplicate the logic in ReplicatedLinear
+        bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+        output = self.base_layer.quant_method.apply(
+            self.base_layer, input_, bias
+        )
+
+        if self.set_lora:
+            output = self.apply_lora(output, input_)
+
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output, output_bias
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        # No slicing needed for replicated layer - all ranks have the same input
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        # No slicing needed for replicated layer - all ranks produce the same output
+        return B
+
+
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
         self,
@@ -586,6 +648,7 @@ def get_lora_layer(
         QKVParallelLinear: QKVParallelLinearWithLoRA,
         MergedColumnParallelLinear: MergedColumnParallelLinearWithLoRA,
         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
+        ReplicatedLinear: ReplicatedLinearWithLoRA,
         RowParallelLinear: RowParallelLinearWithLoRA,
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():

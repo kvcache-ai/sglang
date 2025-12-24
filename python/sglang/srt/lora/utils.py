@@ -69,7 +69,10 @@ def get_hidden_dim(
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        if module_name == "qkv_proj":
+        if module_name == "q_proj":
+            # For DeepSeek-V2 MLA and similar architectures where q_proj is not merged
+            return config.hidden_size, head_dim * config.num_attention_heads
+        elif module_name == "qkv_proj":
             return config.hidden_size, head_dim * (
                 config.num_attention_heads + config.num_key_value_heads * 2
             )
@@ -100,9 +103,17 @@ def get_normalized_target_modules(
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
+
+    For DeepSeek-V2/V3 MLA architecture, q_proj is kept separate (not merged into qkv_proj).
     """
+    # Check if this is DeepSeek-V2/V3 MLA architecture
+    target_modules_list = list(target_modules)
+    is_deepseek_mla = any(
+        "kv_a_proj_with_mqa" in name or "kv_b_proj" in name
+        for name in target_modules_list
+    )
+
     params_mapping = {
-        "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
@@ -115,8 +126,12 @@ def get_normalized_target_modules(
         "output": "lm_head",
     }
 
+    # For non-MLA architectures, q_proj should also be mapped to qkv_proj
+    if not is_deepseek_mla:
+        params_mapping["q_proj"] = "qkv_proj"
+
     result = set()
-    for name in target_modules:
+    for name in target_modules_list:
         base_name = name.split(".")[-1]
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)

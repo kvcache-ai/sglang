@@ -3376,6 +3376,66 @@ class DeepseekV2ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        """
+        Get input and output dimensions for LoRA modules in DeepSeek-V2 MLA architecture.
+
+        DeepSeek-V2 uses MLA (Multi-head Latent Attention) with:
+        - q_proj: standard query projection
+        - kv_a_proj_with_mqa: compresses KV to latent space
+        - kv_b_proj: expands from latent space to K and V
+        - o_proj: output projection
+        """
+        config = self.config
+
+        # MLA-specific modules
+        if module_name == "q_proj" or module_name == "qkv_proj":
+            # Q projection (renamed to qkv_proj in LoRA system): hidden_size -> num_heads * qk_head_dim
+            # Note: For DeepSeek-V2, this is only Q, not QKV
+            qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+            return (
+                config.hidden_size,
+                config.num_attention_heads * qk_head_dim,
+            )
+        elif module_name == "kv_a_proj_with_mqa":
+            # KV compression: hidden_size -> kv_lora_rank + qk_rope_head_dim
+            return (
+                config.hidden_size,
+                config.kv_lora_rank + config.qk_rope_head_dim,
+            )
+        elif module_name == "kv_b_proj":
+            # KV expansion: kv_lora_rank -> num_heads * (qk_nope_head_dim + v_head_dim)
+            return (
+                config.kv_lora_rank,
+                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+            )
+        elif module_name == "o_proj":
+            # Output projection: num_heads * v_head_dim -> hidden_size
+            return (
+                config.num_attention_heads * config.v_head_dim,
+                config.hidden_size,
+            )
+        # MLP modules (MoE or shared experts)
+        elif module_name == "gate_up_proj" or module_name == "down_proj":
+            # Determine the correct intermediate size based on layer structure
+            # Some layers have regular MLP, others have MoE with SharedExperts
+            intermediate_size = config.intermediate_size
+
+            # Check if this layer has SharedExperts (which use different intermediate_size)
+            if hasattr(self, "model") and layer_idx < len(self.model.layers):
+                mlp = self.model.layers[layer_idx].mlp
+                # DeepseekV2MoE has shared_experts attribute
+                if hasattr(mlp, "shared_experts"):
+                    # SharedExperts use moe_intermediate_size * n_shared_experts
+                    intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+
+            if module_name == "gate_up_proj":
+                return config.hidden_size, intermediate_size * 2
+            else:  # down_proj
+                return intermediate_size, config.hidden_size
+        else:
+            raise NotImplementedError(f"Module {module_name} not supported for DeepSeek-V2 LoRA")
+
     @torch.no_grad()
     def forward(
         self,
