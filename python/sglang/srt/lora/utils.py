@@ -93,6 +93,9 @@ def get_hidden_dim(
             # For lm_head: input is hidden_size, output is vocab_size
             # if contain extra tokens will be added; otherwise is 0.
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
+        elif module_name == "gate":
+            # MoE router gate: input is hidden_size, output is num_experts
+            return config.hidden_size, config.num_experts
         else:
             raise NotImplementedError()
 
