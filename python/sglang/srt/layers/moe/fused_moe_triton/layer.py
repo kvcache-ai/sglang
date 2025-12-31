@@ -611,8 +611,11 @@ class FusedMoE(torch.nn.Module):
             KTEPWrapperMethod,
         ):
             if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
-                    return
+                # Check if this expert is on GPU using the mask
+                if not self.quant_method.gpu_experts_mask[expert_id]:
+                    return  # CPU expert, skip loading to GPU weights
+                # Remap logical expert_id to GPU weight index
+                expert_id = self.quant_method.logical_to_gpu_index[expert_id].item()
 
         self._weight_loader_impl(
             param=param,

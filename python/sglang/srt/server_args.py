@@ -496,6 +496,7 @@ class ServerArgs:
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
     kt_gpu_prefill_token_threshold: Optional[int] = None
+    record_kt_gpu_expert_distribution: bool = False
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -3756,7 +3757,7 @@ class ServerArgs:
         parser.add_argument(
             "--kt-num-gpu-experts",
             type=int,
-            help="[ktransformers parameter] The number of GPU experts.",
+            help="[ktransformers parameter] Total number of GPU experts across all MoE layers. Experts are selected based on activation frequency.",
         )
         parser.add_argument(
             "--kt-max-deferred-experts-per-token",
@@ -3769,6 +3770,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kt_gpu_prefill_token_threshold,
             help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
+        )
+        parser.add_argument(
+            "--record-kt-gpu-expert-distribution",
+            action="store_true",
+            help="[ktransformers parameter] Record GPU expert distribution (which experts are on GPU) for each forward pass. Recorded data is dumped with expert distribution stats.",
         )
 
         # Diffusion LLM

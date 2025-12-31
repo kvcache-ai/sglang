@@ -106,6 +106,10 @@ class ExpertDistributionRecorder(ABC):
     ):
         pass
 
+    def on_gpu_expert_mask(self, layer_idx: int, gpu_experts_mask: torch.Tensor):
+        """Record GPU expert mask for a layer (used by KT EP wrapper)."""
+        pass
+
     def start_record(self):
         self._on_not_implemented()
 
@@ -138,6 +142,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     ):
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
+        self._rank = rank
 
         self._recording = False
         self._disable_all = False
@@ -151,6 +156,18 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
+
+        # GPU expert mask recording (for KT EP wrapper, rank 0 only)
+        self._record_kt_gpu_expert_distribution = (
+            server_args.record_kt_gpu_expert_distribution and rank == 0
+        )
+        if self._record_kt_gpu_expert_distribution:
+            self._gpu_expert_mask_gatherer = _GpuExpertMaskGatherer(
+                expert_location_metadata, device=server_args.device
+            )
+            self._gpu_expert_mask_accumulator = _GpuExpertMaskAccumulator(
+                server_args, expert_location_metadata
+            )
 
         if server_args.enable_expert_distribution_metrics:
             logger.info(
@@ -200,6 +217,12 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
 
+        # Process GPU expert mask data
+        if self._record_kt_gpu_expert_distribution:
+            gpu_mask_data = self._gpu_expert_mask_gatherer.collect()
+            self._gpu_expert_mask_accumulator.append(gpu_mask_data)
+            self._gpu_expert_mask_gatherer.reset()
+
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
@@ -226,6 +249,21 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
 
+    def on_gpu_expert_mask(self, layer_idx: int, gpu_experts_mask: torch.Tensor):
+        """Record GPU expert mask for a layer (used by KT EP wrapper).
+
+        CUDA graph compatible: uses GPU tensor operations only.
+        """
+        if self._disable_all:
+            return
+        if not (
+            self._recording or torch.get_device_module().is_current_stream_capturing()
+        ):
+            return
+        if not self._record_kt_gpu_expert_distribution:
+            return
+        self._gpu_expert_mask_gatherer.on_layer(layer_idx, gpu_experts_mask)
+
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
@@ -250,6 +288,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             gatherer.reset()
         self._accumulator.reset()
 
+        # Reset GPU expert mask gatherer and accumulator
+        if self._record_kt_gpu_expert_distribution:
+            self._gpu_expert_mask_gatherer.reset()
+            self._gpu_expert_mask_accumulator.reset()
+
     def start_record(self):
         """Start recording the expert distribution."""
         if self._recording:
@@ -270,6 +313,20 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def dump_record(self, output_mode: _OutputMode = "file"):
         """Dump the expert distribution record and reset the recorder after dumping."""
         output = self._accumulator.dump(output_mode=output_mode)
+
+        # Dump GPU expert mask data (rank 0 only)
+        if self._record_kt_gpu_expert_distribution:
+            gpu_mask_output = self._gpu_expert_mask_accumulator.dump()
+            if output_mode == "file":
+                _dump_to_file(
+                    f"gpu_expert_distribution_{time.time()}.pt",
+                    dict(gpu_expert_masks=gpu_mask_output),
+                )
+            elif output_mode == "object":
+                if output is None:
+                    output = {}
+                output["gpu_expert_masks"] = gpu_mask_output
+
         self._reset()
         return output
 
@@ -562,6 +619,34 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     ):
         # Most naive implementation, can optimize later
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _GpuExpertMaskGatherer:
+    """Collect GPU expert masks for each layer in a single forward pass.
+
+    Used by KT EP wrapper to record which experts are on GPU at each layer.
+    CUDA graph compatible: uses GPU tensor and pure GPU operations.
+    """
+
+    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", device: str):
+        self._num_layers = expert_location_metadata.num_layers
+        self._num_experts = expert_location_metadata.num_logical_experts
+        # Shape: [num_layers, num_experts], bool, on GPU for CUDA graph compatibility
+        self._masks = torch.zeros(
+            (self._num_layers, self._num_experts), dtype=torch.bool, device=device
+        )
+
+    def on_layer(self, layer_idx: int, gpu_experts_mask: torch.Tensor):
+        # gpu_experts_mask should already be on GPU (gpu_experts_mask_cuda)
+        # Use copy_ to explicitly snapshot the current mask state
+        # Pure GPU operation, compatible with CUDA graph
+        self._masks[layer_idx].copy_(gpu_experts_mask)
+
+    def reset(self):
+        self._masks.zero_()
+
+    def collect(self) -> torch.Tensor:
+        return self._masks.clone()
 
 
 def _convert_per_token_to_global_physical_count(
@@ -992,6 +1077,40 @@ class _InfiniteBuffer(_Buffer):
     def reset(self):
         self._buffer[...] = 0
         self._size = 0
+
+
+class _GpuExpertMaskAccumulator:
+    """Accumulate GPU expert masks across forward passes.
+
+    Used by KT EP wrapper to record GPU expert distribution over time.
+    Shape of stored data: [buffer_size, num_layers, num_experts], bool.
+    """
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        expert_location_metadata: "ExpertLocationMetadata",
+    ):
+        self._num_layers = expert_location_metadata.num_layers
+        self._num_experts = expert_location_metadata.num_logical_experts
+        self._buffer_size = server_args.expert_distribution_recorder_buffer_size or 1000
+
+        # Shape: [buffer_size, num_layers, num_experts], bool
+        self._masks = _Buffer.init_new(
+            item_shape=(self._num_layers, self._num_experts),
+            buffer_size=self._buffer_size,
+            dtype=torch.bool,
+            device="cpu",
+        )
+
+    def append(self, single_pass_mask: torch.Tensor):
+        self._masks.append(single_pass_mask)
+
+    def reset(self):
+        self._masks.reset()
+
+    def dump(self) -> torch.Tensor:
+        return self._masks.get_all()
 
 
 def _convert_global_physical_count_to_logical_count(
