@@ -734,16 +734,38 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             "No activation frequency file provided, using uniform distribution"
         )
         activation_freq = torch.zeros(num_layers, num_experts, dtype=torch.float32)
+        activation_freq[0,:] = 1
 
-    # Generate masks using kt_kernel function
-    masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
+    # Generate masks using kt_kernel function (rank 0 only, then broadcast)
+    # This ensures all ranks have identical masks (torch.topk with sorted=False
+    # can produce different results for tied values across ranks)
+    tp_rank = get_tensor_model_parallel_rank()
+
+    if tp_rank == 0:
+        masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
+    else:
+        masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
+
+    if dist.is_initialized():
+        dist.broadcast(masks, src=0, group=get_tp_group().cpu_group)
+
     _KT_GPU_EXPERTS_MASKS = masks
 
-    logger.info(
-        "Generated KT GPU experts masks: %d layers x %d experts, "
-        "total GPU experts = %d / %d requested",
-        num_layers, num_experts, masks.sum().item(), num_gpu_experts
-    )
+    # Log per-layer GPU expert counts (rank 0 only)
+    if tp_rank == 0:
+        per_layer_gpu_experts = masks.sum(dim=1).cpu().tolist()
+        for layer_idx, num_gpu in enumerate(per_layer_gpu_experts):
+            logger.info(
+                "KT GPU experts: layer %d has %d GPU experts",
+                layer_idx,
+                int(num_gpu),
+            )
+
+        logger.info(
+            "Generated KT GPU experts masks: %d layers x %d experts, "
+            "total GPU experts = %d / %d requested",
+            num_layers, num_experts, masks.sum().item(), num_gpu_experts
+        )
 
     return _KT_GPU_EXPERTS_MASKS
 
@@ -876,6 +898,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
+        # Dual-stream parallelism: cpu_stream for CPU expert operations,
+        # main stream for GPU computation (initialized in create_weights)
+        self._cpu_stream: Optional[torch.cuda.Stream] = None
+        self._sync_done_event: Optional[torch.cuda.Event] = None  # CPU computation done
+
+        # GPU staging buffer for CPU expert input (avoids data race with inplace GPU computation)
+        # Maps batch_size -> staging buffer tensor
+        self._staging_buffers: Dict[int, torch.Tensor] = {}
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -935,6 +966,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+
+        # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
+        if self.tp_rank == 0:
+            self._cpu_stream = torch.cuda.Stream(device=target_device)
+            self._sync_done_event = torch.cuda.Event()
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
@@ -1044,6 +1080,56 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             x, torch.cuda.current_stream(x.device).cuda_stream
         )
 
+    def _submit_with_staged_input(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+        staged_hidden_states: torch.Tensor,
+    ) -> None:
+        """Submit CPU expert computation using staged hidden states.
+
+        Args:
+            layer: The MoE layer module
+            dispatch_output: Dispatched tokens and routing information
+            staged_hidden_states: Pre-copied hidden states in staging buffer
+        """
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        if self.tp_rank != 0 or self.wrapper is None:
+            return
+
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+
+        # Submit forward task using staged buffer
+        self.wrapper.submit_forward(
+            staged_hidden_states,
+            topk_ids,
+            topk_weights,
+            torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
+        )
+
+    def _sync_with_staged_input(
+        self, staged_hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Synchronize CPU computation using staged hidden states reference.
+
+        Args:
+            staged_hidden_states: Staged buffer used in submit
+
+        Returns:
+            CPU expert computation results
+        """
+        if self.tp_rank != 0 or self.wrapper is None:
+            return torch.zeros_like(staged_hidden_states)
+
+        return self.wrapper.sync_forward(
+            staged_hidden_states,
+            torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1100,9 +1186,26 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
             return result
 
-        # Step 1: Submit CPU expert computation (non-blocking)
-        if self.tp_rank == 0:
-            self.submit(layer, dispatch_output)
+        # Step 1: Copy hidden_states to staging buffer and submit CPU computation
+        # Staging buffer allows GPU computation to proceed without waiting for D2H copy
+        staging_buffer = None
+        if self.tp_rank == 0 and self._cpu_stream is not None:
+            # Get or create staging buffer for this batch size
+            batch_size = x.shape[0]
+            if batch_size not in self._staging_buffers:
+                self._staging_buffers[batch_size] = torch.empty_like(x)
+            staging_buffer = self._staging_buffers[batch_size]
+
+            # Copy to staging buffer on main stream
+            staging_buffer.copy_(x, non_blocking=True)
+
+            # Fork to cpu_stream (waits for staging copy to complete)
+            self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+            with torch.cuda.stream(self._cpu_stream):
+                # Submit uses staging_buffer, so GPU can modify original x freely
+                self._submit_with_staged_input(
+                    layer, dispatch_output, staging_buffer
+                )
 
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
         # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
@@ -1117,14 +1220,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             topk_output=masked_topk_output
         )
 
-        # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
+        # Step 3: Execute GPU expert computation on main stream
+        # No wait needed - staging buffer decouples CPU and GPU data access
         gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
 
-        # Step 4: Synchronize CPU results and merge with GPU results
+        # Step 4: Sync CPU results on cpu_stream, then synchronize streams
         output = gpu_combine_input.hidden_states
-        if self.tp_rank == 0:
-            cpu_output = self.sync(x)
+        if self.tp_rank == 0 and self._cpu_stream is not None:
+            with torch.cuda.stream(self._cpu_stream):
+                # Use staging_buffer for sync to get correct buffer reference
+                cpu_output = self._sync_with_staged_input(staging_buffer)
+                self._sync_done_event.record(self._cpu_stream)
+
+            # Main stream waits for cpu_stream to complete before merging results
+            torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)
