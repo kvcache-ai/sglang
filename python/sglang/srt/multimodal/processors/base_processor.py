@@ -334,7 +334,6 @@ class BaseMultimodalProcessor(ABC):
             return_tensors="pt",
             **kwargs,
         )
-        print(f"334 result: {result}")
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
@@ -908,7 +907,6 @@ class BaseMultimodalProcessor(ABC):
         """
 
         items: dict[Modality, MultimodalDataItem] = {}
-        print(f"724 data_dict: {data_dict}")
         for attr_name, value in data_dict.items():
             if attr_name == "input_ids":
                 continue
