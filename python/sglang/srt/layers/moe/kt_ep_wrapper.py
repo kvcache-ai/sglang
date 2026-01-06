@@ -693,6 +693,10 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         logger.warning("kt_num_gpu_experts is required but not set.")
         return None
 
+    # Get first_k_dense_replace to identify which layers are MoE layers
+    first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0)
+    moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
+
     # Load activation frequency from init_expert_location if it's a .pt file
     init_loc = server_args.init_expert_location
     if init_loc and init_loc.endswith(".pt"):
@@ -734,7 +738,10 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             "No activation frequency file provided, using uniform distribution"
         )
         activation_freq = torch.zeros(num_layers, num_experts, dtype=torch.float32)
-        activation_freq[0,:] = 1
+        # For layers that are actually MoE layers, set uniform distribution
+        for layer_idx in range(num_layers):
+            if layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0:
+                activation_freq[layer_idx, :] = 1.0
 
     # Generate masks using kt_kernel function (rank 0 only, then broadcast)
     # This ensures all ranks have identical masks (torch.topk with sorted=False
@@ -743,6 +750,12 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
 
     if tp_rank == 0:
         masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
+
+        # For non-MoE layers (layer_idx < first_k_dense_replace or not matching moe_layer_freq),
+        # set all experts to GPU (these layers won't use KT wrapper anyway)
+        for layer_idx in range(num_layers):
+            if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
+                masks[layer_idx, :] = True
     else:
         masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
 
@@ -755,16 +768,32 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     if tp_rank == 0:
         per_layer_gpu_experts = masks.sum(dim=1).cpu().tolist()
         for layer_idx, num_gpu in enumerate(per_layer_gpu_experts):
+            is_moe_layer = (
+                layer_idx >= first_k_dense_replace
+                and layer_idx % moe_layer_freq == 0
+            )
+            layer_type = "MoE" if is_moe_layer else "Dense"
             logger.info(
-                "KT GPU experts: layer %d has %d GPU experts",
+                "KT GPU experts: layer %d (%s) has %d GPU experts",
                 layer_idx,
+                layer_type,
                 int(num_gpu),
             )
 
+        # Count total GPU experts only for actual MoE layers
+        total_moe_gpu_experts = sum(
+            masks[i].sum().item()
+            for i in range(num_layers)
+            if i >= first_k_dense_replace and i % moe_layer_freq == 0
+        )
+        num_moe_layers = sum(
+            1 for i in range(num_layers)
+            if i >= first_k_dense_replace and i % moe_layer_freq == 0
+        )
         logger.info(
-            "Generated KT GPU experts masks: %d layers x %d experts, "
-            "total GPU experts = %d / %d requested",
-            num_layers, num_experts, masks.sum().item(), num_gpu_experts
+            "Generated KT GPU experts masks: %d MoE layers (out of %d total layers) x %d experts, "
+            "total GPU experts in MoE layers = %d",
+            num_moe_layers, num_layers, num_experts, total_moe_gpu_experts
         )
 
     return _KT_GPU_EXPERTS_MASKS
