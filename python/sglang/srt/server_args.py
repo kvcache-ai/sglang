@@ -497,6 +497,8 @@ class ServerArgs:
     kt_max_deferred_experts_per_token: Optional[int] = None
     kt_gpu_prefill_token_threshold: Optional[int] = None
     record_kt_gpu_expert_distribution: bool = False
+    kt_enable_dynamic_expert_update: bool = False
+    kt_expert_placement_strategy: str = "frequency"
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -3775,6 +3777,23 @@ class ServerArgs:
             "--record-kt-gpu-expert-distribution",
             action="store_true",
             help="[ktransformers parameter] Record GPU expert distribution (which experts are on GPU) for each forward pass. Recorded data is dumped with expert distribution stats.",
+        )
+        parser.add_argument(
+            "--kt-enable-dynamic-expert-update",
+            action="store_true",
+            default=ServerArgs.kt_enable_dynamic_expert_update,
+            help="[ktransformers parameter] Enable dynamic GPU expert updates based on runtime statistics. After full GPU fallback computation, updates original layer's GPU experts to match the most frequently activated experts in the current batch.",
+        )
+        parser.add_argument(
+            "--kt-expert-placement-strategy",
+            type=str,
+            default=ServerArgs.kt_expert_placement_strategy,
+            choices=["frequency", "front-loading", "uniform", "random"],
+            help="[ktransformers parameter] GPU expert placement strategy. "
+                 "frequency: Select top-k by activation frequency (default). "
+                 "front-loading: Fill layers from first MoE layer onwards. "
+                 "uniform: Equal experts per layer. "
+                 "random: Random placement with fixed seed.",
         )
 
         # Diffusion LLM
