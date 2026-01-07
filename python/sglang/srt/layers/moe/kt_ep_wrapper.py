@@ -136,6 +136,7 @@ class SharedFullContext:
 
         # Detect quantization type for weight loading
         self.is_fp8_quant = self._detect_fp8_quant()
+        self.is_bf16_quant = self._detect_bf16_quant()
 
         self.gpu_method.create_weights(
             layer=self.gpu_layer,
@@ -163,7 +164,7 @@ class SharedFullContext:
         """Detect if the quantization method is FP8 block quant.
 
         Returns:
-            True if FP8 block quant, False otherwise (INT4 Marlin, etc.)
+            True if FP8 block quant, False otherwise (INT4 Marlin, BF16, etc.)
         """
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
@@ -179,10 +180,32 @@ class SharedFullContext:
 
         return False
 
+    def _detect_bf16_quant(self) -> bool:
+        """Detect if the quantization method is BF16/unquantized.
+
+        Returns:
+            True if BF16/unquantized, False otherwise (INT4 Marlin, FP8, etc.)
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            UnquantizedFusedMoEMethod,
+        )
+
+        method = self.gpu_method
+        # Check for UnquantizedFusedMoEMethod
+        if isinstance(method, UnquantizedFusedMoEMethod):
+            return True
+
+        return False
+
     @property
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
-        return self.WEIGHT_NAMES_FP8 if self.is_fp8_quant else self.WEIGHT_NAMES_INT4
+        if self.is_fp8_quant:
+            return self.WEIGHT_NAMES_FP8
+        elif self.is_bf16_quant:
+            return self.WEIGHT_NAMES_BF16
+        else:
+            return self.WEIGHT_NAMES_INT4
 
     # Weight names for shared memory buffers (INT4 Marlin format)
     WEIGHT_NAMES_INT4 = [
@@ -198,6 +221,12 @@ class SharedFullContext:
         "w13_weight_scale_inv",
         "w2_weight",
         "w2_weight_scale_inv",
+    ]
+
+    # Weight names for BF16/unquantized format (no scales)
+    WEIGHT_NAMES_BF16 = [
+        "w13_weight",
+        "w2_weight",
     ]
 
     def _create_cpu_buffers(self):
@@ -622,6 +651,125 @@ class SharedFullContext:
     # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
     # The conversion is handled separately in the normal weight loading path.
 
+    def _prepare_weight_bf16(self, wrapper):
+        """Prepare BF16/unquantized weights by writing from KT and copying to GPU.
+
+        Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+
+        BF16/unquantized is similar to FP8 block quant:
+        - No transpose needed (weight layout is already correct)
+        - No marlin_repack needed (only INT4 Marlin needs this)
+        - No permute_scales needed (only Marlin format needs this)
+        - No scales at all (unlike FP8 which has scale_inv)
+
+        The postprocess stage is a no-op for BF16 but provides pipeline synchronization
+        to ensure copy(e-2) completes before write(e) overwrites the same slot.
+        """
+        # Bind Python thread to specific CPU core (last cores for each rank)
+        tp_rank = get_tensor_model_parallel_rank()
+        num_cpus = os.cpu_count()
+        target_cpu = num_cpus - 1 - tp_rank
+        os.sched_setaffinity(0, {target_cpu})
+
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_weight.device
+
+        # Prepare weight tensors (cpu_buf is double-buffered with shape [2, ...])
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_BF16:
+            cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
+            gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
+            weight_infos.append((cpu_buf, gpu_t))
+
+        # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+        copy_stream = torch.cuda.Stream(device=device)
+        post_stream = torch.cuda.Stream(device=device)
+        events = [torch.cuda.Event() for _ in range(num_experts)]
+
+        def postprocess_expert(e):
+            # BF16 doesn't need actual postprocessing (no repack/permute/transpose).
+            # This function provides a pipeline synchronization point and
+            # can be extended for future BF16-specific processing if needed.
+            pass
+
+        # Prepare write pipeline (rank 0 only)
+        tp_world_size = get_tensor_model_parallel_world_size()
+        do_write = tp_rank == 0 and wrapper is not None
+
+        if do_write:
+            # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
+            w13_weight_buf = self.cpu_buffers["w13_weight"]
+            w2_weight_buf = self.cpu_buffers["w2_weight"]
+
+            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
+            w13_weight_expert_nbytes = (
+                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+            )
+            w2_weight_expert_nbytes = (
+                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+            )
+
+            def submit_write_expert(expert_id):
+                # Use expert_id % 2 for double buffering slot selection
+                slot = expert_id % 2
+                w13_weight_ptrs = [
+                    ptr + slot * w13_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                ]
+                w2_weight_ptrs = [
+                    ptr + slot * w2_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                ]
+                # For BF16, we pass empty scale pointer lists (no scales)
+                w13_scale_ptrs = [0] * tp_world_size
+                w2_scale_ptrs = [0] * tp_world_size
+                wrapper.submit_write_weight_scale_to_buffer(
+                    tp_world_size,
+                    expert_id,
+                    w13_weight_ptrs,
+                    w13_scale_ptrs,
+                    w2_weight_ptrs,
+                    w2_scale_ptrs,
+                )
+
+            # Submit expert 0 ahead of time
+            submit_write_expert(0)
+
+        for e in range(num_experts):
+            # Sync write for expert e, submit write for expert e+1
+            if do_write:
+                wrapper.sync_write_weight_scale_to_buffer()
+                if e + 1 < num_experts:
+                    # Before writing to slot (e+1)%2, ensure copy from that slot is complete.
+                    # Since (e+1)%2 == (e-1)%2 for e >= 1, we need to wait for copy(e-1).
+                    if e > 0:
+                        events[e - 1].synchronize()
+                    submit_write_expert(e + 1)
+
+            # Barrier to ensure all ranks see the written data
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            with torch.cuda.stream(copy_stream):
+                slot = e % 2  # Double buffering
+                for cpu_buf, gpu_t in weight_infos:
+                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                events[e].record(copy_stream)
+
+            # Postprocess expert e-1: provides pipeline structure for future extensions
+            if e > 0:
+                with torch.cuda.stream(post_stream):
+                    post_stream.wait_event(events[e - 1])
+                    postprocess_expert(e - 1)
+
+        # Process last expert
+        with torch.cuda.stream(post_stream):
+            post_stream.wait_event(events[-1])
+            postprocess_expert(num_experts - 1)
+
+        torch.cuda.current_stream(device).wait_stream(post_stream)
+
     def load(self, layer_idx, wrapper):
         """Load weights from disk to GPU via shared memory."""
         for name, param in self.original_params.items():
@@ -639,6 +787,8 @@ class SharedFullContext:
         # Select appropriate prepare_weight method based on quantization type
         if self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper)
+        elif self.is_bf16_quant:
+            self._prepare_weight_bf16(wrapper)
         else:
             # INT4 Marlin format: write(e+1) || copy(e) || postprocess(e-1)
             self._prepare_weight_int4(wrapper)
