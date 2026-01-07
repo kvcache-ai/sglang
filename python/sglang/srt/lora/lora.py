@@ -132,8 +132,18 @@ class LoRAAdapter(nn.Module):
                 target_module.add("v_proj")
             if "qkv_proj" in weight_name:
                 target_module.add("qkv_proj")
+            # Check for DeepSeek-V2 MLA architecture modules
+            if "kv_a_proj_with_mqa" in weight_name or "kv_b_proj" in weight_name:
+                target_module.add("deepseek_v2_mla")
         if len(target_module) == 0:
             return
+
+        # Check if this is DeepSeek-V2 or V3 with MLA architecture
+        # These models use q_proj + kv_a_proj_with_mqa + kv_b_proj instead of traditional q/k/v
+        is_deepseek_mla = "deepseek_v2_mla" in target_module or (
+            hasattr(self.base_hf_config, "model_type")
+            and self.base_hf_config.model_type in ["deepseek_v2", "deepseek_v3"]
+        )
 
         for weight_name in weight_names:
             # We assume every lora adaptor should contain lora modules for q_proj
@@ -143,6 +153,14 @@ class LoRAAdapter(nn.Module):
                 v_name = weight_name.replace("q_proj", "v_proj")
                 qkv_name = weight_name.replace("q_proj", "qkv_proj")
 
+                # For DeepSeek-V2/V3 MLA architecture, q_proj is standalone (ColumnParallelLinear)
+                # Do NOT rename or merge - keep q_proj as is
+                # The MLA architecture uses separate kv_a_proj_with_mqa and kv_b_proj for K/V
+                if is_deepseek_mla:
+                    # Keep q_proj unchanged
+                    continue
+
+                # Traditional architecture: merge q/k/v
                 # If k_proj doesn't have lora, initialize it to zero
                 k_proj_weight = (
                     weights[k_name]
