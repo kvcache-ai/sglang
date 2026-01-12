@@ -498,7 +498,7 @@ class ServerArgs:
     kt_gpu_prefill_token_threshold: Optional[int] = None
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
-    kt_expert_placement_strategy: str = "frequency"
+    kt_expert_placement_strategy: str = "uniform"
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None

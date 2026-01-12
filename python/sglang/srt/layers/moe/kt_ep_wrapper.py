@@ -778,10 +778,10 @@ def generate_random_masks(
 
     # Randomly select positions
     if len(moe_positions) > 0:
-        rng = torch.Generator()
+        rng = torch.Generator(device='cpu')
         rng.manual_seed(seed)
         num_to_select = min(num_gpu_experts, len(moe_positions))
-        selected_indices = torch.randperm(len(moe_positions), generator=rng)[:num_to_select]
+        selected_indices = torch.randperm(len(moe_positions), generator=rng, device='cpu')[:num_to_select]
 
         for idx in selected_indices:
             layer_idx, expert_idx = moe_positions[idx]
