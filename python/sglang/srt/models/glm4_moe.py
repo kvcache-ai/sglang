@@ -62,6 +62,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -495,8 +496,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(hidden_states, router_logits)
 
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda and not _use_aiter:
+            if (
+                not _is_cuda
+                and not _use_aiter
+                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            ):
                 # fused in biased_grouped_topk so we can skip here
+                # For KTEPWrapperMethod, routed_scaling_factor is not applied
+                # internally (disabled in gpu_runner_config), so apply here
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -532,7 +539,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_cuda and not _use_aiter:
+        if (
+            not _is_cuda
+            and not _use_aiter
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
+            # fused in biased_grouped_topk so we can skip here
+            # For KTEPWrapperMethod, routed_scaling_factor is not applied
+            # internally (disabled in gpu_runner_config), so apply here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
