@@ -55,6 +55,7 @@ Its core features include:
    advanced_features/epd_disaggregation.md
    advanced_features/pipeline_parallelism.md
    advanced_features/hicache.rst
+   advanced_features/mooncake_connector.md
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
    advanced_features/dp_for_multi_modal_encoder.md
