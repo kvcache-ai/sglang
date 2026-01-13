@@ -19,7 +19,10 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
-from typing import Dict, List
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -33,6 +36,121 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
+
+
+# Pattern to match MoE expert LoRA weights
+# Examples:
+#   model.layers.1.mlp.experts.0.gate_proj.lora_A.weight
+#   model.layers.1.mlp.experts.0.up_proj.lora_B.weight
+#   model.layers.1.mlp.experts.0.down_proj.lora_A.weight
+MOE_EXPERT_PATTERN = re.compile(
+    r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.lora_([AB])\.weight"
+)
+
+
+def get_moe_expert_info(weight_name: str) -> Optional[Tuple[int, int, str, str]]:
+    """
+    Parse MoE expert LoRA weight name.
+
+    Args:
+        weight_name: Weight name like "model.layers.1.mlp.experts.0.gate_proj.lora_A.weight"
+
+    Returns:
+        Tuple of (layer_id, expert_id, proj_type, lora_type) or None if not a MoE expert weight
+        - layer_id: int, the layer index
+        - expert_id: int, the expert index
+        - proj_type: str, one of "gate_proj", "up_proj", "down_proj"
+        - lora_type: str, "A" or "B"
+    """
+    match = MOE_EXPERT_PATTERN.search(weight_name)
+    if match:
+        layer_id = int(match.group(1))
+        expert_id = int(match.group(2))
+        proj_type = match.group(3)
+        lora_type = match.group(4)
+        return (layer_id, expert_id, proj_type, lora_type)
+    return None
+
+
+@dataclass
+class MoELoRALayer:
+    """
+    Stores per-expert LoRA weights for a single MoE layer.
+
+    For each expert, we store SEPARATE gate and up LoRA weights:
+    - gate_lora_a: (rank, hidden_size) - gate_proj LoRA A
+    - gate_lora_b: (intermediate_size, rank) - gate_proj LoRA B
+    - up_lora_a: (rank, hidden_size) - up_proj LoRA A
+    - up_lora_b: (intermediate_size, rank) - up_proj LoRA B
+    - down_lora_a: (rank, intermediate_size) - down LoRA A
+    - down_lora_b: (hidden_size, rank) - down LoRA B
+
+    NOTE: gate and up are stored separately because in PEFT LoRA,
+    each linear layer has independent lora_A and lora_B matrices.
+    """
+    # Per-expert gate_proj LoRA weights
+    gate_lora_a: Dict[int, torch.Tensor] = field(default_factory=dict)
+    gate_lora_b: Dict[int, torch.Tensor] = field(default_factory=dict)
+
+    # Per-expert up_proj LoRA weights
+    up_lora_a: Dict[int, torch.Tensor] = field(default_factory=dict)
+    up_lora_b: Dict[int, torch.Tensor] = field(default_factory=dict)
+
+    # Per-expert down_proj LoRA weights
+    down_lora_a: Dict[int, torch.Tensor] = field(default_factory=dict)
+    down_lora_b: Dict[int, torch.Tensor] = field(default_factory=dict)
+
+    # Metadata
+    expert_ids: Set[int] = field(default_factory=set)
+    rank: int = 0
+    scaling: float = 1.0
+
+    def add_expert_weight(
+        self,
+        expert_id: int,
+        proj_type: str,
+        lora_type: str,
+        weight: torch.Tensor,
+    ):
+        """Add a single expert weight."""
+        self.expert_ids.add(expert_id)
+
+        if proj_type == "gate_proj":
+            if lora_type == "A":
+                self.gate_lora_a[expert_id] = weight
+            else:
+                self.gate_lora_b[expert_id] = weight
+        elif proj_type == "up_proj":
+            if lora_type == "A":
+                self.up_lora_a[expert_id] = weight
+            else:
+                self.up_lora_b[expert_id] = weight
+        elif proj_type == "down_proj":
+            if lora_type == "A":
+                self.down_lora_a[expert_id] = weight
+            else:
+                self.down_lora_b[expert_id] = weight
+
+        # Update rank from weight shape
+        if lora_type == "A" and self.rank == 0:
+            self.rank = weight.shape[0]
+
+    def finalize(self):
+        """
+        Finalize the MoE LoRA layer after all weights are loaded.
+
+        Previously this merged gate+up, but now we keep them separate
+        because gate_lora_a and up_lora_a are different matrices in PEFT.
+        """
+        # No merging needed - gate and up are stored separately
+        pass
+
+    @property
+    def num_experts(self) -> int:
+        return len(self.expert_ids)
+
+    def has_expert(self, expert_id: int) -> bool:
+        return expert_id in self.expert_ids
 
 
 class LoRALayer(nn.Module):
@@ -74,6 +192,10 @@ class LoRAAdapter(nn.Module):
         self.embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
+        # MoE LoRA layers: layer_id -> MoELoRALayer
+        self.moe_layers: Dict[int, MoELoRALayer] = {}
+        self.has_moe_lora: bool = False
+
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
@@ -87,11 +209,30 @@ class LoRAAdapter(nn.Module):
             self.config.target_modules
         )
 
+        # Track MoE expert weights separately
+        moe_expert_count = 0
+
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
+            # Check if this is a MoE expert weight
+            moe_info = get_moe_expert_info(name)
+            if moe_info is not None:
+                layer_id, expert_id, proj_type, lora_type = moe_info
+
+                # Create MoELoRALayer if not exists
+                if layer_id not in self.moe_layers:
+                    self.moe_layers[layer_id] = MoELoRALayer(scaling=self.scaling)
+
+                # Add weight to MoE layer
+                self.moe_layers[layer_id].add_expert_weight(
+                    expert_id, proj_type, lora_type, loaded_weight.cpu()
+                )
+                moe_expert_count += 1
+                continue
+
             layer_id = get_layer_id(name)
             if layer_id is not None:
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
@@ -117,6 +258,17 @@ class LoRAAdapter(nn.Module):
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_gate_up_proj(weight_names, layer.weights)
+
+        # Finalize MoE LoRA layers (merge gate + up)
+        if self.moe_layers:
+            self.has_moe_lora = True
+            for layer_id, moe_layer in self.moe_layers.items():
+                moe_layer.finalize()
+            logger.info(
+                f"LoRA adapter '{self.uid}' loaded {moe_expert_count} MoE expert weights "
+                f"across {len(self.moe_layers)} layers, "
+                f"covering {sum(l.num_experts for l in self.moe_layers.values())} unique experts"
+            )
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]

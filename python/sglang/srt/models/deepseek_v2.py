@@ -778,6 +778,49 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+        # MoE LoRA support
+        self._lora_manager = None
+
+    def set_moe_lora_manager(self, lora_manager):
+        """Set the LoRA manager for MoE LoRA support."""
+        self._lora_manager = lora_manager
+
+    def _apply_moe_lora(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output,
+        base_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply MoE LoRA to the base MoE output if enabled."""
+        if self._lora_manager is None:
+            return base_output
+
+        # Import here to avoid circular imports
+        from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
+
+        # Only support StandardTopKOutput for now
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            return base_output
+
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+
+        # Get base MoE weights for correct LoRA computation
+        # w13_weight: (num_experts, intermediate_size*2, hidden_size) - gate_up
+        # w2_weight: (num_experts, hidden_size, intermediate_size) - down
+        base_gate_up_weight = getattr(self.experts, 'w13_weight', None)
+        base_down_weight = getattr(self.experts, 'w2_weight', None)
+
+        return self._lora_manager.apply_moe_lora(
+            layer_id=self.layer_id,
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            base_output=base_output,
+            base_gate_up_weight=base_gate_up_weight,
+            base_down_weight=base_down_weight,
+        )
+
     def get_moe_weights(self):
         return [
             x.data
@@ -837,6 +880,10 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
+            # Apply MoE LoRA if enabled
+            final_hidden_states = self._apply_moe_lora(
+                hidden_states, topk_output, final_hidden_states
+            )
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
 
@@ -911,6 +958,12 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_output,
         )
+
+        # Apply MoE LoRA if enabled
+        final_hidden_states = self._apply_moe_lora(
+            hidden_states, topk_output, final_hidden_states
+        )
+
         if (
             not _is_cuda
             and not _use_aiter
@@ -939,6 +992,11 @@ class DeepseekV2MoE(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         fused_experts_out = self.experts(
             hidden_states=hidden_states, topk_output=topk_output
+        )
+
+        # Apply MoE LoRA if enabled
+        fused_experts_out = self._apply_moe_lora(
+            hidden_states, topk_output, fused_experts_out
         )
 
         assert use_intel_amx_backend(
@@ -1129,6 +1187,11 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
+        )
+
+        # Apply MoE LoRA if enabled
+        final_hidden_states = self._apply_moe_lora(
+            hidden_states, topk_output, final_hidden_states
         )
 
         if (

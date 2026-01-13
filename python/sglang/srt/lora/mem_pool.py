@@ -11,6 +11,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
+    REPLICATED_LINEAR_LORA_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
@@ -174,7 +175,12 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+        # Don't shard output for RowParallel (already sharded input) and Replicated (not sharded at all)
+        if (
+            self.tp_size > 1
+            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
             output_dim = divide(output_dim, self.tp_size)
         return (
             self.max_loras_per_batch,

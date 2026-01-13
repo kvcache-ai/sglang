@@ -69,6 +69,9 @@ def convert_lora_adapter(adapter_path: str, output_path: str = None, verbose: bo
                     new_key = key.replace("base_model.model.", "")
                     # Remove 'orig_module.' occurrences
                     new_key = new_key.replace(".orig_module", "")
+                    # Remove '.default' adapter name (PEFT multi-adapter naming)
+                    new_key = new_key.replace(".lora_A.default.", ".lora_A.")
+                    new_key = new_key.replace(".lora_B.default.", ".lora_B.")
                     new_state_dict[new_key] = value
 
                     if verbose and key != new_key:

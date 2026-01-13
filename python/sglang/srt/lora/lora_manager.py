@@ -33,6 +33,7 @@ from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.moe_mem_pool import MoELoRAMemoryPool
 from sglang.srt.lora.utils import (
     LoRAType,
     get_normalized_target_modules,
@@ -253,6 +254,13 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
+        # Prepare MoE LoRA batch if enabled
+        if self.moe_memory_pool is not None:
+            self.moe_memory_pool.prepare_batch(
+                cur_uids=cur_uids,
+                lora_adapters=self.loras,
+            )
+
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
@@ -280,6 +288,12 @@ class LoRAManager:
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
         )
+
+        # Store batch info for MoE LoRA access
+        self._current_weight_indices = weight_indices
+        self._current_lora_ranks = lora_ranks
+        self._current_scalings = scalings
+        self._current_seq_lens = forward_batch.extend_seq_lens
 
     def update_lora_info(self):
         """
@@ -341,6 +355,7 @@ class LoRAManager:
             target_modules=target_modules,
         )
         self.init_lora_modules()
+        self.init_moe_lora_modules()  # Initialize MoE LoRA modules
         self.init_memory_pool()
         self.update_lora_info()
 
@@ -459,6 +474,24 @@ class LoRAManager:
             lora_added_tokens_size=self.lora_added_tokens_size,
         )
 
+        # Initialize MoE LoRA memory pool if any adapter has MoE LoRA
+        self.has_moe_lora = any(
+            adapter.has_moe_lora for adapter in self.loras.values()
+        )
+        if self.has_moe_lora:
+            self.moe_memory_pool = MoELoRAMemoryPool(
+                base_hf_config=self.base_hf_config,
+                max_loras_per_batch=self.max_loras_per_batch,
+                dtype=self.dtype,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                max_lora_rank=self.max_lora_rank,
+                device=self.device,
+            )
+            logger.info(f"MoE LoRA memory pool initialized")
+        else:
+            self.moe_memory_pool = None
+
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
@@ -508,3 +541,167 @@ class LoRAManager:
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
+
+    def init_moe_lora_modules(self):
+        """
+        Find and register MoE layers for MoE LoRA.
+        Sets a reference to this lora_manager on each MoE layer.
+        """
+        self.moe_modules: Dict[int, torch.nn.Module] = {}
+
+        # Check if any adapter has MoE LoRA
+        has_moe_lora = any(
+            adapter.has_moe_lora for adapter in self.loras.values()
+        )
+        if not has_moe_lora:
+            return
+
+        # Find all MoE modules
+        for module_name, module in self.base_model.named_modules():
+            # Look for DeepseekV2MoE or similar MoE classes
+            class_name = module.__class__.__name__
+            if "MoE" in class_name and hasattr(module, "layer_id"):
+                layer_id = module.layer_id
+                self.moe_modules[layer_id] = module
+                # Set reference to lora_manager on the MoE module
+                if hasattr(module, "set_moe_lora_manager"):
+                    module.set_moe_lora_manager(self)
+                else:
+                    # Fallback: set attribute directly
+                    module._lora_manager = self
+                logger.info(f"Registered MoE layer {layer_id} for MoE LoRA: {module_name}")
+
+    # ========== MoE LoRA Methods ==========
+
+    def get_moe_lora_buffers(self, layer_id: int):
+        """
+        Get MoE LoRA buffers for a specific layer.
+
+        Returns:
+            Tuple of (gate_a, gate_b, up_a, up_b, down_a, down_b) or (None, ..., None)
+        """
+        if self.moe_memory_pool is None:
+            return None, None, None, None, None, None
+        return self.moe_memory_pool.get_buffers(layer_id)
+
+    def has_moe_lora_for_layer(self, layer_id: int) -> bool:
+        """Check if MoE LoRA is enabled for a specific layer."""
+        if self.moe_memory_pool is None:
+            return False
+        return self.moe_memory_pool.has_moe_lora_for_layer(layer_id)
+
+    def get_moe_lora_batch_info(self, device: torch.device):
+        """
+        Get batch info tensors for MoE LoRA computation.
+
+        Returns:
+            Tuple of (weight_indices, seq_lens, lora_ranks, scalings) tensors
+        """
+        if not hasattr(self, "_current_weight_indices"):
+            return None, None, None, None
+
+        weight_indices = torch.tensor(
+            self._current_weight_indices, dtype=torch.long, device=device
+        )
+        lora_ranks = torch.tensor(
+            self._current_lora_ranks, dtype=torch.long, device=device
+        )
+        scalings = torch.tensor(
+            self._current_scalings, dtype=torch.float32, device=device
+        )
+
+        # seq_lens might be a tensor already
+        if isinstance(self._current_seq_lens, torch.Tensor):
+            seq_lens = self._current_seq_lens.to(device)
+        else:
+            seq_lens = torch.tensor(
+                self._current_seq_lens, dtype=torch.long, device=device
+            )
+
+        return weight_indices, seq_lens, lora_ranks, scalings
+
+    def apply_moe_lora(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        base_output: torch.Tensor,
+        base_gate_up_weight: Optional[torch.Tensor] = None,
+        base_down_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Apply MoE LoRA to a layer's output.
+
+        Args:
+            layer_id: The layer index
+            hidden_states: Input hidden states to the MoE layer
+            topk_ids: Expert indices from router (num_tokens, top_k)
+            topk_weights: Routing weights from router (num_tokens, top_k)
+            base_output: Output from base MoE computation
+            base_gate_up_weight: Base MoE gate_up weights (num_experts, inter*2, hidden)
+            base_down_weight: Base MoE down weights (num_experts, hidden, inter)
+
+        Returns:
+            base_output with MoE LoRA contribution added
+        """
+        if not self.has_moe_lora_for_layer(layer_id):
+            return base_output
+
+        gate_a, gate_b, up_a, up_b, down_a, down_b = self.get_moe_lora_buffers(layer_id)
+        if gate_a is None:
+            return base_output
+
+        weight_indices, seq_lens, lora_ranks, scalings = self.get_moe_lora_batch_info(
+            hidden_states.device
+        )
+        if weight_indices is None:
+            return base_output
+
+        # Import here to avoid circular imports
+        from sglang.srt.lora.moe_lora import moe_lora_forward_batched, moe_lora_forward
+
+        # Check if single adapter (common case)
+        unique_adapters = weight_indices.unique()
+
+        if len(unique_adapters) == 1:
+            adapter_idx = unique_adapters[0].item()
+            rank = lora_ranks[adapter_idx].item()
+            scaling = scalings[adapter_idx].item()
+
+            return moe_lora_forward_batched(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                gate_a,
+                gate_b,
+                up_a,
+                up_b,
+                down_a,
+                down_b,
+                adapter_idx,
+                rank,
+                scaling,
+                base_output,
+                base_gate_up_weight,
+                base_down_weight,
+            )
+        else:
+            return moe_lora_forward(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                gate_a,
+                gate_b,
+                up_a,
+                up_b,
+                down_a,
+                down_b,
+                weight_indices,
+                seq_lens,
+                lora_ranks,
+                scalings,
+                base_output,
+                base_gate_up_weight,
+                base_down_weight,
+            )

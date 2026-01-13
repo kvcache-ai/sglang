@@ -169,3 +169,5 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
+# ReplicatedLinear modules: weights are replicated across all TP ranks, not sharded
+REPLICATED_LINEAR_LORA_NAMES = ["kv_a_proj_with_mqa"]
