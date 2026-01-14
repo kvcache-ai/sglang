@@ -145,6 +145,15 @@ def get_default_config(
     is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
+    base_config_item = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128, 
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2
+    }
+    return base_config_item
     if get_global_server_args().enable_deterministic_inference:
         config = {
             "BLOCK_SIZE_M": 64,
