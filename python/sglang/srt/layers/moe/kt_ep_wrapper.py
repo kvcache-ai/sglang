@@ -1490,6 +1490,74 @@ def copy_experts_weights_fp8(
             dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
 
 
+def copy_experts_weights_fp8_channel(
+    src_layer: torch.nn.Module,
+    dst_layer: torch.nn.Module,
+    selected_experts: torch.Tensor,
+) -> None:
+    """Copy FP8 per-channel quant expert weights from source to destination layer.
+
+    Args:
+        src_layer: Source layer (temporary full GPU layer) with all experts
+        dst_layer: Destination layer (original layer) with subset of experts
+        selected_experts: Tensor of logical expert IDs to copy (shape: [num_gpu_experts])
+
+    This copies:
+        - w13_weight: FP8 weights for gate+up projection
+        - w13_weight_scale: FP32 per-channel scales for w13
+        - w2_weight: FP8 weights for down projection
+        - w2_weight_scale: FP32 per-channel scales for w2
+    """
+    weight_names = ["w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"]
+
+    # Build mapping: selected logical ID -> dst GPU index
+    logical_to_dst_index = {
+        int(selected_experts[i].item()): i
+        for i in range(len(selected_experts))
+    }
+
+    for weight_name in weight_names:
+        src_weight = getattr(src_layer, weight_name)  # [global_num_experts, ...]
+        dst_weight = getattr(dst_layer, weight_name)  # [num_gpu_experts, ...]
+
+        # Copy each selected expert
+        for logical_id, dst_idx in logical_to_dst_index.items():
+            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+
+
+def copy_experts_weights_bf16(
+    src_layer: torch.nn.Module,
+    dst_layer: torch.nn.Module,
+    selected_experts: torch.Tensor,
+) -> None:
+    """Copy BF16/unquantized expert weights from source to destination layer.
+
+    Args:
+        src_layer: Source layer (temporary full GPU layer) with all experts
+        dst_layer: Destination layer (original layer) with subset of experts
+        selected_experts: Tensor of logical expert IDs to copy (shape: [num_gpu_experts])
+
+    This copies:
+        - w13_weight: BF16 weights for gate+up projection
+        - w2_weight: BF16 weights for down projection
+    """
+    weight_names = ["w13_weight", "w2_weight"]
+
+    # Build mapping: selected logical ID -> dst GPU index
+    logical_to_dst_index = {
+        int(selected_experts[i].item()): i
+        for i in range(len(selected_experts))
+    }
+
+    for weight_name in weight_names:
+        src_weight = getattr(src_layer, weight_name)  # [global_num_experts, ...]
+        dst_weight = getattr(dst_layer, weight_name)  # [num_gpu_experts, ...]
+
+        # Copy each selected expert
+        for logical_id, dst_idx in logical_to_dst_index.items():
+            dst_weight[dst_idx].copy_(src_weight[logical_id], non_blocking=False)
+
+
 def update_gpu_expert_mappings(
     selected_experts: torch.Tensor,
     num_experts: int,
@@ -2030,6 +2098,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Copy weights from temporary layer to original layer
         if ctx.is_fp8_quant:
             copy_experts_weights_fp8(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+            )
+        elif ctx.is_fp8_channel_quant:
+            copy_experts_weights_fp8_channel(
+                src_layer=ctx.gpu_layer,
+                dst_layer=layer,
+                selected_experts=selected_experts,
+            )
+        elif ctx.is_bf16_quant:
+            copy_experts_weights_bf16(
                 src_layer=ctx.gpu_layer,
                 dst_layer=layer,
                 selected_experts=selected_experts,
