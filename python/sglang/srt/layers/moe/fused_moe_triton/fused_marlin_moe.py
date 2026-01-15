@@ -1,13 +1,17 @@
-from typing import Optional
 
-import torch
-
-from sglang.srt.utils import direct_register_custom_op, is_cuda
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import moe_sum_reduce, silu_and_mul
+    from sgl_kernel import silu_and_mul
+
+import functools
+from typing import Optional
+
+import torch
+from sgl_kernel.elementwise import silu_and_mul
+from sgl_kernel.moe import moe_sum_reduce
 
 
 def get_scalar_type(num_bits: int, has_zp: bool):
@@ -41,7 +45,7 @@ def fused_marlin_moe(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
-    routed_scaling_factor: Optional[float] = None,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -65,13 +69,18 @@ def fused_marlin_moe(
     - topk_ids (torch.Tensor): Indices of topk-k elements.
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
-    - num_bits (int): The number of bits in expert weights quantization.
+    - num_bits (bool): The number of bits in expert weights quantization.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+    # Delay the import to avoid circular dependency
+    from sglang.srt.layers.moe.fused_moe_triton import (
+        moe_align_block_size,
+        try_get_optimal_moe_config,
+    )
 
+    # Check constraints.
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (
@@ -94,11 +103,17 @@ def fused_marlin_moe(
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w1.shape,
+        w2.shape,
+        topk_ids.shape[1],
+        None,
+        is_marlin=True,
+    )
+    config = get_config_func(M)
+
+    block_size_m = config["BLOCK_SIZE_M"]
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -203,11 +218,10 @@ def fused_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
-    output = hidden_states if inplace else torch.empty_like(hidden_states)
-
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0
 
+    output = hidden_states if inplace else torch.empty_like(hidden_states)
     moe_sum_reduce(
         intermediate_cache3,
         output,
@@ -237,14 +251,16 @@ def fused_marlin_moe_fake(
     num_bits: int = 8,
     is_k_full: bool = True,
     inplace: bool = False,
-    routed_scaling_factor: Optional[float] = None,
+    routed_scaling_factor: float = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
+from sglang.srt.utils import direct_register_custom_op, supports_custom_op
 
-direct_register_custom_op(
-    op_name="fused_marlin_moe",
-    op_func=fused_marlin_moe,
-    mutates_args=[],
-    fake_impl=fused_marlin_moe_fake,
-)
+if supports_custom_op():
+    direct_register_custom_op(
+        op_name="fused_marlin_moe",
+        op_func=fused_marlin_moe,
+        mutates_args=[],
+        fake_impl=fused_marlin_moe_fake,
+    )

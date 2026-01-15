@@ -141,6 +141,7 @@ class SharedFullContext:
 
         # Detect quantization type for weight loading
         self.is_fp8_quant = self._detect_fp8_quant()
+        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
         self.is_bf16_quant = self._detect_bf16_quant()
 
         self.gpu_method.create_weights(
@@ -185,6 +186,33 @@ class SharedFullContext:
 
         return False
 
+    def _detect_fp8_channel_quant(self) -> bool:
+        """Detect if the quantization method is FP8 per-channel quant.
+
+        Per-channel FP8 differs from block FP8:
+        - Per-channel: scale shape is (num_experts, output_dim, 1), weight_scale name
+        - Block FP8: scale shape is (num_experts, blocks_n, blocks_k), weight_scale_inv name
+
+        Returns:
+            True if FP8 per-channel quant, False otherwise
+        """
+        try:
+            from compressed_tensors.quantization import QuantizationStrategy
+        except ImportError:
+            return False
+
+        method = self.gpu_method
+        method_name = method.__class__.__name__
+
+        # Check for CompressedTensorsW8A8Fp8MoEMethod with channel strategy
+        if "W8A8Fp8" in method_name:
+            weight_quant = getattr(method, "weight_quant", None)
+            if weight_quant is not None:
+                if weight_quant.strategy == QuantizationStrategy.CHANNEL:
+                    return True
+
+        return False
+
     def _detect_bf16_quant(self) -> bool:
         """Detect if the quantization method is BF16/unquantized.
 
@@ -207,6 +235,8 @@ class SharedFullContext:
         """Get weight names based on quantization type."""
         if self.is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
+        elif self.is_fp8_channel_quant:
+            return self.WEIGHT_NAMES_FP8_CHANNEL
         elif self.is_bf16_quant:
             return self.WEIGHT_NAMES_BF16
         else:
@@ -226,6 +256,17 @@ class SharedFullContext:
         "w13_weight_scale_inv",
         "w2_weight",
         "w2_weight_scale_inv",
+    ]
+
+    # Weight names for FP8 per-channel quant format
+    # Per-channel differs from block quant:
+    # - Scale shape: (num_experts, output_dim, 1) vs (num_experts, blocks_n, blocks_k)
+    # - Weight name: w13_weight_scale vs w13_weight_scale_inv
+    WEIGHT_NAMES_FP8_CHANNEL = [
+        "w13_weight",
+        "w13_weight_scale",
+        "w2_weight",
+        "w2_weight_scale",
     ]
 
     # Weight names for BF16/unquantized format (no scales)
@@ -656,6 +697,142 @@ class SharedFullContext:
     # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
     # The conversion is handled separately in the normal weight loading path.
 
+    def _prepare_weight_fp8_channel(self, wrapper):
+        """Prepare FP8 per-channel quant weights by writing from KT and copying to GPU.
+
+        Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+
+        FP8 per-channel quant differs from FP8 block quant:
+        - Per-channel scale shape: (num_experts, output_dim, 1) vs (num_experts, blocks_n, blocks_k)
+        - Weight name: w13_weight_scale vs w13_weight_scale_inv
+        - Both use float8_e4m3fn weights
+
+        Similar to block FP8:
+        - No transpose needed (weight layout is already correct)
+        - No marlin_repack needed (only INT4 Marlin needs this)
+        - No permute_scales needed (only Marlin format needs this)
+
+        The postprocess stage is a no-op for FP8 but provides pipeline synchronization
+        to ensure copy(e-2) completes before write(e) overwrites the same slot.
+        """
+        # Bind Python thread to specific CPU core (last cores for each rank)
+        tp_rank = get_tensor_model_parallel_rank()
+        num_cpus = os.cpu_count()
+        target_cpu = num_cpus - 1 - tp_rank
+        os.sched_setaffinity(0, {target_cpu})
+
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_weight.device
+
+        # Prepare weight tensors (cpu_buf is double-buffered with shape [2, ...])
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_FP8_CHANNEL:
+            cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
+            gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
+            weight_infos.append((cpu_buf, gpu_t))
+
+        # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+        copy_stream = torch.cuda.Stream(device=device)
+        post_stream = torch.cuda.Stream(device=device)
+        events = [torch.cuda.Event() for _ in range(num_experts)]
+
+        def postprocess_expert(e):
+            # FP8 per-channel doesn't need actual postprocessing (no repack/permute).
+            # This function provides a pipeline synchronization point and
+            # can be extended for future FP8-specific processing if needed.
+            pass
+
+        # Prepare write pipeline (rank 0 only)
+        tp_world_size = get_tensor_model_parallel_world_size()
+        do_write = tp_rank == 0 and wrapper is not None
+
+        if do_write:
+            # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
+            w13_weight_buf = self.cpu_buffers["w13_weight"]
+            w13_scale_buf = self.cpu_buffers["w13_weight_scale"]
+            w2_weight_buf = self.cpu_buffers["w2_weight"]
+            w2_scale_buf = self.cpu_buffers["w2_weight_scale"]
+
+            # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
+            w13_weight_expert_nbytes = (
+                w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+            )
+            w13_scale_expert_nbytes = (
+                w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+            )
+            w2_weight_expert_nbytes = (
+                w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+            )
+            w2_scale_expert_nbytes = (
+                w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+            )
+
+            def submit_write_expert(expert_id):
+                # Use expert_id % 2 for double buffering slot selection
+                slot = expert_id % 2
+                w13_weight_ptrs = [
+                    ptr + slot * w13_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                ]
+                w13_scale_ptrs = [
+                    ptr + slot * w13_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w13_weight_scale"]
+                ]
+                w2_weight_ptrs = [
+                    ptr + slot * w2_weight_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                ]
+                w2_scale_ptrs = [
+                    ptr + slot * w2_scale_expert_nbytes
+                    for ptr in self.all_rank_buffer_ptrs["w2_weight_scale"]
+                ]
+                wrapper.submit_write_weight_scale_to_buffer(
+                    tp_world_size,
+                    expert_id,
+                    w13_weight_ptrs,
+                    w13_scale_ptrs,
+                    w2_weight_ptrs,
+                    w2_scale_ptrs,
+                )
+
+            # Submit expert 0 ahead of time
+            submit_write_expert(0)
+
+        for e in range(num_experts):
+            # Sync write for expert e, submit write for expert e+1
+            if do_write:
+                wrapper.sync_write_weight_scale_to_buffer()
+                if e + 1 < num_experts:
+                    # Before writing to slot (e+1)%2, ensure copy from that slot is complete.
+                    # Since (e+1)%2 == (e-1)%2 for e >= 1, we need to wait for copy(e-1).
+                    if e > 0:
+                        events[e - 1].synchronize()
+                    submit_write_expert(e + 1)
+
+            # Barrier to ensure all ranks see the written data
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            with torch.cuda.stream(copy_stream):
+                slot = e % 2  # Double buffering
+                for cpu_buf, gpu_t in weight_infos:
+                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                events[e].record(copy_stream)
+
+            # Postprocess expert e-1: provides pipeline structure for future extensions
+            if e > 0:
+                with torch.cuda.stream(post_stream):
+                    post_stream.wait_event(events[e - 1])
+                    postprocess_expert(e - 1)
+
+        # Process last expert
+        with torch.cuda.stream(post_stream):
+            post_stream.wait_event(events[-1])
+            postprocess_expert(num_experts - 1)
+
+        torch.cuda.current_stream(device).wait_stream(post_stream)
+
     def _prepare_weight_bf16(self, wrapper):
         """Prepare BF16/unquantized weights by writing from KT and copying to GPU.
 
@@ -792,6 +969,8 @@ class SharedFullContext:
         # Select appropriate prepare_weight method based on quantization type
         if self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper)
+        elif self.is_fp8_channel_quant:
+            self._prepare_weight_fp8_channel(wrapper)
         elif self.is_bf16_quant:
             self._prepare_weight_bf16(wrapper)
         else:
@@ -1563,10 +1742,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             moe_runner_config: Configuration for MoE runner
         """
         self.moe_runner_config = moe_runner_config
+
+        # Create a separate config for GPU method without routed_scaling_factor.
+        # This is because:
+        # 1. GPU method's moe_sum_reduce would apply routed_scaling_factor internally
+        # 2. KT CPU kernel does NOT apply routed_scaling_factor
+        # 3. The combined output (GPU + CPU) would have inconsistent scaling
+        # 4. routed_scaling_factor is applied uniformly in deepseek_v2.py forward_normal
+        # So we disable it in GPU method to avoid double scaling on GPU part.
+        gpu_runner_config = replace(moe_runner_config, routed_scaling_factor=None)
         if self.override_num_local_experts:
-            moe_runner_config.num_local_experts = self.num_gpu_experts
+            gpu_runner_config = replace(
+                gpu_runner_config, num_local_experts=self.num_gpu_experts
+            )
+
         # Delegate to GPU method to create its runner
-        self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        self.gpu_method.create_moe_runner(layer, gpu_runner_config)
 
     def submit(
         self,

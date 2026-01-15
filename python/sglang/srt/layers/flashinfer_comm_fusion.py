@@ -5,11 +5,8 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.utils import (
-    direct_register_custom_op,
-    is_flashinfer_available,
-    supports_custom_op,
-)
+from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +32,7 @@ class FlashInferWorkspaceManager:
         self.world_size = None
         self.rank = None
         self.initialized = False
+        self.disabled = False
 
     def initialize(
         self,
@@ -46,6 +44,9 @@ class FlashInferWorkspaceManager:
         use_fp32_lamport: bool = False,
     ):
         """Initialize workspace"""
+        if self.disabled:
+            return
+
         if self.initialized and self.world_size == world_size:
             return
 
@@ -57,16 +58,26 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
 
-        self.ipc_handles, self.workspace_tensor = (
-            comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                rank,
-                world_size,
-                max_token_num,
-                hidden_dim,
-                group=group,
-                use_fp32_lamport=use_fp32_lamport,
+        try:
+            self.ipc_handles, self.workspace_tensor = (
+                comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                    rank,
+                    world_size,
+                    max_token_num,
+                    hidden_dim,
+                    group=group,
+                    use_fp32_lamport=use_fp32_lamport,
+                )
             )
-        )
+        except RuntimeError as e:
+            message = str(e).lower()
+            if "peer access is not supported" in message:
+                logger.warning(
+                    "Disabling FlashInfer allreduce fusion because GPU peer access is not supported."
+                )
+                self.disabled = True
+                return
+            raise
 
         self.world_size = world_size
         self.rank = rank
@@ -96,7 +107,7 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
-    max_token_num: int = 2048, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+    max_token_num: int = 16384, hidden_dim: int = 4096, use_fp32_lamport: bool = False
 ):
     """Ensure workspace is initialized"""
     if not is_flashinfer_available() or _flashinfer_comm is None:
@@ -107,6 +118,9 @@ def ensure_workspace_initialized(
         return False
 
     rank = dist.get_rank()
+
+    if _workspace_manager.disabled:
+        return False
 
     if (
         not _workspace_manager.initialized
@@ -123,12 +137,31 @@ def ensure_workspace_initialized(
     return _workspace_manager.initialized
 
 
+def fake_flashinfer_allreduce_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 16384,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(input_tensor)
+    return norm_out, residual_out
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
+)
 def flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    max_token_num: int = 2048,
+    max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
@@ -160,7 +193,14 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
 
-    assert input_tensor.shape[0] <= max_token_num
+    if input_tensor.shape[0] > max_token_num:
+        logger.debug(
+            "Input token(%d) is greater than max_token_num(%d), "
+            "falling back to standard implementation",
+            input_tensor.shape[0],
+            max_token_num,
+        )
+        return None, None
 
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
@@ -200,30 +240,6 @@ def flashinfer_allreduce_residual_rmsnorm(
     )
 
     return norm_out, residual_out
-
-
-def fake_flashinfer_allreduce_residual_rmsnorm(
-    input_tensor: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-    max_token_num: int = 16384,
-    use_oneshot: Optional[bool] = None,
-    trigger_completion_at_end: bool = False,
-    fp32_acc: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    residual_out = torch.empty_like(residual)
-    norm_out = torch.empty_like(input_tensor)
-    return norm_out, residual_out
-
-
-if supports_custom_op():
-    direct_register_custom_op(
-        "flashinfer_allreduce_residual_rmsnorm",
-        flashinfer_allreduce_residual_rmsnorm,
-        mutates_args=["input_tensor", "residual", "weight"],
-        fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
-    )
 
 
 def cleanup_flashinfer_workspace():

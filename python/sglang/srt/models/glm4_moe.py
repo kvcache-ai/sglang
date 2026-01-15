@@ -62,6 +62,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -75,6 +76,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -250,28 +252,6 @@ class Glm4MoeAttention(nn.Module):
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -295,7 +275,14 @@ class Glm4MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            q, k = self._apply_qk_norm(q, k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
         q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -495,8 +482,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(hidden_states, router_logits)
 
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda and not _use_aiter:
+            if (
+                not _is_cuda
+                and not _use_aiter
+                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            ):
                 # fused in biased_grouped_topk so we can skip here
+                # For KTEPWrapperMethod, routed_scaling_factor is not applied
+                # internally (disabled in gpu_runner_config), so apply here
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -532,7 +525,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if not _is_cuda and not _use_aiter:
+        if (
+            not _is_cuda
+            and not _use_aiter
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
+            # fused in biased_grouped_topk so we can skip here
+            # For KTEPWrapperMethod, routed_scaling_factor is not applied
+            # internally (disabled in gpu_runner_config), so apply here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
