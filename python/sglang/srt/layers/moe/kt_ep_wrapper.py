@@ -65,6 +65,11 @@ class KTConfig:
         method: CPU computation method (e.g., "int4")
         num_layers: Total number of layers in the model (optional)
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
+        moe_lora_enabled: Whether MoE expert LoRA is enabled
+        moe_lora_path: Path to converted MoE LoRA weights (.pt file)
+        lora_rank: LoRA rank
+        lora_alpha: LoRA alpha scaling factor
+        sft_method: SFT quantization method (e.g., "AMXBF16_SFT")
     """
 
     layer_idx: int
@@ -77,6 +82,12 @@ class KTConfig:
     method: str
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
+    # MoE LoRA configuration
+    moe_lora_enabled: bool = False
+    moe_lora_path: Optional[str] = None
+    lora_rank: int = 16
+    lora_alpha: float = 32.0
+    sft_method: str = "AMXBF16_SFT"
 
 
 _SHARED_FULL_CONTEXT = None
@@ -1003,6 +1014,13 @@ def create_kt_config_from_server_args(
     hf_config = server_args.get_hf_config()
     num_layers = getattr(hf_config, "num_hidden_layers", None)
 
+    # Check for MoE LoRA configuration
+    moe_lora_enabled = getattr(server_args, "kt_moe_lora_path", None) is not None
+    moe_lora_path = getattr(server_args, "kt_moe_lora_path", None)
+    lora_rank = getattr(server_args, "kt_moe_lora_rank", 16)
+    lora_alpha = getattr(server_args, "kt_moe_lora_alpha", 32.0)
+    sft_method = getattr(server_args, "kt_moe_sft_method", "AMXBF16_SFT")
+
     return KTConfig(
         layer_idx=layer_idx,
         num_gpu_experts=server_args.kt_num_gpu_experts,
@@ -1014,6 +1032,12 @@ def create_kt_config_from_server_args(
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
+        # MoE LoRA configuration
+        moe_lora_enabled=moe_lora_enabled,
+        moe_lora_path=moe_lora_path,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        sft_method=sft_method,
     )
 
 
@@ -1139,20 +1163,41 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
-            self.wrapper = KTMoEWrapper(
-                layer_idx=self.kt_config.layer_idx,
-                num_experts=num_experts,
-                num_experts_per_tok=num_experts_per_tok,
-                hidden_size=hidden_size,
-                moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
-                cpuinfer_threads=self.kt_config.cpuinfer_threads,
-                threadpool_count=self.kt_config.threadpool_count,
-                weight_path=self.kt_config.weight_path,
-                chunked_prefill_size=self.kt_config.chunked_prefill_size,
-                method=self.kt_config.method,
-                max_deferred_experts_per_token=layer_max_deferred,
-            )
+            if self.kt_config.moe_lora_enabled:
+                # SFT mode with MoE LoRA support
+                self.wrapper = KTMoEWrapper(
+                    layer_idx=self.kt_config.layer_idx,
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    hidden_size=hidden_size,
+                    moe_intermediate_size=intermediate_size_full,
+                    num_gpu_experts=self.num_gpu_experts,
+                    cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                    threadpool_count=self.kt_config.threadpool_count,
+                    weight_path=self.kt_config.weight_path,
+                    chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                    mode="sft",
+                    method=self.kt_config.sft_method,
+                    lora_rank=self.kt_config.lora_rank,
+                    lora_alpha=self.kt_config.lora_alpha,
+                    max_cache_depth=1,  # Inference mode: no need for deep cache
+                )
+            else:
+                # Standard inference mode
+                self.wrapper = KTMoEWrapper(
+                    layer_idx=self.kt_config.layer_idx,
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    hidden_size=hidden_size,
+                    moe_intermediate_size=intermediate_size_full,
+                    num_gpu_experts=self.num_gpu_experts,
+                    cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                    threadpool_count=self.kt_config.threadpool_count,
+                    weight_path=self.kt_config.weight_path,
+                    chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                    method=self.kt_config.method,
+                    max_deferred_experts_per_token=layer_max_deferred,
+                )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -1179,6 +1224,68 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 .contiguous()
             )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+
+            # 3. Load MoE LoRA weights if enabled
+            if self.kt_config.moe_lora_enabled and self.kt_config.moe_lora_path:
+                self._load_moe_lora_weights()
+
+    def _load_moe_lora_weights(self) -> None:
+        """Load MoE LoRA weights from converted .pt file.
+
+        This method loads the pre-converted MoE LoRA weights and initializes
+        them in the kt-kernel SFT wrapper.
+        """
+        import os
+
+        lora_path = self.kt_config.moe_lora_path
+        layer_idx = self.kt_config.layer_idx
+
+        if not os.path.exists(lora_path):
+            raise FileNotFoundError(
+                f"MoE LoRA file not found: {lora_path}. "
+                "Please run scripts/convert_moe_lora.py to convert the adapter first."
+            )
+
+        # Load the converted LoRA weights
+        lora_weights = torch.load(lora_path, map_location="cpu", weights_only=True)
+
+        # Get layer-specific weights
+        layer_key = f"layer_{layer_idx}"
+        if layer_key not in lora_weights:
+            raise KeyError(
+                f"Layer {layer_idx} not found in MoE LoRA file. "
+                f"Available layers: {[k for k in lora_weights.keys() if k.startswith('layer_')]}"
+            )
+
+        layer_data = lora_weights[layer_key]
+
+        # Extract LoRA weight tensors (ensure contiguous and correct dtype)
+        gate_lora_a = layer_data["gate_lora_a"].contiguous().to(torch.bfloat16)
+        gate_lora_b = layer_data["gate_lora_b"].contiguous().to(torch.bfloat16)
+        up_lora_a = layer_data["up_lora_a"].contiguous().to(torch.bfloat16)
+        up_lora_b = layer_data["up_lora_b"].contiguous().to(torch.bfloat16)
+        down_lora_a = layer_data["down_lora_a"].contiguous().to(torch.bfloat16)
+        down_lora_b = layer_data["down_lora_b"].contiguous().to(torch.bfloat16)
+
+        # Initialize LoRA weights in the kt-kernel wrapper
+        self.wrapper.init_lora_weights(
+            gate_lora_a,
+            gate_lora_b,
+            up_lora_a,
+            up_lora_b,
+            down_lora_a,
+            down_lora_b,
+        )
+
+        if layer_idx == 0:
+            metadata = lora_weights.get("metadata", {})
+            logger.info(
+                "MoE LoRA loaded: rank=%s, alpha=%s, num_experts=%s, num_layers=%s",
+                metadata.get("lora_rank"),
+                metadata.get("lora_alpha"),
+                metadata.get("num_experts"),
+                metadata.get("num_layers"),
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -1217,6 +1324,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         This method submits the CPU expert computation to AMX/AVX without waiting
         for completion, allowing GPU computation to proceed in parallel.
 
+        Note: In SFT mode (MoE LoRA enabled), this method is a no-op because
+        forward_sft() is synchronous and will be called in apply() directly.
+
         Args:
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
@@ -1228,6 +1338,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank != 0 or self.wrapper is None:
             return
 
+        # SFT mode uses synchronous forward_sft, skip async submit
+        if self.kt_config.moe_lora_enabled:
+            return
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
@@ -1237,13 +1351,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
         )
 
-    def sync(self, x: torch.Tensor) -> torch.Tensor:
+    def sync(
+        self,
+        x: torch.Tensor,
+        dispatch_output: "StandardDispatchOutput" = None,
+    ) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
 
         This method waits for the CPU computation to complete and returns the results.
 
         Args:
             x: Reference tensor for shape and device information
+            dispatch_output: Dispatched tokens and routing information (required for SFT mode)
 
         Returns:
             CPU expert computation results
@@ -1251,7 +1370,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(x)
 
-        # Wait for CPU computation and retrieve results
+        # SFT mode: use synchronous forward_sft with LoRA
+        if self.kt_config.moe_lora_enabled:
+            if dispatch_output is None:
+                raise ValueError(
+                    "dispatch_output is required for SFT mode (MoE LoRA enabled)"
+                )
+
+            topk_output = dispatch_output.topk_output
+            topk_weights, topk_ids, _ = topk_output
+
+            # forward_sft is synchronous and includes LoRA computation
+            return self.wrapper.forward_sft(
+                x,
+                topk_ids,
+                topk_weights,
+                save_for_backward=False,  # Inference mode: no gradient needed
+            )
+
+        # Standard inference mode: wait for async CPU computation
         return self.wrapper.sync_forward(
             x, torch.cuda.current_stream(x.device).cuda_stream
         )
@@ -1323,7 +1460,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 4: Synchronize CPU results and merge with GPU results
         output = gpu_combine_input.hidden_states
         if self.tp_rank == 0:
-            cpu_output = self.sync(x)
+            # Pass dispatch_output for SFT mode (needed for forward_sft)
+            cpu_output = self.sync(x, dispatch_output)
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)

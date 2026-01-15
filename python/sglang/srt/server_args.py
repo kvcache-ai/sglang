@@ -500,6 +500,11 @@ class ServerArgs:
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
     kt_gpu_prefill_token_threshold: Optional[int] = None
+    # KT MoE LoRA (SFT mode)
+    kt_moe_lora_path: Optional[str] = None
+    kt_moe_lora_rank: int = 16
+    kt_moe_lora_alpha: float = 32.0
+    kt_moe_sft_method: str = "AMXBF16_SFT"
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -3889,6 +3894,30 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kt_gpu_prefill_token_threshold,
             help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
+        )
+        parser.add_argument(
+            "--kt-moe-lora-path",
+            type=str,
+            default=ServerArgs.kt_moe_lora_path,
+            help="[ktransformers parameter] Path to converted MoE LoRA weights (.pt file). Use scripts/convert_moe_lora.py to convert PEFT adapters.",
+        )
+        parser.add_argument(
+            "--kt-moe-lora-rank",
+            type=int,
+            default=ServerArgs.kt_moe_lora_rank,
+            help="[ktransformers parameter] LoRA rank for MoE expert LoRA (default: 16).",
+        )
+        parser.add_argument(
+            "--kt-moe-lora-alpha",
+            type=float,
+            default=ServerArgs.kt_moe_lora_alpha,
+            help="[ktransformers parameter] LoRA alpha for MoE expert LoRA (default: 32.0).",
+        )
+        parser.add_argument(
+            "--kt-moe-sft-method",
+            type=str,
+            default=ServerArgs.kt_moe_sft_method,
+            help="[ktransformers parameter] SFT quantization method for MoE expert LoRA (default: AMXBF16_SFT). Options: AMXBF16_SFT, AMXINT8_SFT, AMXINT4_SFT.",
         )
 
         # Diffusion LLM
