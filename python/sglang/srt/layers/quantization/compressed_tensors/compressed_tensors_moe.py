@@ -364,7 +364,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
-    def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
+    def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
@@ -386,7 +386,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 "is supported for the following bits: ",
                 f"{WNA16_SUPPORTED_BITS}",
             )
-        self.num_gpu_experts = num_gpu_experts
 
     def create_weights(
         self,
