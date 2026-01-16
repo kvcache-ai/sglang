@@ -741,6 +741,9 @@ class ServerArgs:
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
 
+        # Handle kt-kernel MoE LoRA (SFT mode).
+        self._handle_kt_moe_lora()
+
         # Handle debug utilities.
         self._handle_debug_utils()
 
@@ -2483,6 +2486,21 @@ class ServerArgs:
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
             self.pp_size = 1
+
+    def _handle_kt_moe_lora(self):
+        """Disable CUDA graph when kt-kernel MoE LoRA (SFT mode) is enabled.
+
+        SFT mode uses synchronous CPU computation (forward_sft) which cannot
+        be captured by CUDA graph. During graph replay, CPU computation would
+        not execute, leading to incorrect results.
+        """
+        if self.kt_moe_lora_path is not None:
+            if not self.disable_cuda_graph:
+                logger.warning(
+                    "CUDA graph is disabled because kt-kernel MoE LoRA is enabled. "
+                    "SFT mode requires synchronous CPU computation."
+                )
+                self.disable_cuda_graph = True
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.

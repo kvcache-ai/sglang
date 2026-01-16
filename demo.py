@@ -1,6 +1,6 @@
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:10130/v1", api_key="EMPTY") # 这里的10103需要对齐SGLang Server的port
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY") # 这里的10103需要对齐SGLang Server的port
 
 response = client.chat.completions.create(
     model="DeepSeek-V2-Lite-Chat:lora0",

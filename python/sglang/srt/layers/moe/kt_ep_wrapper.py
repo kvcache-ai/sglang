@@ -70,6 +70,7 @@ class KTConfig:
         lora_rank: LoRA rank
         lora_alpha: LoRA alpha scaling factor
         sft_method: SFT quantization method (e.g., "AMXBF16_SFT")
+        model_path: Path to HuggingFace model (for SFT BF16 mode)
     """
 
     layer_idx: int
@@ -88,6 +89,7 @@ class KTConfig:
     lora_rank: int = 16
     lora_alpha: float = 32.0
     sft_method: str = "AMXBF16_SFT"
+    model_path: Optional[str] = None
 
 
 _SHARED_FULL_CONTEXT = None
@@ -1038,6 +1040,7 @@ def create_kt_config_from_server_args(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         sft_method=sft_method,
+        model_path=server_args.model_path,
     )
 
 
@@ -1165,6 +1168,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             if self.kt_config.moe_lora_enabled:
                 # SFT mode with MoE LoRA support
+                # Determine weight path based on SFT method:
+                # - AMXBF16_SFT: use model_path (HuggingFace BF16 weights)
+                # - AMXINT8_SFT/AMXINT4_SFT: use weight_path (pre-quantized weights)
+                if self.kt_config.sft_method == "AMXBF16_SFT":
+                    sft_weight_path = self.kt_config.model_path
+                else:
+                    sft_weight_path = self.kt_config.weight_path
+
                 self.wrapper = KTMoEWrapper(
                     layer_idx=self.kt_config.layer_idx,
                     num_experts=num_experts,
@@ -1174,7 +1185,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     num_gpu_experts=self.num_gpu_experts,
                     cpuinfer_threads=self.kt_config.cpuinfer_threads,
                     threadpool_count=self.kt_config.threadpool_count,
-                    weight_path=self.kt_config.weight_path,
+                    weight_path=sft_weight_path,
                     chunked_prefill_size=self.kt_config.chunked_prefill_size,
                     mode="sft",
                     method=self.kt_config.sft_method,
@@ -1462,6 +1473,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             # Pass dispatch_output for SFT mode (needed for forward_sft)
             cpu_output = self.sync(x, dispatch_output)
+            # SFT mode returns CPU tensor, need to move to GPU before adding
+            if cpu_output.device != output.device:
+                cpu_output = cpu_output.to(output.device, non_blocking=True)
             output = output + cpu_output
 
         return StandardCombineInput(hidden_states=output)
