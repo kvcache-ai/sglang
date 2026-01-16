@@ -25,7 +25,7 @@ from pathlib import Path
 import requests
 import torch
 
-SERVER_URL = "http://localhost:30000"
+SERVER_URL = "http://localhost:30005"
 
 
 def start_record():
