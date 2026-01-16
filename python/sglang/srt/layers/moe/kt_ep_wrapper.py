@@ -1159,14 +1159,45 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         )
         return None
 
-    num_gpu_experts = server_args.kt_num_gpu_experts
-    if num_gpu_experts is None:
-        logger.warning("kt_num_gpu_experts is required but not set.")
-        return None
-
     # Get first_k_dense_replace to identify which layers are MoE layers
     first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0)
     moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
+
+    # Count actual MoE layers
+    num_moe_layers = sum(
+        1 for i in range(num_layers)
+        if i >= first_k_dense_replace and i % moe_layer_freq == 0
+    )
+    total_experts = num_moe_layers * num_experts
+
+    # Determine num_gpu_experts (total across all layers)
+    if server_args.kt_gpu_experts_ratio is not None:
+        # Use ratio to calculate total GPU experts
+        num_gpu_experts = int(total_experts * server_args.kt_gpu_experts_ratio)
+        if server_args.kt_num_gpu_experts is not None:
+            logger.warning(
+                f"--kt-gpu-experts-ratio={server_args.kt_gpu_experts_ratio} is set, "
+                f"ignoring --kt-num-gpu-experts={server_args.kt_num_gpu_experts}. "
+                f"Actual total GPU experts: {num_gpu_experts} "
+                f"(= {total_experts} total experts × {server_args.kt_gpu_experts_ratio})"
+            )
+        else:
+            logger.info(
+                f"Using kt_gpu_experts_ratio={server_args.kt_gpu_experts_ratio}, "
+                f"total GPU experts: {num_gpu_experts} "
+                f"(= {total_experts} total experts × {server_args.kt_gpu_experts_ratio})"
+            )
+    elif server_args.kt_num_gpu_experts is not None:
+        # kt_num_gpu_experts is per-layer, multiply by num_moe_layers
+        num_gpu_experts = server_args.kt_num_gpu_experts * num_moe_layers
+        logger.info(
+            f"Using kt_num_gpu_experts={server_args.kt_num_gpu_experts} per layer, "
+            f"total GPU experts: {num_gpu_experts} "
+            f"(= {server_args.kt_num_gpu_experts} × {num_moe_layers} MoE layers)"
+        )
+    else:
+        logger.warning("Either kt_num_gpu_experts or kt_gpu_experts_ratio is required but not set.")
+        return None
 
     # Get GPU expert placement strategy
     strategy = server_args.kt_expert_placement_strategy
