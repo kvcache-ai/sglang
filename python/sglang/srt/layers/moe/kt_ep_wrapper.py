@@ -158,10 +158,15 @@ class SharedFullContext:
                 param.data = param.data.to(target_device)
 
         # Create runner config - update both num_experts and num_local_experts for full GPU fallback
+        # Set routed_scaling_factor=None to avoid double scaling:
+        # - moe_sum_reduce would apply routed_scaling_factor internally
+        # - deepseek_v2.py forward_normal also applies routed_scaling_factor for KTEPWrapperMethod
+        # By setting it to None here, we ensure it's only applied once in forward_normal
         runner_config = replace(
             moe_runner_config,
             num_experts=global_num_experts,
             num_local_experts=global_num_experts,
+            routed_scaling_factor=None,
         )
         self.gpu_layer.moe_runner_config = runner_config
         self.gpu_method.create_moe_runner(self.gpu_layer, runner_config)
