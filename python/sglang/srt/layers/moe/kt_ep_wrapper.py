@@ -1057,10 +1057,13 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
         num_gpu_experts: Number of experts that should run on GPU (experts 0 to num_gpu_experts-1)
 
     Returns:
-        Modified topk_ids tensor with CPU expert IDs masked as -1
+        New tensor with CPU expert IDs masked as -1 (original tensor is not modified)
     """
-    topk_ids[topk_ids >= num_gpu_experts] = -1
-    return topk_ids
+    # Clone to avoid in-place modification of the original tensor
+    # This is critical for SFT mode where the original topk_ids is needed later
+    result = topk_ids.clone()
+    result[result >= num_gpu_experts] = -1
+    return result
 
 
 class KTEPWrapperMethod(FusedMoEMethodBase):
@@ -1251,6 +1254,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         lora_path = self.kt_config.moe_lora_path
         layer_idx = self.kt_config.layer_idx
 
+        # DEBUG: 确认函数被调用
+        if layer_idx == 1:
+            print(f"[DEBUG _load_moe_lora_weights] layer={layer_idx}, path={lora_path}")
+
         if not os.path.exists(lora_path):
             raise FileNotFoundError(
                 f"MoE LoRA file not found: {lora_path}. "
@@ -1392,12 +1399,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             topk_weights, topk_ids, _ = topk_output
 
             # forward_sft is synchronous and includes LoRA computation
-            return self.wrapper.forward_sft(
+            result = self.wrapper.forward_sft(
                 x,
                 topk_ids,
                 topk_weights,
                 save_for_backward=False,  # Inference mode: no gradient needed
             )
+
+            return result
 
         # Standard inference mode: wait for async CPU computation
         return self.wrapper.sync_forward(
@@ -1428,6 +1437,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+
+        # SFT mode (MoE LoRA): save a copy of hidden_states before GPU computation
+        # because GPU method may modify hidden_states in-place (used as output buffer)
+        if self.kt_config.moe_lora_enabled:
+            x_for_cpu = x.clone()
+        else:
+            x_for_cpu = x
 
         # Check for full GPU fallback
         if (
@@ -1472,7 +1488,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         output = gpu_combine_input.hidden_states
         if self.tp_rank == 0:
             # Pass dispatch_output for SFT mode (needed for forward_sft)
-            cpu_output = self.sync(x, dispatch_output)
+            # Use x_for_cpu which is a clone in SFT mode (original x may be modified by GPU)
+            cpu_output = self.sync(x_for_cpu, dispatch_output)
             # SFT mode returns CPU tensor, need to move to GPU before adding
             if cpu_output.device != output.device:
                 cpu_output = cpu_output.to(output.device, non_blocking=True)

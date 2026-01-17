@@ -669,6 +669,232 @@ CUDA_VISIBLE_DEVICES=3 python -m sglang.launch_server \
 
 ---
 
+### Bug #7: 新版本 MoE LoRA 输出乱码
+
+**状态**: ✅ 已解决
+
+**发现日期**: 2026-01-16
+
+**解决日期**: 2026-01-16
+
+**问题描述**:
+
+- **旧版本**（只有 Attention + Shared Experts LoRA）: 输出正常
+- **新版本**（加上 Routed Experts LoRA）: 输出乱码（如 "balenabalenabalena..."）
+
+**根本原因 1**: `topk_ids` 被原地修改
+
+`mask_cpu_expert_ids` 函数在 `kt_ep_wrapper.py:1062` **原地修改**了 `topk_ids`：
+
+```python
+def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
+    topk_ids[topk_ids >= num_gpu_experts] = -1  # ← 原地修改！
+    return topk_ids
+```
+
+**修复**: 添加 `.clone()` 避免原地修改 ✅ 已修复
+
+**根本原因 2**: `hidden_states` 被 GPU 计算修改
+
+在 `apply()` 方法中，`x = dispatch_output.hidden_states` 只是获取引用，而 `masked_dispatch_output.hidden_states` 和 `x` 是同一个引用。GPU 方法 `gpu_method.apply()` 可能原地修改了这个 tensor（用作输出缓冲区），导致 `sync()` 接收到的 `x` 已经是零。
+
+**修复**: 在 SFT 模式下，GPU 计算前保存 `hidden_states` 的副本 ✅ 已修复
+
+```python
+if self.kt_config.moe_lora_enabled:
+    x_for_cpu = x.clone()
+else:
+    x_for_cpu = x
+```
+
+**验证结果**:
+- `x.abs().mean(): 0.255859` ✓ (非零输入)
+- `topk_ids.min(): 0, topk_ids.max(): 60` ✓ (正确的专家 ID)
+- 输出不再乱码 ✓
+
+**相关文件**:
+- `python/sglang/srt/layers/moe/kt_ep_wrapper.py:1062` (topk_ids 修复)
+- `python/sglang/srt/layers/moe/kt_ep_wrapper.py:1464-1467` (hidden_states 修复)
+
+---
+
+### Bug #8: MoE LoRA 输出与基座模型完全一样
+
+**状态**: 🔍 调试中（进入 C++ 层调试阶段）
+
+**发现日期**: 2026-01-16
+
+**问题描述**:
+
+使用 `demo.py` 测试时，`DeepSeek-V2-Lite-Chat:lora0` 和 `DeepSeek-V2-Lite-Chat` 的输出**逐字相同**。这表明 MoE LoRA 虽然正确加载，但没有实际生效。
+
+---
+
+#### 调试阶段 1: Python 层验证 ✅ 完成
+
+**验证项目**:
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| LoRA 权重形状 | ✅ | `[64, 8, 2048]` 等，与预期完全匹配 |
+| LoRA 权重值 | ✅ | 非零，std≈0.004-0.005，正常分布 |
+| `init_lora_weights()` 调用 | ✅ | 日志确认被调用 |
+| `_weights_loaded` | ✅ | True |
+| `moe is not None` | ✅ | True |
+| `update_lora_weights()` 调用 | ✅ | 日志确认被调用 |
+
+**日志证据**:
+```
+[DEBUG init_lora_weights] layer=1, _weights_loaded=True, moe=True
+[MoE LoRA] Layer 1: update_lora_weights() called
+```
+
+**结论**: Python 层完全正确，问题在 C++ 后端。
+
+---
+
+#### 调试阶段 2: C++ 层分析 🔍 当前阶段
+
+**重要说明**: 当前使用的是**非 TP 模式**，代码路径如下：
+
+```
+Python: AMXSFTMoEWrapper (amx_sft.py)
+  → self.moe = AMXBF16_SFT_MOE(config)  # 绑定到 C++ AMX_SFT_MOE_TP
+
+Python: update_lora_weights()
+  → self.moe.update_lora_weights_task(gate_lora_a.data_ptr(), ...)
+  → C++: AMX_SFT_MOE_TP::update_lora_weights()
+    → 设置 gate_lora_a_, gate_lora_b_, etc. 指针
+    → 设置 lora_weights_prepared_ = false
+
+Python: forward_sft()
+  → C++: AMX_SFT_MOE_TP::forward_sft()
+    → 检查 if (gate_lora_a_ != nullptr && gate_lora_b_ != nullptr)
+    → 调用 compute_lora_gate_up_amx() 或 compute_lora_gate_up()
+      → prepare_lora_weights() (转换为 BufferB 格式)
+      → 执行 LoRA 计算
+```
+
+**关键 C++ 代码** (`kt-kernel/operators/amx/sft_moe.hpp`):
+
+```cpp
+// Line 523-535: forward_sft() 中的 LoRA 分支
+// Step 5.5: Gate + Up LoRA
+if (gate_lora_a_ != nullptr && gate_lora_b_ != nullptr) {
+    if constexpr (supports_standard_mat_mul_v<T>) {
+        compute_lora_gate_up_amx(qlen, activated_expert);  // AMX-optimized path
+    } else {
+        compute_lora_gate_up(qlen, activated_expert);  // For-loop fallback
+    }
+}
+
+// Line 688-702: update_lora_weights() 设置指针
+void update_lora_weights(void* gate_lora_a, void* gate_lora_b, ...) {
+    gate_lora_a_ = (ggml_bf16_t*)gate_lora_a;
+    gate_lora_b_ = (ggml_bf16_t*)gate_lora_b;
+    // ...
+    lora_weights_prepared_ = false;  // 需要重新转换为 BufferB
+}
+```
+
+**可能问题点**:
+1. C++ `update_lora_weights()` 没有正确接收到 Python 传来的指针
+2. `forward_sft()` 中 `gate_lora_a_` 指针为 nullptr（未被设置）
+3. `prepare_lora_weights()` 转换失败
+4. LoRA 计算逻辑有 bug
+
+---
+
+#### 下一步调试方案
+
+**Step 1**: 在 C++ 层添加调试打印
+
+已在以下位置添加调试代码：
+
+1. `sft_moe.hpp:690-692` - `update_lora_weights()`:
+```cpp
+printf("[C++ AMX_SFT_MOE_TP::update_lora_weights] tp_part=%d, gate_lora_a=%p, gate_lora_b=%p\n",
+       tp_part_idx, gate_lora_a, gate_lora_b);
+```
+
+2. `sft_moe.hpp:525-527` - `forward_sft()`:
+```cpp
+if (tp_part_idx == 0 && qlen > 0) {
+    printf("[C++ forward_sft] tp_part=%d, qlen=%d, gate_lora_a_=%p, gate_lora_b_=%p\n",
+           tp_part_idx, qlen, (void*)gate_lora_a_, (void*)gate_lora_b_);
+}
+```
+
+**Step 2**: 重新编译 kt-kernel
+
+```bash
+cd /home/lpl/ktransformers-sglang/kt-kernel
+pip install -e . --no-build-isolation
+```
+
+**Step 3**: 重启服务，观察日志
+
+期望看到:
+- `[C++ AMX_SFT_MOE_TP::update_lora_weights]` - 确认 C++ 层收到 LoRA 指针
+- `[C++ forward_sft]` - 确认 forward 时 LoRA 指针状态
+
+**预期结果分析**:
+- 如果 `gate_lora_a` 为 `0x0`（nullptr）：问题在 Python→C++ 调用链
+- 如果 `gate_lora_a` 非空但 LoRA 仍无效：问题在 C++ 计算逻辑
+
+---
+
+**相关文件**:
+- `kt-kernel/operators/amx/sft_moe.hpp` (C++ LoRA 实现，非 TP 模式)
+- `kt-kernel/python/utils/amx_sft.py` (Python wrapper)
+- `python/sglang/srt/layers/moe/kt_ep_wrapper.py` (sglang 集成)
+
+**注意**: 修改 C++ `.hpp` 文件后必须重新编译 kt-kernel 才能生效
+
+---
+
+## 进度跟踪
+
+| 日期 | 事项 | 状态 |
+|------|------|------|
+| 2026-01-15 | 发现 Bug #1: `kt_num_gpu_experts` 为 None 问题 | 临时方案可用，待代码修复 |
+| 2026-01-15 | 发现 Bug #2: `kt_cpuinfer` 为 None 问题 | 临时方案可用，待代码修复 |
+| 2026-01-15 | 发现 Bug #3: SFT 模式权重加载 API 不兼容 | ✅ 已解决 |
+| 2026-01-15 | 新增 `BF16SafeTensorLoader` 到 kt-kernel | ✅ 完成 |
+| 2026-01-15 | 设计 SFT 权重加载策略 (BF16/INT8/INT4) | ✅ 完成 |
+| 2026-01-16 | 发现并修复 Bug #4: `safe_open.close()` 不存在 | ✅ 已解决 |
+| 2026-01-16 | 发现 Bug #5: 转换脚本输出格式错误 | ✅ 已解决 |
+| 2026-01-16 | 发现并修复 Bug #6: SFT 模式 CUDA Graph 设备不匹配 | ✅ 已解决 |
+| 2026-01-16 | Bug #7: 新版本输出乱码 (两处原地修改问题) | ✅ 已解决 |
+| 2026-01-16 | Bug #8: MoE LoRA 输出与基座模型一样 | 🔍 调试中 |
+| 2026-01-16 | 删除 kt_ep_wrapper.py 调试打印（优化性能） | ✅ 完成 |
+| 2026-01-16 | 添加 amx_sft.py 精简调试输出 | ✅ 完成 |
+
+---
+
+## 完整启动命令
+
+需要添加以下参数才能正常启动 MoE LoRA 推理：
+- `--kt-num-gpu-experts 0` (所有专家在 CPU 上运行)
+- `--kt-cpuinfer 60` (CPU 推理线程数，根据实际 CPU 核心数调整)
+- 不需要手动添加 `--disable-cuda-graph`，系统会自动禁用
+
+**完整启动命令**:
+```bash
+CUDA_VISIBLE_DEVICES=3 python -m sglang.launch_server \
+    --model-path /mnt/data3/models/DeepSeek-V2-Lite-Chat \
+    --kt-weight-path /mnt/data3/models/DeepSeek-V2-Lite-Chat-CPU-weight-INT8 \
+    --kt-moe-lora-path /mnt/data/lpl/kernel_new_test_adapter/Kllama2_deepseekV2_WEST_ALL/moe_lora.pt \
+    --kt-moe-lora-rank 8 \
+    --kt-moe-lora-alpha 16.0 \
+    --kt-moe-sft-method AMXBF16_SFT \
+    --kt-num-gpu-experts 0 \
+    --kt-cpuinfer 60 \
+    --lora-paths /mnt/data/lpl/kernel_new_test_adapter/Kllama2_deepseekV2_WEST_ALL/checkpoint-133
+```
+
+---
+
 ## 备注
 
 - 转换脚本 `convert_moe_lora.py` 输出必须使用 `.pt` 扩展名
