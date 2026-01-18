@@ -37,6 +37,18 @@ MOE_PATTERN = re.compile(
     r"(gate|up|down)_proj\.lora_(A|B)\.weight"
 )
 
+# Attention LoRA key pattern
+# Matches: layers.{L}.self_attn.{proj}.lora_{type}.weight
+ATTN_PATTERN = re.compile(
+    r".*layers\.(\d+)\.self_attn\.(q_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)\.lora_(A|B)\.weight"
+)
+
+# Layer 0 MLP LoRA key pattern (non-MoE layer)
+# Matches: layers.0.mlp.{proj}.lora_{type}.weight
+MLP0_PATTERN = re.compile(
+    r".*layers\.0\.mlp\.(gate|up|down)_proj\.lora_(A|B)\.weight"
+)
+
 
 def parse_moe_key(key: str) -> Optional[Tuple[int, int, str, str]]:
     """
@@ -62,6 +74,48 @@ def parse_moe_key(key: str) -> Optional[Tuple[int, int, str, str]]:
     return None
 
 
+def parse_attn_key(key: str) -> Optional[Tuple[int, str, str]]:
+    """
+    解析 Attention LoRA key。
+
+    Args:
+        key: safetensors 中的 key 名称
+
+    Returns:
+        (layer_idx, proj_type, lora_type) or None
+        - layer_idx: 层索引
+        - proj_type: "q_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"
+        - lora_type: "a", "b"
+    """
+    match = ATTN_PATTERN.match(key)
+    if match:
+        layer_idx = int(match.group(1))
+        proj_type = match.group(2)
+        lora_type = match.group(3).lower()
+        return (layer_idx, proj_type, lora_type)
+    return None
+
+
+def parse_mlp0_key(key: str) -> Optional[Tuple[str, str]]:
+    """
+    解析 Layer 0 MLP LoRA key。
+
+    Args:
+        key: safetensors 中的 key 名称
+
+    Returns:
+        (proj_type, lora_type) or None
+        - proj_type: "gate", "up", "down"
+        - lora_type: "a", "b"
+    """
+    match = MLP0_PATTERN.match(key)
+    if match:
+        proj_type = match.group(1)
+        lora_type = match.group(2).lower()
+        return (proj_type, lora_type)
+    return None
+
+
 def load_adapter_config(config_path: str) -> dict:
     """加载 adapter_config.json"""
     with open(config_path, "r") as f:
@@ -76,6 +130,11 @@ def convert_peft_to_kt_format(
 ) -> dict:
     """
     转换 PEFT 格式的 MoE LoRA adapter 为 kt-kernel 格式。
+
+    包含：
+    - MoE 专家的 LoRA 权重
+    - Attention 层的 LoRA 权重
+    - Layer 0 MLP 的 LoRA 权重（非 MoE 层）
 
     Args:
         input_path: PEFT adapter_model.safetensors 路径
@@ -94,45 +153,88 @@ def convert_peft_to_kt_format(
 
     logger.info(f"Total keys in adapter: {len(all_keys)}")
 
-    # 2. 扫描 MoE expert LoRA keys
-    # 结构: moe_weights[layer_idx][expert_id][proj_type][lora_type] = tensor
+    # 2. 扫描所有 LoRA keys
+    # MoE: moe_weights[layer_idx][expert_id][proj_type][lora_type] = tensor
+    # Attn: attn_weights[layer_idx][proj_type][lora_type] = tensor
+    # MLP0: mlp0_weights[proj_type][lora_type] = tensor
     moe_weights: Dict[int, Dict[int, Dict[str, Dict[str, torch.Tensor]]]] = {}
+    attn_weights: Dict[int, Dict[str, Dict[str, torch.Tensor]]] = {}
+    mlp0_weights: Dict[str, Dict[str, torch.Tensor]] = {}
 
     moe_key_count = 0
+    attn_key_count = 0
+    mlp0_key_count = 0
     lora_rank = None
 
     with safe_open(input_path, framework="pt") as f:
         for key in all_keys:
+            # Try MoE pattern
             parsed = parse_moe_key(key)
-            if parsed is None:
+            if parsed is not None:
+                layer_idx, expert_id, proj_type, lora_type = parsed
+                tensor = f.get_tensor(key)
+
+                if layer_idx not in moe_weights:
+                    moe_weights[layer_idx] = {}
+                if expert_id not in moe_weights[layer_idx]:
+                    moe_weights[layer_idx][expert_id] = {}
+                if proj_type not in moe_weights[layer_idx][expert_id]:
+                    moe_weights[layer_idx][expert_id][proj_type] = {}
+
+                moe_weights[layer_idx][expert_id][proj_type][lora_type] = tensor
+                moe_key_count += 1
+
+                if lora_type == "a" and lora_rank is None:
+                    lora_rank = tensor.shape[0]
+
+                if verbose:
+                    logger.debug(f"  [MoE] {key}: {tensor.shape}")
                 continue
 
-            layer_idx, expert_id, proj_type, lora_type = parsed
-            tensor = f.get_tensor(key)
+            # Try Attention pattern
+            parsed = parse_attn_key(key)
+            if parsed is not None:
+                layer_idx, proj_type, lora_type = parsed
+                tensor = f.get_tensor(key)
 
-            # 初始化嵌套字典
-            if layer_idx not in moe_weights:
-                moe_weights[layer_idx] = {}
-            if expert_id not in moe_weights[layer_idx]:
-                moe_weights[layer_idx][expert_id] = {}
-            if proj_type not in moe_weights[layer_idx][expert_id]:
-                moe_weights[layer_idx][expert_id][proj_type] = {}
+                if layer_idx not in attn_weights:
+                    attn_weights[layer_idx] = {}
+                if proj_type not in attn_weights[layer_idx]:
+                    attn_weights[layer_idx][proj_type] = {}
 
-            moe_weights[layer_idx][expert_id][proj_type][lora_type] = tensor
-            moe_key_count += 1
+                attn_weights[layer_idx][proj_type][lora_type] = tensor
+                attn_key_count += 1
 
-            # 推断 lora_rank (从 lora_A 的第一维)
-            if lora_type == "a" and lora_rank is None:
-                lora_rank = tensor.shape[0]
+                if lora_type == "a" and lora_rank is None:
+                    lora_rank = tensor.shape[0]
 
-            if verbose:
-                logger.debug(f"  {key}: {tensor.shape}")
+                if verbose:
+                    logger.debug(f"  [Attn] {key}: {tensor.shape}")
+                continue
+
+            # Try Layer 0 MLP pattern
+            parsed = parse_mlp0_key(key)
+            if parsed is not None:
+                proj_type, lora_type = parsed
+                tensor = f.get_tensor(key)
+
+                if proj_type not in mlp0_weights:
+                    mlp0_weights[proj_type] = {}
+
+                mlp0_weights[proj_type][lora_type] = tensor
+                mlp0_key_count += 1
+
+                if verbose:
+                    logger.debug(f"  [MLP0] {key}: {tensor.shape}")
+                continue
 
     logger.info(f"Found {moe_key_count} MoE expert LoRA keys")
+    logger.info(f"Found {attn_key_count} Attention LoRA keys")
+    logger.info(f"Found {mlp0_key_count} Layer 0 MLP LoRA keys")
 
-    if moe_key_count == 0:
-        logger.warning("No MoE expert LoRA keys found. Nothing to convert.")
-        return {"status": "skipped", "reason": "no_moe_keys"}
+    if moe_key_count == 0 and attn_key_count == 0 and mlp0_key_count == 0:
+        logger.warning("No LoRA keys found. Nothing to convert.")
+        return {"status": "skipped", "reason": "no_lora_keys"}
 
     # 3. 堆叠权重为 kt-kernel 格式
     result = {
@@ -202,6 +304,38 @@ def convert_peft_to_kt_format(
 
         result[f"layer_{layer_idx}"] = layer_weights
 
+    # 3.5 处理 Attention LoRA 权重
+    if attn_weights:
+        logger.info(f"Processing {len(attn_weights)} layers of Attention LoRA...")
+        for layer_idx, layer_data in sorted(attn_weights.items()):
+            attn_layer_weights = {}
+            for proj_type, lora_data in layer_data.items():
+                if "a" in lora_data and "b" in lora_data:
+                    attn_layer_weights[f"{proj_type}_lora_a"] = lora_data["a"]
+                    attn_layer_weights[f"{proj_type}_lora_b"] = lora_data["b"]
+                    if verbose and layer_idx == min(attn_weights.keys()):
+                        logger.info(f"    {proj_type}_lora_a: {lora_data['a'].shape}")
+                        logger.info(f"    {proj_type}_lora_b: {lora_data['b'].shape}")
+
+            if attn_layer_weights:
+                attn_key = f"attn_layer_{layer_idx}"
+                result[attn_key] = attn_layer_weights
+
+    # 3.6 处理 Layer 0 MLP LoRA 权重
+    if mlp0_weights:
+        logger.info("Processing Layer 0 MLP LoRA...")
+        mlp0_layer_weights = {}
+        for proj_type, lora_data in mlp0_weights.items():
+            if "a" in lora_data and "b" in lora_data:
+                mlp0_layer_weights[f"{proj_type}_lora_a"] = lora_data["a"]
+                mlp0_layer_weights[f"{proj_type}_lora_b"] = lora_data["b"]
+                if verbose:
+                    logger.info(f"    {proj_type}_lora_a: {lora_data['a'].shape}")
+                    logger.info(f"    {proj_type}_lora_b: {lora_data['b'].shape}")
+
+        if mlp0_layer_weights:
+            result["mlp0"] = mlp0_layer_weights
+
     # 4. 保存结果
     logger.info(f"Saving to: {output_path}")
     torch.save(result, output_path)
@@ -210,13 +344,18 @@ def convert_peft_to_kt_format(
     file_size_mb = Path(output_path).stat().st_size / (1024 * 1024)
     stats = {
         "status": "success",
-        "num_layers": num_layers,
-        "num_experts": result["metadata"]["num_experts"],
+        "num_moe_layers": num_layers,
+        "num_experts": result["metadata"].get("num_experts", 0),
+        "num_attn_layers": len(attn_weights),
+        "has_mlp0": len(mlp0_weights) > 0,
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
         "hidden_size": result["metadata"].get("hidden_size"),
         "intermediate_size": result["metadata"].get("intermediate_size"),
-        "total_keys": moe_key_count,
+        "moe_keys": moe_key_count,
+        "attn_keys": attn_key_count,
+        "mlp0_keys": mlp0_key_count,
+        "total_keys": moe_key_count + attn_key_count + mlp0_key_count,
         "output_file_size_mb": round(file_size_mb, 2),
     }
     logger.info(f"Conversion complete!")

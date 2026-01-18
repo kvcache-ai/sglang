@@ -53,6 +53,348 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# Global flag to track if attention LoRA has been loaded
+_ATTN_LORA_LOADED = False
+
+# Global reference to the model for attention LoRA loading
+_MODEL_REF = None
+
+
+def set_model_reference(model: torch.nn.Module) -> None:
+    """Set global model reference for attention LoRA loading."""
+    global _MODEL_REF
+    _MODEL_REF = model
+
+
+def get_model_reference() -> Optional[torch.nn.Module]:
+    """Get global model reference."""
+    return _MODEL_REF
+
+
+class LoRALinear(torch.nn.Module):
+    """A simple LoRA wrapper for Linear layers used in attention/MLP.
+
+    This applies LoRA as: output = base(x) + (x @ lora_a.T @ lora_b.T) * scaling
+
+    Handles both cases:
+    - Base layers that return a single tensor
+    - SGLang linear layers that return (output, output_bias) tuples
+    """
+
+    def __init__(self, base: torch.nn.Module, lora_a: torch.Tensor, lora_b: torch.Tensor, lora_alpha: float):
+        super().__init__()
+        self.base = base
+
+        # Get device from base module's parameters
+        device = next(base.parameters()).device
+
+        self.lora_a = torch.nn.Parameter(lora_a.to(device=device, dtype=torch.bfloat16), requires_grad=False)
+        self.lora_b = torch.nn.Parameter(lora_b.to(device=device, dtype=torch.bfloat16), requires_grad=False)
+        self.scaling = lora_alpha / float(self.lora_a.shape[0])
+
+    def forward(self, x: torch.Tensor, **kwargs):
+        base_out = self.base(x, **kwargs)
+
+        # LoRA computation in higher precision for accuracy
+        x_lora = x.to(self.lora_a.dtype)
+        lora_out = (x_lora @ self.lora_a.t()) @ self.lora_b.t()
+
+        # Handle both tensor and tuple (output, output_bias) returns from SGLang layers
+        if isinstance(base_out, tuple):
+            output, output_bias = base_out
+            output = output + lora_out.to(output.dtype) * self.scaling
+            return output, output_bias
+        else:
+            return base_out + lora_out.to(base_out.dtype) * self.scaling
+
+
+def load_attention_lora_from_converted_file(model: torch.nn.Module, lora_path: str, lora_alpha: float = 16.0) -> int:
+    """Load attention (MLA) and layer 0 MLP LoRA weights from converted .pt file.
+
+    This function should be called once after model initialization to load
+    attention LoRA weights that are stored in the converted MoE LoRA file.
+
+    DeepSeek-V2 MLA (Multi-Head Latent Attention) projections:
+        - q_proj: Query projection (ColumnParallelLinear)
+        - kv_a_proj_with_mqa: KV latent projection (ReplicatedLinear)
+        - kv_b_proj: KV up projection (ColumnParallelLinear)
+        - o_proj: Output projection (RowParallelLinear)
+
+    Args:
+        model: The base model to apply LoRA to
+        lora_path: Path to the converted .pt file (same as --kt-moe-lora-path)
+        lora_alpha: LoRA alpha scaling factor
+
+    Returns:
+        Number of LoRA layers applied
+
+    Raises:
+        FileNotFoundError: If the LoRA file does not exist
+        RuntimeError: If any expected LoRA weights fail to load
+    """
+    global _ATTN_LORA_LOADED
+    if _ATTN_LORA_LOADED:
+        return 0
+
+    if not os.path.exists(lora_path):
+        raise FileNotFoundError(
+            f"LoRA file not found: {lora_path}. "
+            "Please run scripts/convert_moe_lora.py to convert the adapter first."
+        )
+
+    lora_weights = torch.load(lora_path, map_location="cpu", weights_only=True)
+
+    # Validate metadata
+    if "metadata" not in lora_weights:
+        raise KeyError(
+            f"Metadata not found in LoRA file: {lora_path}. "
+            "The file may be corrupted or in wrong format."
+        )
+
+    metadata = lora_weights["metadata"]
+    lora_rank = metadata.get("lora_rank")
+    logger.info(f"[Attention LoRA] Loading from {lora_path}, lora_rank={lora_rank}, lora_alpha={lora_alpha}")
+
+    loaded_count = 0
+    failed_loads = []
+
+    # MLA projection names (DeepSeek-V2 specific)
+    ATTN_PROJ_NAMES = ["q_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"]
+    MLP0_PROJ_NAMES = ["gate", "up", "down"]
+
+    # Load attention LoRA
+    attn_layers = sorted([k for k in lora_weights.keys() if k.startswith("attn_layer_")])
+    logger.info(f"[Attention LoRA] Found {len(attn_layers)} attention layers in file")
+
+    for attn_key in attn_layers:
+        layer_idx = int(attn_key.split("_")[-1])
+        layer_data = lora_weights[attn_key]
+
+        if layer_idx >= len(model.model.layers):
+            failed_loads.append(
+                f"attn_layer_{layer_idx}: layer index out of range "
+                f"(model has {len(model.model.layers)} layers)"
+            )
+            continue
+
+        layer = model.model.layers[layer_idx]
+
+        # Check which projections are available in the file
+        available_projs = set()
+        for proj_name in ATTN_PROJ_NAMES:
+            a_key = f"{proj_name}_lora_a"
+            b_key = f"{proj_name}_lora_b"
+            if a_key in layer_data and b_key in layer_data:
+                available_projs.add(proj_name)
+
+        if not available_projs:
+            failed_loads.append(f"attn_layer_{layer_idx}: no valid projection LoRA found")
+            continue
+
+        # Load each available projection
+        for proj_name in ATTN_PROJ_NAMES:
+            a_key = f"{proj_name}_lora_a"
+            b_key = f"{proj_name}_lora_b"
+
+            if a_key not in layer_data or b_key not in layer_data:
+                # Skip if not in file (not all projections may have LoRA)
+                continue
+
+            lora_a = layer_data[a_key]
+            lora_b = layer_data[b_key]
+
+            # Validate tensor values
+            if torch.isnan(lora_a).any() or torch.isnan(lora_b).any():
+                failed_loads.append(f"layer_{layer_idx}.self_attn.{proj_name}: contains NaN values")
+                continue
+            if torch.isinf(lora_a).any() or torch.isinf(lora_b).any():
+                failed_loads.append(f"layer_{layer_idx}.self_attn.{proj_name}: contains Inf values")
+                continue
+
+            # Get base layer
+            base_layer = getattr(layer.self_attn, proj_name, None)
+            if base_layer is None:
+                failed_loads.append(f"layer_{layer_idx}.self_attn.{proj_name}: base layer not found in model")
+                continue
+
+            if isinstance(base_layer, LoRALinear):
+                logger.warning(f"layer_{layer_idx}.self_attn.{proj_name}: already wrapped with LoRA, skipping")
+                continue
+
+            try:
+                wrapped = LoRALinear(base_layer, lora_a, lora_b, lora_alpha)
+                setattr(layer.self_attn, proj_name, wrapped)
+                loaded_count += 1
+                logger.debug(
+                    f"[Attention LoRA] Loaded layer_{layer_idx}.self_attn.{proj_name}: "
+                    f"lora_a={lora_a.shape}, lora_b={lora_b.shape}"
+                )
+            except Exception as e:
+                failed_loads.append(f"layer_{layer_idx}.self_attn.{proj_name}: {e}")
+
+    # Load layer 0 MLP LoRA (non-MoE layer)
+    if "mlp0" in lora_weights:
+        mlp0_data = lora_weights["mlp0"]
+        layer0_mlp = model.model.layers[0].mlp
+        logger.info("[MLP0 LoRA] Loading layer 0 MLP LoRA")
+
+        # Check if model uses fused gate_up_proj (MergedColumnParallelLinear)
+        has_fused_gate_up = hasattr(layer0_mlp, "gate_up_proj") and not hasattr(layer0_mlp, "gate_proj")
+
+        if has_fused_gate_up:
+            # Handle fused gate_up_proj case
+            logger.info("[MLP0 LoRA] Model uses fused gate_up_proj, applying merged LoRA")
+
+            # Check if we have gate and up LoRA in file
+            has_gate = "gate_lora_a" in mlp0_data and "gate_lora_b" in mlp0_data
+            has_up = "up_lora_a" in mlp0_data and "up_lora_b" in mlp0_data
+            has_down = "down_lora_a" in mlp0_data and "down_lora_b" in mlp0_data
+
+            if has_gate and has_up:
+                gate_lora_a = mlp0_data["gate_lora_a"]
+                gate_lora_b = mlp0_data["gate_lora_b"]
+                up_lora_a = mlp0_data["up_lora_a"]
+                up_lora_b = mlp0_data["up_lora_b"]
+
+                # Validate tensors
+                for name, tensor in [("gate_lora_a", gate_lora_a), ("gate_lora_b", gate_lora_b),
+                                     ("up_lora_a", up_lora_a), ("up_lora_b", up_lora_b)]:
+                    if torch.isnan(tensor).any():
+                        failed_loads.append(f"layer_0.mlp.gate_up_proj ({name}): contains NaN values")
+                    if torch.isinf(tensor).any():
+                        failed_loads.append(f"layer_0.mlp.gate_up_proj ({name}): contains Inf values")
+
+                if not failed_loads:
+                    base_layer = layer0_mlp.gate_up_proj
+                    if isinstance(base_layer, LoRALinear):
+                        logger.warning("layer_0.mlp.gate_up_proj: already wrapped with LoRA, skipping")
+                    else:
+                        try:
+                            # For MergedColumnParallelLinear, we need to concatenate gate and up LoRA
+                            # lora_a: [rank, hidden] -> same for both, just use gate
+                            # lora_b: [intermediate*2, rank] -> concat gate_b and up_b
+                            merged_lora_a = gate_lora_a  # Both should be the same shape
+                            merged_lora_b = torch.cat([gate_lora_b, up_lora_b], dim=0)
+
+                            wrapped = LoRALinear(base_layer, merged_lora_a, merged_lora_b, lora_alpha)
+                            layer0_mlp.gate_up_proj = wrapped
+                            loaded_count += 1
+                            logger.debug(
+                                f"[MLP0 LoRA] Loaded layer_0.mlp.gate_up_proj (merged): "
+                                f"lora_a={merged_lora_a.shape}, lora_b={merged_lora_b.shape}"
+                            )
+                        except Exception as e:
+                            failed_loads.append(f"layer_0.mlp.gate_up_proj: {e}")
+            else:
+                if not has_gate:
+                    failed_loads.append("layer_0.mlp.gate_up_proj: missing gate LoRA in file")
+                if not has_up:
+                    failed_loads.append("layer_0.mlp.gate_up_proj: missing up LoRA in file")
+
+            # Handle down_proj separately
+            if has_down:
+                down_lora_a = mlp0_data["down_lora_a"]
+                down_lora_b = mlp0_data["down_lora_b"]
+
+                if torch.isnan(down_lora_a).any() or torch.isnan(down_lora_b).any():
+                    failed_loads.append("layer_0.mlp.down_proj: contains NaN values")
+                elif torch.isinf(down_lora_a).any() or torch.isinf(down_lora_b).any():
+                    failed_loads.append("layer_0.mlp.down_proj: contains Inf values")
+                else:
+                    base_layer = getattr(layer0_mlp, "down_proj", None)
+                    if base_layer is None:
+                        failed_loads.append("layer_0.mlp.down_proj: base layer not found in model")
+                    elif isinstance(base_layer, LoRALinear):
+                        logger.warning("layer_0.mlp.down_proj: already wrapped with LoRA, skipping")
+                    else:
+                        try:
+                            wrapped = LoRALinear(base_layer, down_lora_a, down_lora_b, lora_alpha)
+                            layer0_mlp.down_proj = wrapped
+                            loaded_count += 1
+                            logger.debug(
+                                f"[MLP0 LoRA] Loaded layer_0.mlp.down_proj: "
+                                f"lora_a={down_lora_a.shape}, lora_b={down_lora_b.shape}"
+                            )
+                        except Exception as e:
+                            failed_loads.append(f"layer_0.mlp.down_proj: {e}")
+        else:
+            # Handle separate gate_proj, up_proj, down_proj case
+            for proj_name in MLP0_PROJ_NAMES:
+                a_key = f"{proj_name}_lora_a"
+                b_key = f"{proj_name}_lora_b"
+
+                if a_key not in mlp0_data or b_key not in mlp0_data:
+                    failed_loads.append(f"layer_0.mlp.{proj_name}_proj: missing lora_a or lora_b in file")
+                    continue
+
+                lora_a = mlp0_data[a_key]
+                lora_b = mlp0_data[b_key]
+
+                # Validate tensor values
+                if torch.isnan(lora_a).any() or torch.isnan(lora_b).any():
+                    failed_loads.append(f"layer_0.mlp.{proj_name}_proj: contains NaN values")
+                    continue
+                if torch.isinf(lora_a).any() or torch.isinf(lora_b).any():
+                    failed_loads.append(f"layer_0.mlp.{proj_name}_proj: contains Inf values")
+                    continue
+
+                proj_attr = f"{proj_name}_proj"
+                base_layer = getattr(layer0_mlp, proj_attr, None)
+                if base_layer is None:
+                    failed_loads.append(f"layer_0.mlp.{proj_attr}: base layer not found in model")
+                    continue
+
+                if isinstance(base_layer, LoRALinear):
+                    logger.warning(f"layer_0.mlp.{proj_attr}: already wrapped with LoRA, skipping")
+                    continue
+
+                try:
+                    wrapped = LoRALinear(base_layer, lora_a, lora_b, lora_alpha)
+                    setattr(layer0_mlp, proj_attr, wrapped)
+                    loaded_count += 1
+                    logger.debug(
+                        f"[MLP0 LoRA] Loaded layer_0.mlp.{proj_attr}: "
+                        f"lora_a={lora_a.shape}, lora_b={lora_b.shape}"
+                    )
+                except Exception as e:
+                    failed_loads.append(f"layer_0.mlp.{proj_attr}: {e}")
+
+    # Check for failures - any failure is fatal
+    if failed_loads:
+        error_msg = (
+            f"Failed to load LoRA weights from {lora_path}:\n"
+            + "\n".join(f"  - {f}" for f in failed_loads)
+            + "\n\nThis indicates a mismatch between the LoRA file and the model structure."
+        )
+        raise RuntimeError(error_msg)
+
+    # Verify we loaded something if file has attention/mlp0 data
+    has_attn_data = len(attn_layers) > 0
+    has_mlp0_data = "mlp0" in lora_weights
+
+    if loaded_count == 0:
+        if has_attn_data or has_mlp0_data:
+            raise RuntimeError(
+                f"No LoRA layers were loaded from {lora_path}, "
+                f"but file contains {len(attn_layers)} attention layers and "
+                f"{'MLP0 data' if has_mlp0_data else 'no MLP0 data'}. "
+                "This may indicate a model/LoRA structure mismatch."
+            )
+        else:
+            logger.info("[Attention LoRA] No attention/MLP0 LoRA data in file, skipping")
+            _ATTN_LORA_LOADED = True
+            return 0
+
+    logger.info(
+        f"[Attention LoRA] Successfully loaded {loaded_count} layers: "
+        f"{len(attn_layers)} attention layers, "
+        f"{'3 MLP0 projections' if has_mlp0_data else 'no MLP0'}"
+    )
+    _ATTN_LORA_LOADED = True
+
+    return loaded_count
+
+
 # Thread-local storage for forward_batch (to avoid breaking API changes)
 _thread_local = threading.local()
 
@@ -1265,6 +1607,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Use "default" as lora_id for initial load
                 self._load_moe_lora_weights(lora_path=self.kt_config.moe_lora_path, lora_id="default")
 
+                # 4. Load attention and layer 0 MLP LoRA (only once, when processing first MoE layer)
+                model = get_model_reference()
+                if model is not None:
+                    load_attention_lora_from_converted_file(
+                        model,
+                        self.kt_config.moe_lora_path,
+                        lora_alpha=self.kt_config.lora_alpha,
+                    )
+
     def _load_moe_lora_weights(self, lora_path: Optional[str] = None, lora_id: Optional[str] = None) -> None:
         """Load MoE LoRA weights from converted .pt file.
 
@@ -1274,6 +1625,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Args:
             lora_path: Path to LoRA weights file. If None, uses self.kt_config.moe_lora_path
             lora_id: LoRA identifier for tracking currently loaded LoRA
+
+        Raises:
+            FileNotFoundError: If the LoRA file does not exist
+            KeyError: If required weights are missing from the file
+            RuntimeError: If weight shapes are invalid
         """
         import os
 
@@ -1281,8 +1637,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             lora_path = self.kt_config.moe_lora_path
         layer_idx = self.kt_config.layer_idx
 
-        # DEBUG: 确认函数被调用
-        print(f"[DEBUG _load_moe_lora_weights] layer={layer_idx}, path={lora_path}, lora_id={lora_id}")
+        logger.info(f"[MoE LoRA] Loading layer {layer_idx} from {lora_path}, lora_id={lora_id}")
 
         if not os.path.exists(lora_path):
             raise FileNotFoundError(
@@ -1293,15 +1648,38 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Load the converted LoRA weights
         lora_weights = torch.load(lora_path, map_location="cpu", weights_only=True)
 
+        # Check metadata exists
+        if "metadata" not in lora_weights:
+            raise KeyError(
+                f"Metadata not found in MoE LoRA file: {lora_path}. "
+                "The file may be corrupted or in wrong format."
+            )
+
+        metadata = lora_weights["metadata"]
+
         # Get layer-specific weights
         layer_key = f"layer_{layer_idx}"
         if layer_key not in lora_weights:
+            available_layers = sorted([k for k in lora_weights.keys() if k.startswith("layer_")])
             raise KeyError(
-                f"Layer {layer_idx} not found in MoE LoRA file. "
-                f"Available layers: {[k for k in lora_weights.keys() if k.startswith('layer_')]}"
+                f"Layer {layer_idx} not found in MoE LoRA file: {lora_path}. "
+                f"Available MoE layers: {available_layers}"
             )
 
         layer_data = lora_weights[layer_key]
+
+        # Verify all required keys exist
+        required_keys = [
+            "gate_lora_a", "gate_lora_b",
+            "up_lora_a", "up_lora_b",
+            "down_lora_a", "down_lora_b",
+        ]
+        missing_keys = [k for k in required_keys if k not in layer_data]
+        if missing_keys:
+            raise KeyError(
+                f"Missing LoRA weights for layer {layer_idx}: {missing_keys}. "
+                f"Available keys: {list(layer_data.keys())}"
+            )
 
         # Extract LoRA weight tensors (ensure contiguous and correct dtype)
         gate_lora_a = layer_data["gate_lora_a"].contiguous().to(torch.bfloat16)
@@ -1310,6 +1688,45 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         up_lora_b = layer_data["up_lora_b"].contiguous().to(torch.bfloat16)
         down_lora_a = layer_data["down_lora_a"].contiguous().to(torch.bfloat16)
         down_lora_b = layer_data["down_lora_b"].contiguous().to(torch.bfloat16)
+
+        # Verify shapes are consistent
+        num_experts = gate_lora_a.shape[0]
+        lora_rank = gate_lora_a.shape[1]
+
+        expected_num_experts = metadata.get("num_experts")
+        expected_lora_rank = metadata.get("lora_rank")
+
+        if expected_num_experts and num_experts != expected_num_experts:
+            raise RuntimeError(
+                f"Layer {layer_idx}: num_experts mismatch. "
+                f"Got {num_experts} but metadata says {expected_num_experts}"
+            )
+
+        if expected_lora_rank and lora_rank != expected_lora_rank:
+            raise RuntimeError(
+                f"Layer {layer_idx}: lora_rank mismatch. "
+                f"Got {lora_rank} but metadata says {expected_lora_rank}"
+            )
+
+        # Verify all tensors have the same number of experts
+        all_tensors = [
+            ("gate_lora_a", gate_lora_a), ("gate_lora_b", gate_lora_b),
+            ("up_lora_a", up_lora_a), ("up_lora_b", up_lora_b),
+            ("down_lora_a", down_lora_a), ("down_lora_b", down_lora_b),
+        ]
+        for name, tensor in all_tensors:
+            if tensor.shape[0] != num_experts:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: {name} has {tensor.shape[0]} experts, "
+                    f"but expected {num_experts}"
+                )
+
+        # Check for NaN/Inf values
+        for name, tensor in all_tensors:
+            if torch.isnan(tensor).any():
+                raise RuntimeError(f"Layer {layer_idx}: {name} contains NaN values")
+            if torch.isinf(tensor).any():
+                raise RuntimeError(f"Layer {layer_idx}: {name} contains Inf values")
 
         # Initialize LoRA weights in the kt-kernel wrapper
         self.wrapper.init_lora_weights(
@@ -1321,14 +1738,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             down_lora_b,
         )
 
-        metadata = lora_weights.get("metadata", {})
         logger.info(
-            "MoE LoRA loaded: rank=%s, alpha=%s, num_experts=%s, num_layers=%s, lora_id=%s",
-            metadata.get("lora_rank"),
-            metadata.get("lora_alpha"),
-            metadata.get("num_experts"),
-            metadata.get("num_layers"),
-            lora_id,
+            f"[MoE LoRA] Layer {layer_idx} loaded successfully: "
+            f"num_experts={num_experts}, lora_rank={lora_rank}, "
+            f"lora_alpha={metadata.get('lora_alpha')}, lora_id={lora_id}"
         )
 
         # Update current loaded LoRA ID

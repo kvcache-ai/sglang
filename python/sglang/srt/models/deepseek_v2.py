@@ -3310,6 +3310,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         return self.model.end_layer
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
+        # Set model reference for KT attention LoRA loading
+        try:
+            from sglang.srt.layers.moe.kt_ep_wrapper import set_model_reference
+            set_model_reference(self)
+        except ImportError:
+            pass
 
         # Perform post-processing after loading weights
         if is_nextn:

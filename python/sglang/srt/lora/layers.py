@@ -24,6 +24,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
 
+# Try to import KT LoRALinear for compatibility check
+try:
+    from sglang.srt.layers.moe.kt_ep_wrapper import LoRALinear as KTLoRALinear
+except ImportError:
+    KTLoRALinear = None
+
 
 class BaseLayerWithLoRA(nn.Module):
     def __init__(
@@ -638,9 +644,51 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return B
 
 
+class KTLoRALinearWrapper(BaseLayerWithLoRA):
+    """
+    Wrapper for KT's LoRALinear modules to make them compatible with sglang's LoRAManager.
+
+    This wrapper allows modules that already have KT LoRA applied to pass through
+    the LoRAManager without being wrapped again. The set_lora_info is a no-op since
+    LoRA is already applied internally by the KT LoRALinear module.
+    """
+
+    def __init__(
+        self,
+        kt_lora_linear: nn.Module,
+        lora_backend: BaseLoRABackend,
+    ) -> None:
+        super().__init__(kt_lora_linear, lora_backend)
+        # Mark as already having LoRA set (but via KT mechanism)
+        self.set_lora = True
+        # Expose weight from the base module inside KT LoRALinear
+        if hasattr(kt_lora_linear, 'base') and hasattr(kt_lora_linear.base, 'weight'):
+            self.weight = kt_lora_linear.base.weight
+
+    def set_lora_info(self, A_buffer: torch.Tensor, B_buffer: torch.Tensor):
+        # No-op: KT LoRALinear already has LoRA weights applied internally
+        pass
+
+    def forward(self, x: torch.Tensor, **kwargs):
+        # Delegate to KT LoRALinear which handles both base + LoRA computation
+        # Pass through any extra kwargs (like skip_all_reduce for RowParallelLinear)
+        return self.base_layer(x, **kwargs)
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        return B
+
+
 def get_lora_layer(
     layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
+    # Check if the layer is already a KT LoRALinear - if so, wrap it with our
+    # compatibility wrapper so it works with LoRAManager
+    if KTLoRALinear is not None and isinstance(layer, KTLoRALinear):
+        return KTLoRALinearWrapper(layer, lora_backend)
+
     supported_layer_types = {
         # the order matters
         ParallelLMHead: ParallelLMHeadWithLoRA,
