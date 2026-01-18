@@ -597,30 +597,41 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-        if not self._enable_a2a_moe:
-            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        # Store forward_batch in thread-local for KT LoRA switching (non-breaking approach)
+        if forward_batch is not None:
+            from sglang.srt.layers.moe.kt_ep_wrapper import set_current_forward_batch
+            set_current_forward_batch(forward_batch)
 
-            if (
-                self.alt_stream is not None
-                and self.num_fused_shared_experts == 0
-                and hidden_states.shape[0] > 0
-                and get_is_capture_mode()
-            ):
-                return self.forward_normal_dual_stream(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                    gemm_output_zero_allocator,
-                )
+        try:
+            if not self._enable_a2a_moe:
+                from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+                if (
+                    self.alt_stream is not None
+                    and self.num_fused_shared_experts == 0
+                    and hidden_states.shape[0] > 0
+                    and get_is_capture_mode()
+                ):
+                    return self.forward_normal_dual_stream(
+                        hidden_states,
+                        should_allreduce_fusion,
+                        use_reduce_scatter,
+                        gemm_output_zero_allocator,
+                    )
+                else:
+                    return self.forward_normal(
+                        hidden_states,
+                        should_allreduce_fusion,
+                        use_reduce_scatter,
+                        gemm_output_zero_allocator,
+                    )
             else:
-                return self.forward_normal(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                    gemm_output_zero_allocator,
-                )
-        else:
-            return self.forward_deepep(hidden_states, forward_batch)
+                return self.forward_deepep(hidden_states, forward_batch)
+        finally:
+            # Clear thread-local to avoid memory leak
+            if forward_batch is not None:
+                from sglang.srt.layers.moe.kt_ep_wrapper import set_current_forward_batch
+                set_current_forward_batch(None)
 
     def forward_normal_dual_stream(
         self,

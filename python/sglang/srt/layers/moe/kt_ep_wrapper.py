@@ -11,6 +11,7 @@ import copy
 import ctypes
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.server_args import ServerArgs
 
 try:
@@ -49,6 +51,20 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+# Thread-local storage for forward_batch (to avoid breaking API changes)
+_thread_local = threading.local()
+
+
+def set_current_forward_batch(forward_batch: Optional["ForwardBatch"]) -> None:
+    """Set the current forward_batch for this thread (used for LoRA switching)."""
+    _thread_local.forward_batch = forward_batch
+
+
+def get_current_forward_batch() -> Optional["ForwardBatch"]:
+    """Get the current forward_batch for this thread."""
+    return getattr(_thread_local, "forward_batch", None)
 
 
 @dataclass
@@ -1112,6 +1128,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
+        # Track current loaded LoRA for dynamic switching
+        self.current_lora_id: Optional[str] = None
+        self.lora_cache: Dict[str, Dict[str, torch.Tensor]] = {}  # Cache loaded LoRA weights
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1241,22 +1261,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
             # 3. Load MoE LoRA weights if enabled
             if self.kt_config.moe_lora_enabled and self.kt_config.moe_lora_path:
-                self._load_moe_lora_weights()
+                # Load default LoRA from kt_config.moe_lora_path
+                # Use "default" as lora_id for initial load
+                self._load_moe_lora_weights(lora_path=self.kt_config.moe_lora_path, lora_id="default")
 
-    def _load_moe_lora_weights(self) -> None:
+    def _load_moe_lora_weights(self, lora_path: Optional[str] = None, lora_id: Optional[str] = None) -> None:
         """Load MoE LoRA weights from converted .pt file.
 
         This method loads the pre-converted MoE LoRA weights and initializes
         them in the kt-kernel SFT wrapper.
+
+        Args:
+            lora_path: Path to LoRA weights file. If None, uses self.kt_config.moe_lora_path
+            lora_id: LoRA identifier for tracking currently loaded LoRA
         """
         import os
 
-        lora_path = self.kt_config.moe_lora_path
+        if lora_path is None:
+            lora_path = self.kt_config.moe_lora_path
         layer_idx = self.kt_config.layer_idx
 
         # DEBUG: 确认函数被调用
-        if layer_idx == 1:
-            print(f"[DEBUG _load_moe_lora_weights] layer={layer_idx}, path={lora_path}")
+        print(f"[DEBUG _load_moe_lora_weights] layer={layer_idx}, path={lora_path}, lora_id={lora_id}")
 
         if not os.path.exists(lora_path):
             raise FileNotFoundError(
@@ -1295,15 +1321,141 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             down_lora_b,
         )
 
+        metadata = lora_weights.get("metadata", {})
+        logger.info(
+            "MoE LoRA loaded: rank=%s, alpha=%s, num_experts=%s, num_layers=%s, lora_id=%s",
+            metadata.get("lora_rank"),
+            metadata.get("lora_alpha"),
+            metadata.get("num_experts"),
+            metadata.get("num_layers"),
+            lora_id,
+        )
+
+        # Update current loaded LoRA ID
+        if lora_id is not None:
+            self.current_lora_id = lora_id
+
+    def _get_lora_path_by_id(self, lora_id: str) -> str:
+        """Get LoRA file path from lora_id using LoRARegistry.
+
+        NOTE: This method is currently unused. We only support the default MoE LoRA for now.
+        TODO: Implement dynamic multi-LoRA switching by querying the LoRA registry.
+
+        Args:
+            lora_id: LoRA identifier (UUID from SGLang's LoRA registry)
+
+        Returns:
+            Path to converted MoE LoRA .pt file
+
+        Raises:
+            ValueError: If lora_id is not found in registry or path is invalid
+        """
+        # This would require access to the LoRA registry to map lora_id (UUID) to lora_path
+        # However, the LoRA registry is in the tokenizer manager process, which may not be
+        # easily accessible from the worker process.
+        # For now, we only support the default MoE LoRA specified at server startup.
+        raise NotImplementedError(
+            "Dynamic multi-LoRA switching is not yet supported for KT MoE. "
+            "Currently only the default MoE LoRA (--kt-moe-lora-path) can be used."
+        )
+
+    def _clear_lora_weights(self) -> None:
+        """Clear LoRA weights and return to base model.
+
+        This is done by setting all LoRA weights to zero.
+        """
+        import torch
+        print("triggered _clear_lora_weights")
+        layer_idx = self.kt_config.layer_idx
+
+        # Create zero LoRA weights with correct shapes
+        # [num_experts, lora_rank, hidden_size/intermediate_size]
+        num_experts = self.global_num_experts - self.num_gpu_experts
+        lora_rank = self.kt_config.lora_rank
+        hidden_size, intermediate_size_per_partition, _ = self._full_init_args
+        intermediate_size_full = intermediate_size_per_partition * get_tensor_model_parallel_world_size()
+
+        zero_gate_lora_a = torch.zeros(num_experts, lora_rank, hidden_size, dtype=torch.bfloat16)
+        zero_gate_lora_b = torch.zeros(num_experts, intermediate_size_full, lora_rank, dtype=torch.bfloat16)
+        zero_up_lora_a = torch.zeros(num_experts, lora_rank, hidden_size, dtype=torch.bfloat16)
+        zero_up_lora_b = torch.zeros(num_experts, intermediate_size_full, lora_rank, dtype=torch.bfloat16)
+        zero_down_lora_a = torch.zeros(num_experts, lora_rank, intermediate_size_full, dtype=torch.bfloat16)
+        zero_down_lora_b = torch.zeros(num_experts, hidden_size, lora_rank, dtype=torch.bfloat16)
+
+        self.wrapper.init_lora_weights(
+            zero_gate_lora_a,
+            zero_gate_lora_b,
+            zero_up_lora_a,
+            zero_up_lora_b,
+            zero_down_lora_a,
+            zero_down_lora_b,
+        )
+
         if layer_idx == 0:
-            metadata = lora_weights.get("metadata", {})
-            logger.info(
-                "MoE LoRA loaded: rank=%s, alpha=%s, num_experts=%s, num_layers=%s",
-                metadata.get("lora_rank"),
-                metadata.get("lora_alpha"),
-                metadata.get("num_experts"),
-                metadata.get("num_layers"),
-            )
+            logger.info("MoE LoRA cleared - using base model")
+
+        self.current_lora_id = None
+
+    def _update_lora_if_needed(self, forward_batch: "ForwardBatch") -> None:
+        """Check if LoRA needs to be switched and update if necessary.
+
+        IMPORTANT: Currently only supports switching between base model and the default MoE LoRA
+        specified at server startup. Dynamic multi-LoRA switching is not yet supported.
+
+        Args:
+            forward_batch: Batch information containing lora_ids
+        """
+        layer_idx = self.kt_config.layer_idx
+
+        # DEBUG: Track calls to this method
+        if layer_idx == 1:
+            print(f"[DEBUG _update_lora_if_needed ENTRY] layer={layer_idx} forward_batch={forward_batch is not None}")
+
+        if not self.kt_config.moe_lora_enabled:
+            if layer_idx == 1:
+                print(f"[DEBUG _update_lora_if_needed] MoE LoRA not enabled, skipping")
+            return
+
+        # Get unique LoRA IDs in current batch
+        if layer_idx == 1:
+            print(f"[DEBUG _update_lora_if_needed] forward_batch.lora_ids: {forward_batch.lora_ids}")
+
+        lora_ids = set(forward_batch.lora_ids)
+
+        # Remove None from set
+        lora_ids.discard(None)
+
+        # Determine target state: "default" (use default MoE LoRA) or None (base model)
+        if len(lora_ids) == 0:
+            # No LoRA requested - use base model
+            target_lora_id = None
+        else:
+            # Any LoRA requested - use default MoE LoRA (for now)
+            # TODO: Support dynamic multi-LoRA switching by mapping lora_id to MoE LoRA paths
+            target_lora_id = "default"
+            if len(lora_ids) > 1 and layer_idx == 1:
+                logger.warning(
+                    f"KT MoE LoRA does not support multiple LoRAs per batch yet. "
+                    f"Requested: {lora_ids}. Using default MoE LoRA."
+                )
+
+        # Switch if needed
+        if target_lora_id != self.current_lora_id:
+            if layer_idx == 1:
+                logger.info(f"Switching MoE LoRA: {self.current_lora_id} -> {target_lora_id}")
+
+            if target_lora_id is None:
+                # Clear LoRA
+                self._clear_lora_weights()
+            else:
+                # Load default MoE LoRA (specified at server startup)
+                default_lora_path = self.kt_config.moe_lora_path
+                if default_lora_path is None:
+                    raise ValueError(
+                        "MoE LoRA enabled but no default MoE LoRA path specified. "
+                        "Please provide --kt-moe-lora-path at server startup."
+                    )
+                self._load_moe_lora_weights(lora_path=default_lora_path, lora_id=target_lora_id)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -1385,8 +1537,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             CPU expert computation results
         """
+
+        # DEBUG: Track sync() calls
+        layer_idx = self.kt_config.layer_idx
+        if layer_idx == 1:
+            print(f"[DEBUG sync ENTRY] layer={layer_idx} tp_rank={self.tp_rank} wrapper={self.wrapper is not None} dispatch_output={dispatch_output is not None}")
+
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(x)
+
+        # DEBUG: Log LoRA enabled status (only once per layer)
+        layer_idx = self.kt_config.layer_idx
+        if not hasattr(self, '_logged_lora_status'):
+            print(f"[DEBUG Layer {layer_idx}] moe_lora_enabled: {self.kt_config.moe_lora_enabled}")
+            print(f"[DEBUG Layer {layer_idx}] current_lora_id: {self.current_lora_id}")
+            self._logged_lora_status = True
 
         # SFT mode: use synchronous forward_sft with LoRA
         if self.kt_config.moe_lora_enabled:
@@ -1394,6 +1559,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 raise ValueError(
                     "dispatch_output is required for SFT mode (MoE LoRA enabled)"
                 )
+
+            # Get forward_batch from thread-local storage (set by model forward())
+            forward_batch = get_current_forward_batch()
+
+            # DEBUG: Check forward_batch availability
+            layer_idx = self.kt_config.layer_idx
+            if layer_idx == 1:
+                print(f"[DEBUG sync] forward_batch from thread-local: {forward_batch is not None}")
+                if forward_batch is not None:
+                    print(f"[DEBUG sync] forward_batch.lora_ids: {forward_batch.lora_ids}")
+
+            # Check and switch LoRA if needed based on batch lora_ids
+            if forward_batch is not None:
+                self._update_lora_if_needed(forward_batch)
+            elif layer_idx == 1:
+                print(f"[DEBUG sync] WARNING: No forward_batch available in thread-local storage")
 
             topk_output = dispatch_output.topk_output
             topk_weights, topk_ids, _ = topk_output
@@ -1433,6 +1614,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             Combined computation results from CPU and GPU experts
         """
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        # DEBUG: Track apply() calls
+        layer_idx = self.kt_config.layer_idx
+        if layer_idx == 1:
+            print(f"[DEBUG apply ENTRY] layer={layer_idx} dispatch_output={dispatch_output is not None}")
+            if dispatch_output is not None:
+                print(f"[DEBUG apply] dispatch_output type: {type(dispatch_output)}")
+                print(f"[DEBUG apply] has forward_batch attr: {hasattr(dispatch_output, 'forward_batch')}")
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
