@@ -3787,3 +3787,6 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+def supports_custom_op() -> bool:
+    return hasattr(torch.library, "custom_op")
