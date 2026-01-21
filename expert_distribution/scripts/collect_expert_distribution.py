@@ -194,7 +194,7 @@ def main():
 
         try:
             # 1. 开始记录
-            start_record()
+            # start_record()
 
             # 2. 发送请求
             t0 = time.time()
@@ -203,14 +203,14 @@ def main():
             print(f"generate: {resp.status_code}, 耗时: {elapsed:.2f}s")
 
             # 3. 停止记录
-            stop_record()
+            # stop_record()
 
             # 4. 导出记录
-            dump_record()
+            # dump_record()
 
             # 5. 移动文件
             time.sleep(0.1)  # 等待文件写入完成
-            move_pt_file(output_dir, idx)
+            # move_pt_file(output_dir, idx)
 
         except Exception as e:
             print(f"错误: {e}")

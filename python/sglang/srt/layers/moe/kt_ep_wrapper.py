@@ -85,6 +85,62 @@ class KTConfig:
 
 
 _SHARED_FULL_CONTEXT = None
+_SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
+
+
+class SharedStagingBuffer:
+    """Global shared staging buffer for CPU expert input across all MoE layers.
+
+    This avoids allocating a separate staging buffer per layer, which would
+    consume significant GPU memory (chunked_prefill_size * hidden_size * N_layers).
+    Instead, all layers share a single buffer since MoE layers are processed
+    sequentially, not in parallel.
+    """
+
+    def __init__(
+        self,
+        max_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.max_tokens = max_tokens
+        self.hidden_size = hidden_size
+        self.buffer = torch.empty(
+            (max_tokens, hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        buffer_size_mb = self.buffer.numel() * self.buffer.element_size() / 1024**2
+        logger.info(
+            f"[KT] Created shared staging buffer: {buffer_size_mb:.1f} MiB "
+            f"(shape={self.buffer.shape}, dtype={dtype})"
+        )
+
+    def get_slice(self, num_tokens: int) -> torch.Tensor:
+        """Get a slice of the buffer for the given number of tokens."""
+        assert num_tokens <= self.max_tokens, (
+            f"Batch size {num_tokens} exceeds staging buffer max size {self.max_tokens}"
+        )
+        return self.buffer[:num_tokens]
+
+
+def get_or_create_shared_staging_buffer(
+    max_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> SharedStagingBuffer:
+    """Get or create the global shared staging buffer."""
+    global _SHARED_STAGING_BUFFER
+    if _SHARED_STAGING_BUFFER is None:
+        _SHARED_STAGING_BUFFER = SharedStagingBuffer(
+            max_tokens=max_tokens,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+    return _SHARED_STAGING_BUFFER
 
 
 class SharedFullContext:
@@ -1723,9 +1779,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._cpu_stream: Optional[torch.cuda.Stream] = None
         self._sync_done_event: Optional[torch.cuda.Event] = None  # CPU computation done
 
-        # GPU staging buffer for CPU expert input (avoids data race with inplace GPU computation)
-        # Maps batch_size -> staging buffer tensor
-        self._staging_buffers: Dict[int, torch.Tensor] = {}
+        # Shared staging buffer reference (initialized in create_weights, shared across all layers)
+        self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
+        self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
 
     def create_weights(
         self,
@@ -1791,6 +1847,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             self._cpu_stream = torch.cuda.Stream(device=target_device)
             self._sync_done_event = torch.cuda.Event()
+
+            # Get or create shared staging buffer (shared across all MoE layers to save GPU memory)
+            self._shared_staging_buffer = get_or_create_shared_staging_buffer(
+                max_tokens=self._staging_buffer_max_size,
+                hidden_size=hidden_size,
+                dtype=params_dtype,
+                device=target_device,
+            )
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
@@ -2044,11 +2108,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
         if self.tp_rank == 0 and self._cpu_stream is not None:
-            # Get or create staging buffer for this batch size
-            batch_size = x.shape[0]
-            if batch_size not in self._staging_buffers:
-                self._staging_buffers[batch_size] = torch.empty_like(x)
-            staging_buffer = self._staging_buffers[batch_size]
+            # Use shared staging buffer (shared across all MoE layers to save GPU memory)
+            assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
+            staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
 
             # Copy to staging buffer on main stream
             staging_buffer.copy_(x, non_blocking=True)
