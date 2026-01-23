@@ -622,7 +622,8 @@ class SharedFullContext:
         w13_p.set_(w13_p.view(num_experts, w13_k // 16, w13_n * (num_bits // 2)))
         w2_p.set_(w2_p.view(num_experts, w2_k // 16, w2_n * (num_bits // 2)))
 
-    def _prepare_weight_fp8(self, wrapper):
+    def _prepare_weight_fp8(self, wrapper, original_layer=None, gpu_experts_mask=None,
+                            logical_to_gpu_index=None):
         """Prepare FP8 block quant weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -636,6 +637,10 @@ class SharedFullContext:
         to ensure copy(e-2) completes before write(e) overwrites the same slot.
 
         Optional DeepGemm ue8m0 conversion is handled after all experts are loaded.
+
+        Optimization: If original_layer and gpu_experts_mask are provided, experts
+        already on GPU are copied directly (fast GPU-to-GPU), while CPU experts
+        use the KT wrapper pipeline.
         """
         # Bind Python thread to specific CPU core (last cores for each rank)
         tp_rank = get_tensor_model_parallel_rank()
@@ -652,14 +657,41 @@ class SharedFullContext:
         for name in self.WEIGHT_NAMES_FP8:
             cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
             gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
-            weight_infos.append((cpu_buf, gpu_t))
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        # Separate GPU experts (direct copy) from CPU experts (KT transfer)
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+            for e in range(num_experts):
+                if gpu_experts_mask[e].item():
+                    gpu_expert_ids.append(e)
+                else:
+                    cpu_expert_ids.append(e)
+        else:
+            # Fallback: all experts from CPU
+            cpu_expert_ids = list(range(num_experts))
+
+        # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
+        if gpu_expert_ids:
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)  # [num_gpu_experts, ...]
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+        # --- Phase 2: Transfer CPU experts via KT pipeline ---
+        if not cpu_expert_ids:
+            # All experts are on GPU, nothing more to do
+            return
 
         # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
         copy_stream = torch.cuda.Stream(device=device)
         post_stream = torch.cuda.Stream(device=device)
-        events = [torch.cuda.Event() for _ in range(num_experts)]
+        # Events indexed by position in cpu_expert_ids
+        events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
 
-        def postprocess_expert(e):
+        def postprocess_expert(idx):
             # FP8 doesn't need actual postprocessing (no repack/permute).
             # This function provides a pipeline synchronization point and
             # can be extended for future FP8-specific processing if needed.
@@ -690,9 +722,8 @@ class SharedFullContext:
                 w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
             )
 
-            def submit_write_expert(expert_id):
-                # Use expert_id % 2 for double buffering slot selection
-                slot = expert_id % 2
+            def submit_write_expert(expert_id, slot):
+                # Use provided slot for double buffering
                 w13_weight_ptrs = [
                     ptr + slot * w13_weight_expert_nbytes
                     for ptr in self.all_rank_buffer_ptrs["w13_weight"]
@@ -718,47 +749,50 @@ class SharedFullContext:
                     w2_scale_ptrs,
                 )
 
-            # Submit expert 0 ahead of time
-            submit_write_expert(0)
+            # Submit first CPU expert ahead of time
+            submit_write_expert(cpu_expert_ids[0], 0)
 
-        for e in range(num_experts):
-            # Sync write for expert e, submit write for expert e+1
+        for idx, e in enumerate(cpu_expert_ids):
+            slot = idx % 2  # Double buffering based on iteration index
+
+            # Sync write for expert e, submit write for next CPU expert
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
-                if e + 1 < num_experts:
-                    # Before writing to slot (e+1)%2, ensure copy from that slot is complete.
-                    # Since (e+1)%2 == (e-1)%2 for e >= 1, we need to wait for copy(e-1).
-                    if e > 0:
-                        events[e - 1].synchronize()
-                    submit_write_expert(e + 1)
+                if idx + 1 < len(cpu_expert_ids):
+                    next_slot = (idx + 1) % 2
+                    # Before writing to next_slot, ensure copy from that slot is complete.
+                    if idx > 0:
+                        events[idx - 1].synchronize()
+                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
                 dist.barrier(group=get_tp_group().device_group)
 
             with torch.cuda.stream(copy_stream):
-                slot = e % 2  # Double buffering
-                for cpu_buf, gpu_t in weight_infos:
+                for _, cpu_buf, gpu_t in weight_infos:
                     gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                events[e].record(copy_stream)
+                events[idx].record(copy_stream)
 
-            # Postprocess expert e-1: provides pipeline structure for future extensions
-            if e > 0:
+            # Postprocess expert idx-1: provides pipeline structure for future extensions
+            if idx > 0:
                 with torch.cuda.stream(post_stream):
-                    post_stream.wait_event(events[e - 1])
-                    postprocess_expert(e - 1)
+                    post_stream.wait_event(events[idx - 1])
+                    postprocess_expert(idx - 1)
 
-        # Process last expert
-        with torch.cuda.stream(post_stream):
-            post_stream.wait_event(events[-1])
-            postprocess_expert(num_experts - 1)
+        # Process last CPU expert
+        if cpu_expert_ids:
+            with torch.cuda.stream(post_stream):
+                post_stream.wait_event(events[-1])
+                postprocess_expert(len(cpu_expert_ids) - 1)
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
     # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
     # The conversion is handled separately in the normal weight loading path.
 
-    def _prepare_weight_fp8_channel(self, wrapper):
+    def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
+                                     logical_to_gpu_index=None):
         """Prepare FP8 per-channel quant weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -775,6 +809,10 @@ class SharedFullContext:
 
         The postprocess stage is a no-op for FP8 but provides pipeline synchronization
         to ensure copy(e-2) completes before write(e) overwrites the same slot.
+
+        Optimization: If original_layer and gpu_experts_mask are provided, experts
+        already on GPU are copied directly (fast GPU-to-GPU), while CPU experts
+        use the KT wrapper pipeline.
         """
         # Bind Python thread to specific CPU core (last cores for each rank)
         tp_rank = get_tensor_model_parallel_rank()
@@ -791,14 +829,41 @@ class SharedFullContext:
         for name in self.WEIGHT_NAMES_FP8_CHANNEL:
             cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
             gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
-            weight_infos.append((cpu_buf, gpu_t))
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        # Separate GPU experts (direct copy) from CPU experts (KT transfer)
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+            for e in range(num_experts):
+                if gpu_experts_mask[e].item():
+                    gpu_expert_ids.append(e)
+                else:
+                    cpu_expert_ids.append(e)
+        else:
+            # Fallback: all experts from CPU
+            cpu_expert_ids = list(range(num_experts))
+
+        # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
+        if gpu_expert_ids:
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)  # [num_gpu_experts, ...]
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+        # --- Phase 2: Transfer CPU experts via KT pipeline ---
+        if not cpu_expert_ids:
+            # All experts are on GPU, nothing more to do
+            return
 
         # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
         copy_stream = torch.cuda.Stream(device=device)
         post_stream = torch.cuda.Stream(device=device)
-        events = [torch.cuda.Event() for _ in range(num_experts)]
+        # Events indexed by position in cpu_expert_ids
+        events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
 
-        def postprocess_expert(e):
+        def postprocess_expert(idx):
             # FP8 per-channel doesn't need actual postprocessing (no repack/permute).
             # This function provides a pipeline synchronization point and
             # can be extended for future FP8-specific processing if needed.
@@ -829,9 +894,8 @@ class SharedFullContext:
                 w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
             )
 
-            def submit_write_expert(expert_id):
-                # Use expert_id % 2 for double buffering slot selection
-                slot = expert_id % 2
+            def submit_write_expert(expert_id, slot):
+                # Use provided slot for double buffering
                 w13_weight_ptrs = [
                     ptr + slot * w13_weight_expert_nbytes
                     for ptr in self.all_rank_buffer_ptrs["w13_weight"]
@@ -857,44 +921,47 @@ class SharedFullContext:
                     w2_scale_ptrs,
                 )
 
-            # Submit expert 0 ahead of time
-            submit_write_expert(0)
+            # Submit first CPU expert ahead of time
+            submit_write_expert(cpu_expert_ids[0], 0)
 
-        for e in range(num_experts):
-            # Sync write for expert e, submit write for expert e+1
+        for idx, e in enumerate(cpu_expert_ids):
+            slot = idx % 2  # Double buffering based on iteration index
+
+            # Sync write for expert e, submit write for next CPU expert
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
-                if e + 1 < num_experts:
-                    # Before writing to slot (e+1)%2, ensure copy from that slot is complete.
-                    # Since (e+1)%2 == (e-1)%2 for e >= 1, we need to wait for copy(e-1).
-                    if e > 0:
-                        events[e - 1].synchronize()
-                    submit_write_expert(e + 1)
+                if idx + 1 < len(cpu_expert_ids):
+                    next_slot = (idx + 1) % 2
+                    # Before writing to next_slot, ensure copy from that slot is complete.
+                    if idx > 0:
+                        events[idx - 1].synchronize()
+                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
                 dist.barrier(group=get_tp_group().device_group)
 
             with torch.cuda.stream(copy_stream):
-                slot = e % 2  # Double buffering
-                for cpu_buf, gpu_t in weight_infos:
+                for _, cpu_buf, gpu_t in weight_infos:
                     gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                events[e].record(copy_stream)
+                events[idx].record(copy_stream)
 
-            # Postprocess expert e-1: provides pipeline structure for future extensions
-            if e > 0:
+            # Postprocess expert idx-1: provides pipeline structure for future extensions
+            if idx > 0:
                 with torch.cuda.stream(post_stream):
-                    post_stream.wait_event(events[e - 1])
-                    postprocess_expert(e - 1)
+                    post_stream.wait_event(events[idx - 1])
+                    postprocess_expert(idx - 1)
 
-        # Process last expert
-        with torch.cuda.stream(post_stream):
-            post_stream.wait_event(events[-1])
-            postprocess_expert(num_experts - 1)
+        # Process last CPU expert
+        if cpu_expert_ids:
+            with torch.cuda.stream(post_stream):
+                post_stream.wait_event(events[-1])
+                postprocess_expert(len(cpu_expert_ids) - 1)
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
-    def _prepare_weight_bf16(self, wrapper):
+    def _prepare_weight_bf16(self, wrapper, original_layer=None, gpu_experts_mask=None,
+                             logical_to_gpu_index=None):
         """Prepare BF16/unquantized weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -907,6 +974,10 @@ class SharedFullContext:
 
         The postprocess stage is a no-op for BF16 but provides pipeline synchronization
         to ensure copy(e-2) completes before write(e) overwrites the same slot.
+
+        Optimization: If original_layer and gpu_experts_mask are provided, experts
+        already on GPU are copied directly (fast GPU-to-GPU), while CPU experts
+        use the KT wrapper pipeline.
         """
         # Bind Python thread to specific CPU core (last cores for each rank)
         tp_rank = get_tensor_model_parallel_rank()
@@ -923,14 +994,41 @@ class SharedFullContext:
         for name in self.WEIGHT_NAMES_BF16:
             cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
             gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
-            weight_infos.append((cpu_buf, gpu_t))
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        # Separate GPU experts (direct copy) from CPU experts (KT transfer)
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+            for e in range(num_experts):
+                if gpu_experts_mask[e].item():
+                    gpu_expert_ids.append(e)
+                else:
+                    cpu_expert_ids.append(e)
+        else:
+            # Fallback: all experts from CPU
+            cpu_expert_ids = list(range(num_experts))
+
+        # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
+        if gpu_expert_ids:
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)  # [num_gpu_experts, ...]
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+        # --- Phase 2: Transfer CPU experts via KT pipeline ---
+        if not cpu_expert_ids:
+            # All experts are on GPU, nothing more to do
+            return
 
         # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
         copy_stream = torch.cuda.Stream(device=device)
         post_stream = torch.cuda.Stream(device=device)
-        events = [torch.cuda.Event() for _ in range(num_experts)]
+        # Events indexed by position in cpu_expert_ids
+        events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
 
-        def postprocess_expert(e):
+        def postprocess_expert(idx):
             # BF16 doesn't need actual postprocessing (no repack/permute/transpose).
             # This function provides a pipeline synchronization point and
             # can be extended for future BF16-specific processing if needed.
@@ -953,9 +1051,8 @@ class SharedFullContext:
                 w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
             )
 
-            def submit_write_expert(expert_id):
-                # Use expert_id % 2 for double buffering slot selection
-                slot = expert_id % 2
+            def submit_write_expert(expert_id, slot):
+                # Use provided slot for double buffering
                 w13_weight_ptrs = [
                     ptr + slot * w13_weight_expert_nbytes
                     for ptr in self.all_rank_buffer_ptrs["w13_weight"]
@@ -976,50 +1073,60 @@ class SharedFullContext:
                     w2_scale_ptrs,
                 )
 
-            # Submit expert 0 ahead of time
-            submit_write_expert(0)
+            # Submit first CPU expert ahead of time
+            submit_write_expert(cpu_expert_ids[0], 0)
 
-        for e in range(num_experts):
-            # Sync write for expert e, submit write for expert e+1
+        for idx, e in enumerate(cpu_expert_ids):
+            slot = idx % 2  # Double buffering based on iteration index
+
+            # Sync write for expert e, submit write for next CPU expert
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
-                if e + 1 < num_experts:
-                    # Before writing to slot (e+1)%2, ensure copy from that slot is complete.
-                    # Since (e+1)%2 == (e-1)%2 for e >= 1, we need to wait for copy(e-1).
-                    if e > 0:
-                        events[e - 1].synchronize()
-                    submit_write_expert(e + 1)
+                if idx + 1 < len(cpu_expert_ids):
+                    next_slot = (idx + 1) % 2
+                    # Before writing to next_slot, ensure copy from that slot is complete.
+                    if idx > 0:
+                        events[idx - 1].synchronize()
+                    submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
                 dist.barrier(group=get_tp_group().device_group)
 
             with torch.cuda.stream(copy_stream):
-                slot = e % 2  # Double buffering
-                for cpu_buf, gpu_t in weight_infos:
+                for _, cpu_buf, gpu_t in weight_infos:
                     gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                events[e].record(copy_stream)
+                events[idx].record(copy_stream)
 
-            # Postprocess expert e-1: provides pipeline structure for future extensions
-            if e > 0:
+            # Postprocess expert idx-1: provides pipeline structure for future extensions
+            if idx > 0:
                 with torch.cuda.stream(post_stream):
-                    post_stream.wait_event(events[e - 1])
-                    postprocess_expert(e - 1)
+                    post_stream.wait_event(events[idx - 1])
+                    postprocess_expert(idx - 1)
 
-        # Process last expert
-        with torch.cuda.stream(post_stream):
-            post_stream.wait_event(events[-1])
-            postprocess_expert(num_experts - 1)
+        # Process last CPU expert
+        if cpu_expert_ids:
+            with torch.cuda.stream(post_stream):
+                post_stream.wait_event(events[-1])
+                postprocess_expert(len(cpu_expert_ids) - 1)
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
-    def load(self, layer_idx, wrapper):
-        """Load weights from disk to GPU via shared memory."""
+    def load(self, layer_idx, wrapper, original_layer=None, gpu_experts_mask=None,
+             logical_to_gpu_index=None):
+        """Load weights from disk to GPU via shared memory.
+
+        Args:
+            layer_idx: Layer index in the model
+            wrapper: KT wrapper for CPU expert weight loading
+            original_layer: Original MoE layer with GPU experts (optional)
+            gpu_experts_mask: bool tensor [num_experts], True = on GPU (optional)
+            logical_to_gpu_index: int tensor [num_experts], maps logical ID to GPU index (optional)
+        """
         for name, param in self.original_params.items():
             setattr(self.gpu_layer, name, param)
         for name, buf in self.original_buffers.items():
             self.gpu_layer.register_buffer(name, buf)
-
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1028,12 +1135,16 @@ class SharedFullContext:
         t0 = time.perf_counter()
 
         # Select appropriate prepare_weight method based on quantization type
+        # FP8/BF16 methods support GPU expert optimization; INT4 uses full CPU pipeline
         if self.is_fp8_quant:
-            self._prepare_weight_fp8(wrapper)
+            self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
+                                     logical_to_gpu_index)
         elif self.is_fp8_channel_quant:
-            self._prepare_weight_fp8_channel(wrapper)
+            self._prepare_weight_fp8_channel(wrapper, original_layer, gpu_experts_mask,
+                                             logical_to_gpu_index)
         elif self.is_bf16_quant:
-            self._prepare_weight_bf16(wrapper)
+            self._prepare_weight_bf16(wrapper, original_layer, gpu_experts_mask,
+                                      logical_to_gpu_index)
         else:
             # INT4 Marlin format: write(e+1) || copy(e) || postprocess(e-1)
             self._prepare_weight_int4(wrapper)
@@ -2284,5 +2395,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _SHARED_FULL_CONTEXT.load(
             layer_idx=self.kt_config.layer_idx,
             wrapper=self.wrapper,
+            original_layer=layer,
+            gpu_experts_mask=self.gpu_experts_mask,
+            logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
