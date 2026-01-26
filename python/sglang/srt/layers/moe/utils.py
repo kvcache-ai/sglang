@@ -133,6 +133,7 @@ TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
+DISABLE_KT_EP_WRAPPER: bool = False
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -147,6 +148,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
+    global DISABLE_KT_EP_WRAPPER
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -169,6 +171,7 @@ def initialize_moe_config(server_args: ServerArgs):
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
     MOE_QUANTIZATION = server_args.quantization
+    DISABLE_KT_EP_WRAPPER = False
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -299,6 +302,28 @@ def speculative_moe_a2a_backend_context():
         DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
             original_disable_flashinfer_cutlass_moe_fp4_allgather
         )
+
+
+def is_kt_ep_wrapper_disabled() -> bool:
+    """Check if KT EP wrapper is disabled (for draft models in speculative decoding)."""
+    global DISABLE_KT_EP_WRAPPER
+    return DISABLE_KT_EP_WRAPPER
+
+
+@contextmanager
+def speculative_kt_ep_disabled_context():
+    """
+    Context manager to disable KT EP wrapper for draft model operations.
+    Ensures draft models use pure GPU MoE instead of CPU-GPU hybrid computation
+    via kt_ep_wrapper.
+    """
+    global DISABLE_KT_EP_WRAPPER
+    original_value = DISABLE_KT_EP_WRAPPER
+    try:
+        DISABLE_KT_EP_WRAPPER = True
+        yield
+    finally:
+        DISABLE_KT_EP_WRAPPER = original_value
 
 
 # The type of method in top-K routing, for use in torch custom op

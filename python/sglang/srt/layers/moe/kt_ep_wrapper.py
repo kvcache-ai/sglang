@@ -1516,8 +1516,14 @@ def create_kt_config_from_server_args(
         layer_idx: Layer index in the model
 
     Returns:
-        KTConfig if KT is configured, None otherwise
+        KTConfig if KT is configured and not disabled, None otherwise
     """
+    # Check if KT EP wrapper is disabled (e.g., for draft models in speculative decoding)
+    from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
+
+    if is_kt_ep_wrapper_disabled():
+        return None
+
     if server_args.kt_weight_path is None:
         return None
 

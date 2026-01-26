@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_disabled_context,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -118,7 +119,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -146,7 +147,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         with self.draft_tp_context(
             self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -626,7 +627,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -644,14 +645,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )

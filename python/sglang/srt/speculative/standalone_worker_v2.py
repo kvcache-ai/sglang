@@ -5,7 +5,10 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_disabled_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
@@ -80,7 +83,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        with empty_context():
+        with empty_context(), speculative_kt_ep_disabled_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -108,7 +111,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
         with self.draft_tp_context(
             self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        ), speculative_moe_backend_context(), speculative_kt_ep_disabled_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
         self.tree_mask_mode = TreeMaskMode.FULL_MASK

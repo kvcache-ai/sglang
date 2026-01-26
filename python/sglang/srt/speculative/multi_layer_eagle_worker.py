@@ -21,7 +21,10 @@ import torch
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_disabled_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -124,7 +127,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
-        with ctx, speculative_moe_backend_context():
+        with ctx, speculative_moe_backend_context(), speculative_kt_ep_disabled_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -178,7 +181,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         )
         with self.draft_tp_context(
             self.mtp_model_runner(0).tp_group
-        ), speculative_moe_backend_context():
+        ), speculative_moe_backend_context(), speculative_kt_ep_disabled_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -247,7 +250,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             )
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            ), speculative_moe_backend_context(), speculative_kt_ep_disabled_context():
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
@@ -260,7 +263,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         else:
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            ), speculative_moe_backend_context(), speculative_kt_ep_disabled_context():
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
@@ -268,7 +271,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            ), speculative_moe_backend_context(), speculative_kt_ep_disabled_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
