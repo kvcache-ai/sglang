@@ -299,6 +299,133 @@ def get_or_create_gpu_sync_state(
     return _GPU_SYNC_STATE
 
 
+@dataclass
+class PrefetchState:
+    """State for a pending prefetch operation."""
+    layer_idx: int                      # Layer being prefetched
+    prefetch_stream: torch.cuda.Stream  # Stream used for prefetch
+    sync_event: torch.cuda.Event        # Event to signal completion
+    is_pending: bool = True             # Whether prefetch is still in progress
+
+
+class GlobalPrefetchManager:
+    """Cross-layer prefetch coordination manager (singleton per device).
+
+    This class manages the prefetching of weights for the next MoE layer while
+    the current layer's Attention is executing. The goal is to overlap weight
+    loading (CPU→GPU) with Attention computation.
+
+    The prefetch flow:
+    1. Layer N-1 MoE completes computation
+    2. Before returning, Layer N-1 submits prefetch for Layer N's weights
+    3. Layer N's Attention executes in parallel with prefetch
+    4. Layer N MoE checks for pending prefetch, waits if needed, then computes
+    """
+
+    _instances: Dict[torch.device, "GlobalPrefetchManager"] = {}
+
+    def __init__(self, device: torch.device):
+        """Initialize prefetch manager for a specific device.
+
+        Args:
+            device: CUDA device for the prefetch stream
+        """
+        self.device = device
+        self.prefetch_stream = torch.cuda.Stream(device=device)
+        self.prefetch_event = torch.cuda.Event()
+        self.current_prefetch: Optional[PrefetchState] = None
+        self._layer_methods: Dict[int, "KTEPWrapperMethod"] = {}
+        logger.info(f"[GlobalPrefetchManager] Created for device {device}")
+
+    @classmethod
+    def get_instance(cls, device: torch.device) -> "GlobalPrefetchManager":
+        """Get or create the singleton instance for a device."""
+        if device not in cls._instances:
+            cls._instances[device] = cls(device)
+        return cls._instances[device]
+
+    def register_layer(self, layer_idx: int, method: "KTEPWrapperMethod") -> None:
+        """Register a layer's method for cross-layer coordination.
+
+        Args:
+            layer_idx: Layer index
+            method: The KTEPWrapperMethod instance for this layer
+        """
+        self._layer_methods[layer_idx] = method
+
+    def get_next_layer_method(
+        self, current_layer_idx: int
+    ) -> Optional["KTEPWrapperMethod"]:
+        """Get the next layer's method if registered.
+
+        Args:
+            current_layer_idx: Current layer index
+
+        Returns:
+            Next layer's method, or None if not registered (e.g., last layer)
+        """
+        return self._layer_methods.get(current_layer_idx + 1)
+
+    def get_layer_method(self, layer_idx: int) -> Optional["KTEPWrapperMethod"]:
+        """Get a specific layer's method.
+
+        Args:
+            layer_idx: Layer index
+
+        Returns:
+            The layer's method, or None if not registered
+        """
+        return self._layer_methods.get(layer_idx)
+
+    def start_prefetch(self, layer_idx: int) -> PrefetchState:
+        """Start a prefetch operation for the given layer.
+
+        Args:
+            layer_idx: Layer index to prefetch
+
+        Returns:
+            PrefetchState for tracking the operation
+        """
+        self.current_prefetch = PrefetchState(
+            layer_idx=layer_idx,
+            prefetch_stream=self.prefetch_stream,
+            sync_event=self.prefetch_event,
+            is_pending=True,
+        )
+        return self.current_prefetch
+
+    def complete_prefetch(self) -> None:
+        """Mark the current prefetch as complete."""
+        if self.current_prefetch is not None:
+            self.current_prefetch.is_pending = False
+
+    def clear_prefetch(self) -> None:
+        """Clear the current prefetch state (after consumption)."""
+        self.current_prefetch = None
+
+    def has_pending_prefetch_for(self, layer_idx: int) -> bool:
+        """Check if there's a pending prefetch for the given layer.
+
+        Args:
+            layer_idx: Layer index to check
+
+        Returns:
+            True if there's a pending prefetch for this layer
+        """
+        return (
+            self.current_prefetch is not None
+            and self.current_prefetch.layer_idx == layer_idx
+        )
+
+
+_PREFETCH_MANAGER: Optional[GlobalPrefetchManager] = None
+
+
+def get_or_create_prefetch_manager(device: torch.device) -> GlobalPrefetchManager:
+    """Get or create the global prefetch manager for a device."""
+    return GlobalPrefetchManager.get_instance(device)
+
+
 class SharedFullContext:
     def __init__(
         self,
@@ -1320,6 +1447,395 @@ class SharedFullContext:
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
+    # ========== Async versions for prefetch (non-blocking to Python) ==========
+
+    def _prepare_weight_fp8_async(
+        self,
+        wrapper,
+        original_layer,
+        gpu_experts_mask,
+        logical_to_gpu_index,
+        prefetch_stream: torch.cuda.Stream,
+        sync_event: torch.cuda.Event,
+    ):
+        """Async version of _prepare_weight_fp8 for prefetch (non-blocking to Python).
+
+        This method queues all operations on prefetch_stream and returns immediately.
+        The sync_event is recorded at the end to signal completion.
+
+        Unlike the sync version, this does NOT block Python at any point. All CPU
+        tasks are queued via cudaLaunchHostFunc and executed when the GPU stream
+        reaches those points.
+
+        Args:
+            wrapper: KT wrapper for CPU expert weight loading
+            original_layer: Original MoE layer with GPU experts
+            gpu_experts_mask: bool tensor [num_experts], True = on GPU
+            logical_to_gpu_index: int tensor [num_experts], maps logical ID to GPU index
+            prefetch_stream: CUDA stream to run prefetch operations on
+            sync_event: CUDA event to record when prefetch completes
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_weight.device
+
+        # Prepare weight tensors
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_FP8:
+            cpu_buf = self.cpu_buffers[name]
+            gpu_t = getattr(layer, name)
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        # Separate GPU experts from CPU experts
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        for e in range(num_experts):
+            if gpu_experts_mask[e].item():
+                gpu_expert_ids.append(e)
+            else:
+                cpu_expert_ids.append(e)
+
+        with torch.cuda.stream(prefetch_stream):
+            # Phase 1: GPU-to-GPU copy (fast, queued on prefetch_stream)
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+            # Phase 2: CPU experts via async KT pipeline
+            if cpu_expert_ids:
+                do_write = tp_rank == 0 and wrapper is not None
+
+                if do_write:
+                    # Prepare buffer pointers and sizes
+                    w13_weight_buf = self.cpu_buffers["w13_weight"]
+                    w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+                    w2_weight_buf = self.cpu_buffers["w2_weight"]
+                    w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+
+                    w13_weight_expert_nbytes = w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+                    w13_scale_expert_nbytes = w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+                    w2_weight_expert_nbytes = w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+                    w2_scale_expert_nbytes = w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+
+                    def submit_write_expert_async(expert_id, slot):
+                        w13_weight_ptrs = [
+                            ptr + slot * w13_weight_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                        ]
+                        w13_scale_ptrs = [
+                            ptr + slot * w13_scale_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
+                        ]
+                        w2_weight_ptrs = [
+                            ptr + slot * w2_weight_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                        ]
+                        w2_scale_ptrs = [
+                            ptr + slot * w2_scale_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
+                        ]
+                        wrapper.submit_write_weight_scale_to_buffer_async(
+                            prefetch_stream.cuda_stream,
+                            tp_world_size,
+                            expert_id,
+                            w13_weight_ptrs,
+                            w13_scale_ptrs,
+                            w2_weight_ptrs,
+                            w2_scale_ptrs,
+                        )
+
+                # Get GPU sync state for cross-process synchronization
+                gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
+                if gpu_sync is not None:
+                    gpu_sync.reset(prefetch_stream)
+
+                for idx, e in enumerate(cpu_expert_ids):
+                    slot = idx % 2
+
+                    if do_write:
+                        # Submit CPU write task (queued via cudaLaunchHostFunc)
+                        submit_write_expert_async(e, slot)
+                        # Wait for CPU write to complete (queued via cudaLaunchHostFunc)
+                        wrapper.sync_write_weight_scale_to_buffer_async(prefetch_stream.cuda_stream)
+
+                    # H2D copy (queued on prefetch_stream)
+                    if tp_rank == 0:
+                        for _, cpu_buf, gpu_t in weight_infos:
+                            gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                        if gpu_sync is not None:
+                            gpu_sync.signal_done(idx, prefetch_stream)
+                    else:
+                        if gpu_sync is not None:
+                            gpu_sync.wait_for_done(idx, prefetch_stream)
+                        for _, cpu_buf, gpu_t in weight_infos:
+                            gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+
+            # Record completion event
+            sync_event.record(prefetch_stream)
+
+    def _prepare_weight_fp8_channel_async(
+        self,
+        wrapper,
+        original_layer,
+        gpu_experts_mask,
+        logical_to_gpu_index,
+        prefetch_stream: torch.cuda.Stream,
+        sync_event: torch.cuda.Event,
+    ):
+        """Async version of _prepare_weight_fp8_channel for prefetch."""
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_weight.device
+
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_FP8_CHANNEL:
+            cpu_buf = self.cpu_buffers[name]
+            gpu_t = getattr(layer, name)
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        for e in range(num_experts):
+            if gpu_experts_mask[e].item():
+                gpu_expert_ids.append(e)
+            else:
+                cpu_expert_ids.append(e)
+
+        with torch.cuda.stream(prefetch_stream):
+            # Phase 1: GPU-to-GPU copy
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+            # Phase 2: CPU experts via async KT pipeline
+            if cpu_expert_ids:
+                do_write = tp_rank == 0 and wrapper is not None
+
+                if do_write:
+                    w13_weight_buf = self.cpu_buffers["w13_weight"]
+                    w13_scale_buf = self.cpu_buffers["w13_weight_scale"]
+                    w2_weight_buf = self.cpu_buffers["w2_weight"]
+                    w2_scale_buf = self.cpu_buffers["w2_weight_scale"]
+
+                    w13_weight_expert_nbytes = w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+                    w13_scale_expert_nbytes = w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+                    w2_weight_expert_nbytes = w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+                    w2_scale_expert_nbytes = w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+
+                    def submit_write_expert_async(expert_id, slot):
+                        w13_weight_ptrs = [
+                            ptr + slot * w13_weight_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                        ]
+                        w13_scale_ptrs = [
+                            ptr + slot * w13_scale_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w13_weight_scale"]
+                        ]
+                        w2_weight_ptrs = [
+                            ptr + slot * w2_weight_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                        ]
+                        w2_scale_ptrs = [
+                            ptr + slot * w2_scale_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w2_weight_scale"]
+                        ]
+                        wrapper.submit_write_weight_scale_to_buffer_async(
+                            prefetch_stream.cuda_stream,
+                            tp_world_size,
+                            expert_id,
+                            w13_weight_ptrs,
+                            w13_scale_ptrs,
+                            w2_weight_ptrs,
+                            w2_scale_ptrs,
+                        )
+
+                gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
+                if gpu_sync is not None:
+                    gpu_sync.reset(prefetch_stream)
+
+                for idx, e in enumerate(cpu_expert_ids):
+                    slot = idx % 2
+
+                    if do_write:
+                        submit_write_expert_async(e, slot)
+                        wrapper.sync_write_weight_scale_to_buffer_async(prefetch_stream.cuda_stream)
+
+                    if tp_rank == 0:
+                        for _, cpu_buf, gpu_t in weight_infos:
+                            gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                        if gpu_sync is not None:
+                            gpu_sync.signal_done(idx, prefetch_stream)
+                    else:
+                        if gpu_sync is not None:
+                            gpu_sync.wait_for_done(idx, prefetch_stream)
+                        for _, cpu_buf, gpu_t in weight_infos:
+                            gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+
+            sync_event.record(prefetch_stream)
+
+    def _prepare_weight_bf16_async(
+        self,
+        wrapper,
+        original_layer,
+        gpu_experts_mask,
+        logical_to_gpu_index,
+        prefetch_stream: torch.cuda.Stream,
+        sync_event: torch.cuda.Event,
+    ):
+        """Async version of _prepare_weight_bf16 for prefetch."""
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_weight.device
+
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_BF16:
+            cpu_buf = self.cpu_buffers[name]
+            gpu_t = getattr(layer, name)
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        for e in range(num_experts):
+            if gpu_experts_mask[e].item():
+                gpu_expert_ids.append(e)
+            else:
+                cpu_expert_ids.append(e)
+
+        with torch.cuda.stream(prefetch_stream):
+            # Phase 1: GPU-to-GPU copy
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+            # Phase 2: CPU experts via async KT pipeline
+            if cpu_expert_ids:
+                do_write = tp_rank == 0 and wrapper is not None
+
+                if do_write:
+                    w13_weight_buf = self.cpu_buffers["w13_weight"]
+                    w2_weight_buf = self.cpu_buffers["w2_weight"]
+
+                    w13_weight_expert_nbytes = w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+                    w2_weight_expert_nbytes = w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+
+                    def submit_write_expert_async(expert_id, slot):
+                        w13_weight_ptrs = [
+                            ptr + slot * w13_weight_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                        ]
+                        w2_weight_ptrs = [
+                            ptr + slot * w2_weight_expert_nbytes
+                            for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                        ]
+                        # BF16 has no scales
+                        w13_scale_ptrs = [0] * tp_world_size
+                        w2_scale_ptrs = [0] * tp_world_size
+                        wrapper.submit_write_weight_scale_to_buffer_async(
+                            prefetch_stream.cuda_stream,
+                            tp_world_size,
+                            expert_id,
+                            w13_weight_ptrs,
+                            w13_scale_ptrs,
+                            w2_weight_ptrs,
+                            w2_scale_ptrs,
+                        )
+
+                gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
+                if gpu_sync is not None:
+                    gpu_sync.reset(prefetch_stream)
+
+                for idx, e in enumerate(cpu_expert_ids):
+                    slot = idx % 2
+
+                    if do_write:
+                        submit_write_expert_async(e, slot)
+                        wrapper.sync_write_weight_scale_to_buffer_async(prefetch_stream.cuda_stream)
+
+                    if tp_rank == 0:
+                        for _, cpu_buf, gpu_t in weight_infos:
+                            gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                        if gpu_sync is not None:
+                            gpu_sync.signal_done(idx, prefetch_stream)
+                    else:
+                        if gpu_sync is not None:
+                            gpu_sync.wait_for_done(idx, prefetch_stream)
+                        for _, cpu_buf, gpu_t in weight_infos:
+                            gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+
+            sync_event.record(prefetch_stream)
+
+    def load_async(
+        self,
+        layer_idx: int,
+        wrapper,
+        original_layer,
+        gpu_experts_mask,
+        logical_to_gpu_index,
+        prefetch_stream: torch.cuda.Stream,
+        sync_event: torch.cuda.Event,
+    ):
+        """Async version of load() for prefetch (non-blocking to Python).
+
+        This method queues all weight loading operations on prefetch_stream
+        and returns immediately. The sync_event is recorded when complete.
+
+        Args:
+            layer_idx: Layer index in the model
+            wrapper: KT wrapper for CPU expert weight loading
+            original_layer: Original MoE layer with GPU experts
+            gpu_experts_mask: bool tensor [num_experts], True = on GPU
+            logical_to_gpu_index: int tensor [num_experts], maps logical ID to GPU index
+            prefetch_stream: CUDA stream to run prefetch operations on
+            sync_event: CUDA event to record when prefetch completes
+        """
+        # Restore original parameters (on prefetch_stream)
+        with torch.cuda.stream(prefetch_stream):
+            for name, param in self.original_params.items():
+                setattr(self.gpu_layer, name, param)
+            for name, buf in self.original_buffers.items():
+                self.gpu_layer.register_buffer(name, buf)
+
+        # Select appropriate async prepare_weight method
+        if self.is_fp8_quant:
+            self._prepare_weight_fp8_async(
+                wrapper, original_layer, gpu_experts_mask,
+                logical_to_gpu_index, prefetch_stream, sync_event
+            )
+        elif self.is_fp8_channel_quant:
+            self._prepare_weight_fp8_channel_async(
+                wrapper, original_layer, gpu_experts_mask,
+                logical_to_gpu_index, prefetch_stream, sync_event
+            )
+        elif self.is_bf16_quant:
+            self._prepare_weight_bf16_async(
+                wrapper, original_layer, gpu_experts_mask,
+                logical_to_gpu_index, prefetch_stream, sync_event
+            )
+        else:
+            # INT4 Marlin: not supported for async prefetch due to complex postprocessing
+            # Fall back to sync_event recording without actual loading
+            # The apply() method will detect this and use sync load instead
+            logger.warning(
+                f"[SharedFullContext] INT4 Marlin async prefetch not supported for layer {layer_idx}. "
+                "Will fall back to synchronous loading."
+            )
+            sync_event.record(prefetch_stream)
+
     def load(self, layer_idx, wrapper, original_layer=None, gpu_experts_mask=None,
              logical_to_gpu_index=None):
         """Load weights from disk to GPU via shared memory.
@@ -2093,6 +2609,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
+        # Cached layer module reference for cross-layer prefetch
+        self._cached_layer_module: Optional[torch.nn.Module] = None
+
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
         # main stream for GPU computation (initialized in create_weights)
         self._cpu_stream: Optional[torch.cuda.Stream] = None
@@ -2192,6 +2711,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
             )
+
+        # Register this layer with GlobalPrefetchManager for cross-layer prefetch coordination
+        prefetch_mgr = get_or_create_prefetch_manager(target_device)
+        prefetch_mgr.register_layer(self.kt_config.layer_idx, self)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -2381,12 +2904,29 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
 
+        # Cache layer module for future prefetch use (for all paths)
+        self._cached_layer_module = layer
+
         # Check for full GPU fallback
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
         ):
-            ctx = self._build_full_context(layer)
+            global _SHARED_FULL_CONTEXT
+            device = x.device
+            prefetch_mgr = get_or_create_prefetch_manager(device)
+            used_prefetch = False
+
+            # Step 1: Check for pending prefetch for this layer
+            if prefetch_mgr.has_pending_prefetch_for(self.kt_config.layer_idx):
+                # Prefetch is available - wait for it and use the context
+                torch.cuda.current_stream(device).wait_event(prefetch_mgr.prefetch_event)
+                ctx = _SHARED_FULL_CONTEXT
+                prefetch_mgr.clear_prefetch()
+                used_prefetch = True
+            else:
+                # No prefetch available (first layer or non-prefetch path)
+                ctx = self._build_full_context(layer)
 
             t_compute = time.perf_counter()
             result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
@@ -2408,18 +2948,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
                 if self.tp_rank == 0:
                     logger.info(
-                        "KT fallback: layer %d compute = %.2f ms, expert update = %.2f ms",
+                        "KT fallback: layer %d compute = %.2f ms, expert update = %.2f ms%s",
                         self.kt_config.layer_idx,
                         compute_time,
                         update_time,
+                        " (prefetched)" if used_prefetch else "",
                     )
             else:
                 if self.tp_rank == 0:
                     logger.info(
-                        "KT fallback: layer %d compute = %.2f ms",
+                        "KT fallback: layer %d compute = %.2f ms%s",
                         self.kt_config.layer_idx,
                         compute_time,
+                        " (prefetched)" if used_prefetch else "",
                     )
+
+            # Step 3: Submit prefetch for next layer (if available)
+            # This runs in parallel with the next layer's Attention computation
+            next_method = prefetch_mgr.get_next_layer_method(self.kt_config.layer_idx)
+            if next_method is not None and next_method._cached_layer_module is not None:
+                # Next layer's module is cached from a previous forward pass
+                # Submit prefetch (non-blocking, runs on prefetch_stream)
+                self._submit_next_layer_prefetch(
+                    prefetch_mgr, next_method, next_method._cached_layer_module
+                )
 
             return result
 
@@ -2608,3 +3160,45 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
+
+    def _submit_next_layer_prefetch(
+        self,
+        prefetch_mgr: "GlobalPrefetchManager",
+        next_method: "KTEPWrapperMethod",
+        next_layer: torch.nn.Module,
+    ) -> None:
+        """Submit prefetch for the next layer's weights (non-blocking).
+
+        This method queues weight loading for the next layer on prefetch_stream,
+        allowing it to run in parallel with the next layer's Attention computation.
+
+        Args:
+            prefetch_mgr: The global prefetch manager
+            next_method: The next layer's KTEPWrapperMethod
+            next_layer: The next layer's MoE module (passed by forward())
+        """
+        global _SHARED_FULL_CONTEXT
+
+        if _SHARED_FULL_CONTEXT is None:
+            # SharedFullContext not initialized yet, can't prefetch
+            logger.warning(
+                "[KTEPWrapperMethod] Cannot prefetch: SharedFullContext not initialized"
+            )
+            return
+
+        # Start prefetch state tracking
+        prefetch_state = prefetch_mgr.start_prefetch(next_method.kt_config.layer_idx)
+
+        # Submit async load for next layer
+        _SHARED_FULL_CONTEXT.load_async(
+            layer_idx=next_method.kt_config.layer_idx,
+            wrapper=next_method.wrapper,
+            original_layer=next_layer,
+            gpu_experts_mask=next_method.gpu_experts_mask,
+            logical_to_gpu_index=next_method.logical_to_gpu_index,
+            prefetch_stream=prefetch_state.prefetch_stream,
+            sync_event=prefetch_state.sync_event,
+        )
+
+        # Mark prefetch as submitted (event will be set when complete)
+        prefetch_mgr.complete_prefetch()
