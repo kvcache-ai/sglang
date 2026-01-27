@@ -66,7 +66,7 @@ except ImportError:
     activations.PytorchGELUTanh = GELUTanh
     PytorchGELUTanh = GELUTanh
 from transformers import PretrainedConfig
-
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.managers.schedule_batch import (
@@ -770,6 +770,15 @@ class KimiK25ForConditionalGeneration(nn.Module):
         )
 
         return hidden_states
+    
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+      # 将调用委托给内部的语言模型配置
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.n_routed_experts,
+            num_groups=config.text_config.n_group,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""

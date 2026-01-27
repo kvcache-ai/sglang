@@ -2018,6 +2018,9 @@ def get_compiler_backend(mode=None) -> str:
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
 
+def supports_custom_op() -> bool:
+    return hasattr(torch.library, "custom_op")
+
 
 def direct_register_custom_op(
     op_name: str,

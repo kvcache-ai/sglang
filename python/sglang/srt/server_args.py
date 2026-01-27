@@ -25,7 +25,7 @@ import os
 import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
-
+import orjson
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -64,7 +64,7 @@ from sglang.srt.utils.common import (
     wait_port_available,
     xpu_has_xmx_support,
 )
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -524,6 +524,7 @@ class ServerArgs:
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
+    kt_gpu_prefill_token_threshold: Optional[int] = None
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -4025,6 +4026,12 @@ class ServerArgs:
             default=ServerArgs.kt_max_deferred_experts_per_token,
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
+        parser.add_argument(
+            "--kt-gpu-prefill-token-threshold",
+            type=int,
+            default=ServerArgs.kt_gpu_prefill_token_threshold,
+            help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
+        )
 
         # Diffusion LLM
         parser.add_argument(
@@ -4735,6 +4742,17 @@ class ServerArgs:
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
+
+    def get_hf_config(self):
+        kwargs = {}
+        hf_config = get_config(
+            self.model_path,
+            trust_remote_code=self.trust_remote_code,
+            revision=self.revision,
+            model_override_args=orjson.loads(self.json_model_override_args),
+            **kwargs,
+        )
+        return hf_config
 
     def get_model_config(self):
         # Lazy init to avoid circular import
