@@ -145,19 +145,11 @@ def get_or_create_shared_staging_buffer(
 
 
 class GPUSyncState:
-    """Cross-process GPU synchronization state using CUDA IPC.
+    """Cross-process GPU synchronization state using NCCL barrier.
 
-    This class manages GPU-based synchronization for cross-process weight loading,
-    replacing CPU-based dist.barrier() with GPU stream operations.
-
-    The synchronization flow:
-    1. Rank 0 completes H2D transfer for expert e
-    2. Rank 0 signals completion by writing to sync_flags[e] on GPU stream
-    3. Other ranks' GPU streams wait for sync_flags[e] to be set
-    4. Other ranks proceed with their H2D transfer
-
-    This allows Python threads to remain unblocked while synchronization
-    happens on the GPU side.
+    This class manages synchronization between ranks using NCCL allreduce
+    as a barrier. This is simpler and more portable than using low-level
+    CUDA stream memory operations (cudaStreamWaitValue32).
     """
 
     def __init__(
@@ -175,105 +167,54 @@ class GPUSyncState:
             tp_world_size: Total number of tensor parallel ranks
             device: CUDA device for the sync buffer
         """
-        from sglang.srt.distributed.device_communicators.cuda_wrapper import (
-            CudaRTLibrary,
-            cudaIpcMemHandle_t,
-            cudaStreamWaitValueEq,
-        )
-
         self.num_experts = num_experts
         self.tp_rank = tp_rank
         self.tp_world_size = tp_world_size
         self.device = device
-        self.cudart = CudaRTLibrary()
-        self._wait_flags = cudaStreamWaitValueEq
 
-        # Rank 0 creates the sync buffer and shares via IPC
-        if tp_rank == 0:
-            # Use int32 for 4-byte aligned access required by cudaStreamWaitValue32
-            self.sync_flags = torch.zeros(
-                num_experts, dtype=torch.int32, device=device
-            )
-            self.ipc_handle = self.cudart.cudaIpcGetMemHandle(
-                self.sync_flags.data_ptr()
-            )
-            logger.info(
-                f"[GPUSyncState] Rank 0 created sync buffer: {num_experts} flags"
-            )
-        else:
-            self.sync_flags = None
-            self.ipc_handle = None
+        # Dummy tensor for NCCL barrier (small 1-element tensor)
+        self._barrier_tensor = torch.zeros(1, dtype=torch.float32, device=device)
 
-        # Broadcast IPC handle from rank 0 to all ranks
-        if dist.is_initialized() and tp_world_size > 1:
-            handles = [self.ipc_handle]
-            dist.broadcast_object_list(handles, src=0, group=get_tp_group().device_group)
-            self.ipc_handle = handles[0]
+        logger.info(
+            f"[GPUSyncState] Rank {tp_rank}/{tp_world_size} initialized with NCCL barrier"
+        )
 
-            # Non-rank-0 opens the shared memory
-            if tp_rank != 0:
-                dev_ptr = self.cudart.cudaIpcOpenMemHandle(self.ipc_handle)
-                # Wrap the pointer as a tensor for easier access
-                # Note: This creates a view into rank 0's GPU memory
-                self.sync_flags = torch.as_strided(
-                    torch.zeros(1, dtype=torch.int32, device=device),
-                    (num_experts,),
-                    (1,),
-                    storage_offset=0,
-                )
-                # Replace underlying storage with IPC memory
-                self._ipc_ptr = dev_ptr.value
-                logger.info(
-                    f"[GPUSyncState] Rank {tp_rank} opened IPC handle"
-                )
+    def barrier(self) -> None:
+        """Synchronize all ranks using NCCL allreduce.
+
+        This is a blocking barrier that ensures all ranks have reached
+        this point before any rank continues.
+        """
+        if self.tp_world_size <= 1:
+            return
+
+        if dist.is_initialized():
+            # Use allreduce as barrier - all ranks must participate
+            dist.all_reduce(
+                self._barrier_tensor,
+                op=dist.ReduceOp.SUM,
+                group=get_tp_group().device_group,
+            )
 
     def signal_done(self, expert_id: int, stream: torch.cuda.Stream) -> None:
-        """Signal that expert_id's H2D transfer is complete (rank 0 only).
+        """Signal that expert_id's H2D transfer is complete.
 
-        Args:
-            expert_id: Expert index that completed
-            stream: CUDA stream to record the signal on
+        Note: With NCCL barrier approach, this is a no-op.
+        Use barrier() after all transfers are done instead.
         """
-        if self.tp_rank != 0:
-            return
-
-        # Write 1 to sync_flags[expert_id] on the stream
-        addr = self.sync_flags.data_ptr() + expert_id * 4  # int32 = 4 bytes
-        self.cudart.cudaStreamWriteValue32(
-            stream.cuda_stream,
-            addr,
-            1,  # Signal value
-            0,  # flags (reserved)
-        )
+        pass
 
     def wait_for_done(self, expert_id: int, stream: torch.cuda.Stream) -> None:
-        """Wait for expert_id's H2D transfer to complete (non-rank-0 only).
+        """Wait for expert_id's H2D transfer to complete.
 
-        Args:
-            expert_id: Expert index to wait for
-            stream: CUDA stream to wait on
+        Note: With NCCL barrier approach, this is a no-op.
+        Use barrier() after all transfers are done instead.
         """
-        if self.tp_rank == 0:
-            return
-
-        # Wait for sync_flags[expert_id] to become 1
-        addr = self._ipc_ptr + expert_id * 4  # int32 = 4 bytes
-        self.cudart.cudaStreamWaitValue32(
-            stream.cuda_stream,
-            addr,
-            1,  # Expected value
-            self._wait_flags,  # cudaStreamWaitValueEq
-        )
+        pass
 
     def reset(self, stream: torch.cuda.Stream) -> None:
-        """Reset all sync flags to 0 (call before starting a new load).
-
-        Args:
-            stream: CUDA stream to perform the reset on
-        """
-        if self.tp_rank == 0 and self.sync_flags is not None:
-            # Zero out all flags
-            self.sync_flags.zero_()
+        """Reset sync state (no-op with NCCL barrier approach)."""
+        pass
 
 
 def get_or_create_gpu_sync_state(
@@ -297,6 +238,23 @@ def get_or_create_gpu_sync_state(
             device=device,
         )
     return _GPU_SYNC_STATE
+
+
+def nccl_barrier(device: torch.device) -> None:
+    """Simple NCCL barrier using allreduce on a dummy tensor.
+
+    Args:
+        device: CUDA device
+    """
+    if not dist.is_initialized():
+        return
+
+    tp_group = get_tp_group()
+    if tp_group is None or tp_group.world_size <= 1:
+        return
+
+    dummy = torch.zeros(1, dtype=torch.float32, device=device)
+    dist.all_reduce(dummy, op=dist.ReduceOp.SUM, group=tp_group.device_group)
 
 
 @dataclass
@@ -875,8 +833,6 @@ class SharedFullContext:
 
         # Get or create GPU sync state for cross-process synchronization
         gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
-        if gpu_sync is not None:
-            gpu_sync.reset(copy_stream)
 
         for e in range(num_experts):
             # Sync write for expert e, submit write for expert e+1
@@ -885,20 +841,18 @@ class SharedFullContext:
                 if e + 1 < num_experts:
                     submit_write_expert(e + 1)
 
-            # Replace CPU barrier with GPU stream synchronization
-            # This allows Python to remain unblocked while sync happens on GPU
+            # Per-expert sync using NCCL barrier (replaces cudaStreamWaitValue32)
             with torch.cuda.stream(copy_stream):
                 slot = e % 2  # Double buffering
                 if tp_rank == 0:
-                    # Rank 0: H2D first, then signal completion
+                    # Rank 0: H2D first
                     for cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                    if gpu_sync is not None:
-                        gpu_sync.signal_done(e, copy_stream)
-                else:
-                    # Other ranks: wait for signal, then H2D
-                    if gpu_sync is not None:
-                        gpu_sync.wait_for_done(e, copy_stream)
+                # NCCL barrier to sync all ranks (runs on copy_stream)
+                if gpu_sync is not None:
+                    gpu_sync.barrier()
+                if tp_rank != 0:
+                    # Other ranks: H2D after barrier
                     for cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[e].record(copy_stream)
@@ -1050,8 +1004,6 @@ class SharedFullContext:
 
         # Get or create GPU sync state for cross-process synchronization
         gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
-        if gpu_sync is not None:
-            gpu_sync.reset(copy_stream)
 
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
@@ -1066,19 +1018,17 @@ class SharedFullContext:
                         events[idx - 1].synchronize()
                     submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
-            # Replace CPU barrier with GPU stream synchronization
-            # This allows Python to remain unblocked while sync happens on GPU
+            # Per-expert sync using NCCL barrier (replaces cudaStreamWaitValue32)
             with torch.cuda.stream(copy_stream):
                 if tp_rank == 0:
-                    # Rank 0: H2D first, then signal completion
+                    # Rank 0: H2D first
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                    if gpu_sync is not None:
-                        gpu_sync.signal_done(idx, copy_stream)
-                else:
-                    # Other ranks: wait for signal, then H2D
-                    if gpu_sync is not None:
-                        gpu_sync.wait_for_done(idx, copy_stream)
+                # NCCL barrier to sync all ranks (runs on copy_stream)
+                if gpu_sync is not None:
+                    gpu_sync.barrier()
+                if tp_rank != 0:
+                    # Other ranks: H2D after barrier
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[idx].record(copy_stream)
@@ -1235,8 +1185,6 @@ class SharedFullContext:
 
         # Get or create GPU sync state for cross-process synchronization
         gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
-        if gpu_sync is not None:
-            gpu_sync.reset(copy_stream)
 
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
@@ -1251,19 +1199,17 @@ class SharedFullContext:
                         events[idx - 1].synchronize()
                     submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
-            # Replace CPU barrier with GPU stream synchronization
-            # This allows Python to remain unblocked while sync happens on GPU
+            # Per-expert sync using NCCL barrier (replaces cudaStreamWaitValue32)
             with torch.cuda.stream(copy_stream):
                 if tp_rank == 0:
-                    # Rank 0: H2D first, then signal completion
+                    # Rank 0: H2D first
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                    if gpu_sync is not None:
-                        gpu_sync.signal_done(idx, copy_stream)
-                else:
-                    # Other ranks: wait for signal, then H2D
-                    if gpu_sync is not None:
-                        gpu_sync.wait_for_done(idx, copy_stream)
+                # NCCL barrier to sync all ranks (runs on copy_stream)
+                if gpu_sync is not None:
+                    gpu_sync.barrier()
+                if tp_rank != 0:
+                    # Other ranks: H2D after barrier
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[idx].record(copy_stream)
@@ -1400,8 +1346,6 @@ class SharedFullContext:
 
         # Get or create GPU sync state for cross-process synchronization
         gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
-        if gpu_sync is not None:
-            gpu_sync.reset(copy_stream)
 
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
@@ -1416,19 +1360,17 @@ class SharedFullContext:
                         events[idx - 1].synchronize()
                     submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
-            # Replace CPU barrier with GPU stream synchronization
-            # This allows Python to remain unblocked while sync happens on GPU
+            # Per-expert sync using NCCL barrier (replaces cudaStreamWaitValue32)
             with torch.cuda.stream(copy_stream):
                 if tp_rank == 0:
-                    # Rank 0: H2D first, then signal completion
+                    # Rank 0: H2D first
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                    if gpu_sync is not None:
-                        gpu_sync.signal_done(idx, copy_stream)
-                else:
-                    # Other ranks: wait for signal, then H2D
-                    if gpu_sync is not None:
-                        gpu_sync.wait_for_done(idx, copy_stream)
+                # NCCL barrier to sync all ranks (runs on copy_stream)
+                if gpu_sync is not None:
+                    gpu_sync.barrier()
+                if tp_rank != 0:
+                    # Other ranks: H2D after barrier
                     for _, cpu_buf, gpu_t in weight_infos:
                         gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[idx].record(copy_stream)
@@ -1551,8 +1493,6 @@ class SharedFullContext:
 
                 # Get GPU sync state for cross-process synchronization
                 gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
-                if gpu_sync is not None:
-                    gpu_sync.reset(prefetch_stream)
 
                 for idx, e in enumerate(cpu_expert_ids):
                     slot = idx % 2
@@ -1563,15 +1503,14 @@ class SharedFullContext:
                         # Wait for CPU write to complete (queued via cudaLaunchHostFunc)
                         wrapper.sync_write_weight_scale_to_buffer_async(prefetch_stream.cuda_stream)
 
-                    # H2D copy (queued on prefetch_stream)
+                    # Per-expert sync using NCCL barrier
                     if tp_rank == 0:
                         for _, cpu_buf, gpu_t in weight_infos:
                             gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                        if gpu_sync is not None:
-                            gpu_sync.signal_done(idx, prefetch_stream)
-                    else:
-                        if gpu_sync is not None:
-                            gpu_sync.wait_for_done(idx, prefetch_stream)
+                    # NCCL barrier (runs on prefetch_stream)
+                    if gpu_sync is not None:
+                        gpu_sync.barrier()
+                    if tp_rank != 0:
                         for _, cpu_buf, gpu_t in weight_infos:
                             gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
 
@@ -1660,8 +1599,6 @@ class SharedFullContext:
                         )
 
                 gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
-                if gpu_sync is not None:
-                    gpu_sync.reset(prefetch_stream)
 
                 for idx, e in enumerate(cpu_expert_ids):
                     slot = idx % 2
@@ -1670,14 +1607,14 @@ class SharedFullContext:
                         submit_write_expert_async(e, slot)
                         wrapper.sync_write_weight_scale_to_buffer_async(prefetch_stream.cuda_stream)
 
+                    # Per-expert sync using NCCL barrier
                     if tp_rank == 0:
                         for _, cpu_buf, gpu_t in weight_infos:
                             gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                        if gpu_sync is not None:
-                            gpu_sync.signal_done(idx, prefetch_stream)
-                    else:
-                        if gpu_sync is not None:
-                            gpu_sync.wait_for_done(idx, prefetch_stream)
+                    # NCCL barrier (runs on prefetch_stream)
+                    if gpu_sync is not None:
+                        gpu_sync.barrier()
+                    if tp_rank != 0:
                         for _, cpu_buf, gpu_t in weight_infos:
                             gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
 
@@ -1756,8 +1693,6 @@ class SharedFullContext:
                         )
 
                 gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
-                if gpu_sync is not None:
-                    gpu_sync.reset(prefetch_stream)
 
                 for idx, e in enumerate(cpu_expert_ids):
                     slot = idx % 2
@@ -1766,14 +1701,14 @@ class SharedFullContext:
                         submit_write_expert_async(e, slot)
                         wrapper.sync_write_weight_scale_to_buffer_async(prefetch_stream.cuda_stream)
 
+                    # Per-expert sync using NCCL barrier
                     if tp_rank == 0:
                         for _, cpu_buf, gpu_t in weight_infos:
                             gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
-                        if gpu_sync is not None:
-                            gpu_sync.signal_done(idx, prefetch_stream)
-                    else:
-                        if gpu_sync is not None:
-                            gpu_sync.wait_for_done(idx, prefetch_stream)
+                    # NCCL barrier (runs on prefetch_stream)
+                    if gpu_sync is not None:
+                        gpu_sync.barrier()
+                    if tp_rank != 0:
                         for _, cpu_buf, gpu_t in weight_infos:
                             gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
 
