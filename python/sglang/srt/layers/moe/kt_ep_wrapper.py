@@ -629,7 +629,6 @@ class SharedFullContext:
         for name, buf in self.original_buffers.items():
             self.gpu_layer.register_buffer(name, buf)
 
-
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -772,11 +771,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             params_dtype: Data type for parameters
             **extra_weight_attrs: Additional weight attributes
         """
-        if self.kt_config.layer_idx == 0:
-            print(f"[KT DEBUG] Layer {self.kt_config.layer_idx}: "
-            f"total_experts={num_experts}, gpu_experts={self.num_gpu_experts}, "
-            f"cpu_experts={num_experts - self.num_gpu_experts}")
-        
+
         self.global_num_experts = num_experts
         self._full_init_args = (
             hidden_size,
@@ -973,17 +968,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
         topk_ids = topk_output.topk_ids
         masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
-        
-        if self.kt_config.layer_idx == 0:
-            unique_ids = topk_ids.flatten().unique().sort().values
-            gpu_ids = unique_ids[unique_ids < self.num_gpu_experts]
-            cpu_ids = unique_ids[unique_ids >= self.num_gpu_experts]
-            print(f"\n[KT DEBUG] ===== Layer 0 Expert Assignment =====")
-            print(f"  num_tokens: {x.shape[0]}")
-            print(f"  num_gpu_experts: {self.num_gpu_experts}")
-            print(f"  GPU expert IDs selected: {gpu_ids.tolist()}")
-            print(f"  CPU expert IDs selected: {cpu_ids.tolist()}")
-            print(f"  Total unique experts: {len(unique_ids)}")
 
         # Create modified dispatch output for GPU computation
         masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
