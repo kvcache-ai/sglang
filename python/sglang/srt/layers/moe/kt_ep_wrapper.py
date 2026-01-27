@@ -86,6 +86,7 @@ class KTConfig:
 
 _SHARED_FULL_CONTEXT = None
 _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
+_GPU_SYNC_STATE = None  # Global GPU sync state for cross-process synchronization
 
 
 class SharedStagingBuffer:
@@ -141,6 +142,161 @@ def get_or_create_shared_staging_buffer(
             device=device,
         )
     return _SHARED_STAGING_BUFFER
+
+
+class GPUSyncState:
+    """Cross-process GPU synchronization state using CUDA IPC.
+
+    This class manages GPU-based synchronization for cross-process weight loading,
+    replacing CPU-based dist.barrier() with GPU stream operations.
+
+    The synchronization flow:
+    1. Rank 0 completes H2D transfer for expert e
+    2. Rank 0 signals completion by writing to sync_flags[e] on GPU stream
+    3. Other ranks' GPU streams wait for sync_flags[e] to be set
+    4. Other ranks proceed with their H2D transfer
+
+    This allows Python threads to remain unblocked while synchronization
+    happens on the GPU side.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        tp_rank: int,
+        tp_world_size: int,
+        device: torch.device,
+    ):
+        """Initialize GPU sync state.
+
+        Args:
+            num_experts: Number of experts to synchronize
+            tp_rank: Current tensor parallel rank
+            tp_world_size: Total number of tensor parallel ranks
+            device: CUDA device for the sync buffer
+        """
+        from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+            CudaRTLibrary,
+            cudaIpcMemHandle_t,
+            cudaStreamWaitValueEq,
+        )
+
+        self.num_experts = num_experts
+        self.tp_rank = tp_rank
+        self.tp_world_size = tp_world_size
+        self.device = device
+        self.cudart = CudaRTLibrary()
+        self._wait_flags = cudaStreamWaitValueEq
+
+        # Rank 0 creates the sync buffer and shares via IPC
+        if tp_rank == 0:
+            # Use int32 for 4-byte aligned access required by cudaStreamWaitValue32
+            self.sync_flags = torch.zeros(
+                num_experts, dtype=torch.int32, device=device
+            )
+            self.ipc_handle = self.cudart.cudaIpcGetMemHandle(
+                self.sync_flags.data_ptr()
+            )
+            logger.info(
+                f"[GPUSyncState] Rank 0 created sync buffer: {num_experts} flags"
+            )
+        else:
+            self.sync_flags = None
+            self.ipc_handle = None
+
+        # Broadcast IPC handle from rank 0 to all ranks
+        if dist.is_initialized() and tp_world_size > 1:
+            handles = [self.ipc_handle]
+            dist.broadcast_object_list(handles, src=0, group=get_tp_group().device_group)
+            self.ipc_handle = handles[0]
+
+            # Non-rank-0 opens the shared memory
+            if tp_rank != 0:
+                dev_ptr = self.cudart.cudaIpcOpenMemHandle(self.ipc_handle)
+                # Wrap the pointer as a tensor for easier access
+                # Note: This creates a view into rank 0's GPU memory
+                self.sync_flags = torch.as_strided(
+                    torch.zeros(1, dtype=torch.int32, device=device),
+                    (num_experts,),
+                    (1,),
+                    storage_offset=0,
+                )
+                # Replace underlying storage with IPC memory
+                self._ipc_ptr = dev_ptr.value
+                logger.info(
+                    f"[GPUSyncState] Rank {tp_rank} opened IPC handle"
+                )
+
+    def signal_done(self, expert_id: int, stream: torch.cuda.Stream) -> None:
+        """Signal that expert_id's H2D transfer is complete (rank 0 only).
+
+        Args:
+            expert_id: Expert index that completed
+            stream: CUDA stream to record the signal on
+        """
+        if self.tp_rank != 0:
+            return
+
+        # Write 1 to sync_flags[expert_id] on the stream
+        addr = self.sync_flags.data_ptr() + expert_id * 4  # int32 = 4 bytes
+        self.cudart.cudaStreamWriteValue32(
+            stream.cuda_stream,
+            addr,
+            1,  # Signal value
+            0,  # flags (reserved)
+        )
+
+    def wait_for_done(self, expert_id: int, stream: torch.cuda.Stream) -> None:
+        """Wait for expert_id's H2D transfer to complete (non-rank-0 only).
+
+        Args:
+            expert_id: Expert index to wait for
+            stream: CUDA stream to wait on
+        """
+        if self.tp_rank == 0:
+            return
+
+        # Wait for sync_flags[expert_id] to become 1
+        addr = self._ipc_ptr + expert_id * 4  # int32 = 4 bytes
+        self.cudart.cudaStreamWaitValue32(
+            stream.cuda_stream,
+            addr,
+            1,  # Expected value
+            self._wait_flags,  # cudaStreamWaitValueEq
+        )
+
+    def reset(self, stream: torch.cuda.Stream) -> None:
+        """Reset all sync flags to 0 (call before starting a new load).
+
+        Args:
+            stream: CUDA stream to perform the reset on
+        """
+        if self.tp_rank == 0 and self.sync_flags is not None:
+            # Zero out all flags
+            self.sync_flags.zero_()
+
+
+def get_or_create_gpu_sync_state(
+    num_experts: int,
+    tp_rank: int,
+    tp_world_size: int,
+    device: torch.device,
+) -> Optional["GPUSyncState"]:
+    """Get or create the global GPU sync state."""
+    global _GPU_SYNC_STATE
+
+    # Only create if we have multiple ranks
+    if tp_world_size <= 1:
+        return None
+
+    if _GPU_SYNC_STATE is None:
+        _GPU_SYNC_STATE = GPUSyncState(
+            num_experts=num_experts,
+            tp_rank=tp_rank,
+            tp_world_size=tp_world_size,
+            device=device,
+        )
+    return _GPU_SYNC_STATE
 
 
 class SharedFullContext:
@@ -590,6 +746,11 @@ class SharedFullContext:
             # Submit expert 0 ahead of time
             submit_write_expert(0)
 
+        # Get or create GPU sync state for cross-process synchronization
+        gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
+        if gpu_sync is not None:
+            gpu_sync.reset(copy_stream)
+
         for e in range(num_experts):
             # Sync write for expert e, submit write for expert e+1
             if do_write:
@@ -597,14 +758,22 @@ class SharedFullContext:
                 if e + 1 < num_experts:
                     submit_write_expert(e + 1)
 
-            # Barrier to ensure all ranks see the written data
-            if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
-
+            # Replace CPU barrier with GPU stream synchronization
+            # This allows Python to remain unblocked while sync happens on GPU
             with torch.cuda.stream(copy_stream):
                 slot = e % 2  # Double buffering
-                for cpu_buf, gpu_t in weight_infos:
-                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                if tp_rank == 0:
+                    # Rank 0: H2D first, then signal completion
+                    for cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                    if gpu_sync is not None:
+                        gpu_sync.signal_done(e, copy_stream)
+                else:
+                    # Other ranks: wait for signal, then H2D
+                    if gpu_sync is not None:
+                        gpu_sync.wait_for_done(e, copy_stream)
+                    for cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[e].record(copy_stream)
 
             if e > 0:
@@ -752,6 +921,11 @@ class SharedFullContext:
             # Submit first CPU expert ahead of time
             submit_write_expert(cpu_expert_ids[0], 0)
 
+        # Get or create GPU sync state for cross-process synchronization
+        gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
+        if gpu_sync is not None:
+            gpu_sync.reset(copy_stream)
+
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
 
@@ -765,13 +939,21 @@ class SharedFullContext:
                         events[idx - 1].synchronize()
                     submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
-            # Barrier to ensure all ranks see the written data
-            if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
-
+            # Replace CPU barrier with GPU stream synchronization
+            # This allows Python to remain unblocked while sync happens on GPU
             with torch.cuda.stream(copy_stream):
-                for _, cpu_buf, gpu_t in weight_infos:
-                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                if tp_rank == 0:
+                    # Rank 0: H2D first, then signal completion
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                    if gpu_sync is not None:
+                        gpu_sync.signal_done(idx, copy_stream)
+                else:
+                    # Other ranks: wait for signal, then H2D
+                    if gpu_sync is not None:
+                        gpu_sync.wait_for_done(idx, copy_stream)
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[idx].record(copy_stream)
 
             # Postprocess expert idx-1: provides pipeline structure for future extensions
@@ -924,6 +1106,11 @@ class SharedFullContext:
             # Submit first CPU expert ahead of time
             submit_write_expert(cpu_expert_ids[0], 0)
 
+        # Get or create GPU sync state for cross-process synchronization
+        gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
+        if gpu_sync is not None:
+            gpu_sync.reset(copy_stream)
+
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
 
@@ -937,13 +1124,21 @@ class SharedFullContext:
                         events[idx - 1].synchronize()
                     submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
-            # Barrier to ensure all ranks see the written data
-            if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
-
+            # Replace CPU barrier with GPU stream synchronization
+            # This allows Python to remain unblocked while sync happens on GPU
             with torch.cuda.stream(copy_stream):
-                for _, cpu_buf, gpu_t in weight_infos:
-                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                if tp_rank == 0:
+                    # Rank 0: H2D first, then signal completion
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                    if gpu_sync is not None:
+                        gpu_sync.signal_done(idx, copy_stream)
+                else:
+                    # Other ranks: wait for signal, then H2D
+                    if gpu_sync is not None:
+                        gpu_sync.wait_for_done(idx, copy_stream)
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[idx].record(copy_stream)
 
             # Postprocess expert idx-1: provides pipeline structure for future extensions
@@ -1076,6 +1271,11 @@ class SharedFullContext:
             # Submit first CPU expert ahead of time
             submit_write_expert(cpu_expert_ids[0], 0)
 
+        # Get or create GPU sync state for cross-process synchronization
+        gpu_sync = get_or_create_gpu_sync_state(num_experts, tp_rank, tp_world_size, device)
+        if gpu_sync is not None:
+            gpu_sync.reset(copy_stream)
+
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
 
@@ -1089,13 +1289,21 @@ class SharedFullContext:
                         events[idx - 1].synchronize()
                     submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
-            # Barrier to ensure all ranks see the written data
-            if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
-
+            # Replace CPU barrier with GPU stream synchronization
+            # This allows Python to remain unblocked while sync happens on GPU
             with torch.cuda.stream(copy_stream):
-                for _, cpu_buf, gpu_t in weight_infos:
-                    gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                if tp_rank == 0:
+                    # Rank 0: H2D first, then signal completion
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                    if gpu_sync is not None:
+                        gpu_sync.signal_done(idx, copy_stream)
+                else:
+                    # Other ranks: wait for signal, then H2D
+                    if gpu_sync is not None:
+                        gpu_sync.wait_for_done(idx, copy_stream)
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
                 events[idx].record(copy_stream)
 
             # Postprocess expert idx-1: provides pipeline structure for future extensions

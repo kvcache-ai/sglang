@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 cudaError_t = ctypes.c_int
 cudaMemcpyKind = ctypes.c_int
+cudaStream_t = ctypes.c_void_p
+
+# cudaStreamWaitValue flags (CUDA 12+)
+cudaStreamWaitValueGeq = 0x0  # Wait until (value >= target)
+cudaStreamWaitValueEq = 0x1   # Wait until (value == target)
+cudaStreamWaitValueAnd = 0x2  # Wait until (value & target) != 0
+cudaStreamWaitValueNOr = 0x3  # Wait until ~(value | target) != 0
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
@@ -100,6 +107,20 @@ class CudaRTLibrary:
             "cudaIpcOpenMemHandle",
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
+        ),
+        # cudaError_t cudaStreamWaitValue32 ( cudaStream_t stream, unsigned int* addr, unsigned int value, unsigned int flags ) # noqa
+        # CUDA 12+ required
+        Function(
+            "cudaStreamWaitValue32",
+            cudaError_t,
+            [cudaStream_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint],
+        ),
+        # cudaError_t cudaStreamWriteValue32 ( cudaStream_t stream, unsigned int* addr, unsigned int value, unsigned int flags ) # noqa
+        # CUDA 12+ required
+        Function(
+            "cudaStreamWriteValue32",
+            cudaError_t,
+            [cudaStream_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint],
         ),
     ]
 
@@ -181,3 +202,65 @@ class CudaRTLibrary:
             )
         )
         return devPtr
+
+    def cudaStreamWaitValue32(
+        self,
+        stream: int,
+        addr: int,
+        value: int,
+        flags: int = cudaStreamWaitValueEq,
+    ) -> None:
+        """Make stream wait until *addr == value (or other comparison based on flags).
+
+        This is a GPU-side synchronization primitive. The stream will block until
+        the memory location pointed to by addr contains the specified value.
+
+        Args:
+            stream: CUDA stream handle (from torch.cuda.Stream.cuda_stream)
+            addr: Device memory address to watch (must be 4-byte aligned)
+            value: Value to wait for
+            flags: Comparison type (default: cudaStreamWaitValueEq)
+                   - cudaStreamWaitValueGeq (0x0): wait until *addr >= value
+                   - cudaStreamWaitValueEq (0x1): wait until *addr == value
+                   - cudaStreamWaitValueAnd (0x2): wait until (*addr & value) != 0
+                   - cudaStreamWaitValueNOr (0x3): wait until ~(*addr | value) != 0
+
+        Note: Requires CUDA 12+
+        """
+        self.CUDART_CHECK(
+            self.funcs["cudaStreamWaitValue32"](
+                ctypes.c_void_p(stream),
+                ctypes.c_void_p(addr),
+                ctypes.c_uint(value),
+                ctypes.c_uint(flags),
+            )
+        )
+
+    def cudaStreamWriteValue32(
+        self,
+        stream: int,
+        addr: int,
+        value: int,
+        flags: int = 0,
+    ) -> None:
+        """Write a 32-bit value to device memory when stream reaches this point.
+
+        This is a GPU-side write operation. When the stream reaches this operation,
+        it will write the specified value to the memory location.
+
+        Args:
+            stream: CUDA stream handle (from torch.cuda.Stream.cuda_stream)
+            addr: Device memory address to write to (must be 4-byte aligned)
+            value: Value to write
+            flags: Reserved, should be 0
+
+        Note: Requires CUDA 12+
+        """
+        self.CUDART_CHECK(
+            self.funcs["cudaStreamWriteValue32"](
+                ctypes.c_void_p(stream),
+                ctypes.c_void_p(addr),
+                ctypes.c_uint(value),
+                ctypes.c_uint(flags),
+            )
+        )
