@@ -150,7 +150,7 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
 class KimiK2Detector(BaseReasoningFormatDetector):
     """
     Detector for Kimi K2 model.
-    
+
     It uses the DeepSeek-R1 reasoning format: (<think>)*(.*)</think>.
     Defaults to thinking mode (force_reasoning=True), but allows disabling it
     if the model is configured to not think.
@@ -325,7 +325,7 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
-        "kimi_k2": KimiK2Detector,
+        "kimi_k2": Qwen3Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
