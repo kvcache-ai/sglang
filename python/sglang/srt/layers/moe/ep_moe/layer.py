@@ -24,9 +24,9 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
-    NPUCompressedTensorsW4A16Int4DynamicMoEMethod,
-)
+#from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+#    NPUCompressedTensorsW4A16Int4DynamicMoEMethod,
+#)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
@@ -372,6 +372,7 @@ class DeepEPMoE(FusedMoE):
                     self, hidden_states, group_list_type, group_list, output_dtype
                 )
             else:
+                """
                 input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
                 if not input_quant and not isinstance(
                     self.quant_method, NPUCompressedTensorsW4A16Int4DynamicMoEMethod
@@ -387,6 +388,7 @@ class DeepEPMoE(FusedMoE):
                     group_list,
                     output_dtype,
                 )
+                """
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPLLDispatchOutput)
