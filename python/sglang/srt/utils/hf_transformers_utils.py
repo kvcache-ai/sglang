@@ -44,6 +44,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs import (
+    AfmoeConfig,
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
@@ -55,6 +56,7 @@ from sglang.srt.configs import (
     JetVLMConfig,
     KimiLinearConfig,
     KimiVLConfig,
+    KimiK25Config,
     LongcatFlashConfig,
     MultiModalityConfig,
     NemotronH_Nano_VL_V2_Config,
@@ -62,7 +64,9 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3NextConfig,
     Step3VLConfig,
+
 )
+
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -71,6 +75,7 @@ from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
+    AfmoeConfig,
     ChatGLMConfig,
     DbrxConfig,
     ExaoneConfig,
@@ -91,6 +96,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DeepseekVLV2Config,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK25Config,
 ]
 
 _CONFIG_REGISTRY = {
