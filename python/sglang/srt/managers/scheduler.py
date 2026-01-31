@@ -1934,8 +1934,10 @@ class Scheduler(
                 and waited < self.min_prefill_timeout
             ):
                 return None
-            # Threshold met or timed out, proceed with prefill
-            self._first_waiting_since = None
+            # Threshold met or timed out, proceed with prefill.
+            # Do NOT reset _first_waiting_since here — if the prefill batch
+            # can only take a subset of waiting requests, the remaining ones
+            # should not have to wait again from scratch.
 
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
