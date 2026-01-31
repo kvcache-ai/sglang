@@ -1856,10 +1856,20 @@ class Scheduler(
 
         if new_batch is not None:
             # Run prefill first if possible
+            if self.min_prefill_tokens is not None:
+                logger.info(
+                    "[min_prefill] action=PREFILL, batch_size=%d, waiting_queue_remaining=%d, running_bs=%d",
+                    len(new_batch.reqs), len(self.waiting_queue), len(self.running_batch.reqs),
+                )
             ret = new_batch
         else:
             # Run decode
             if not self.running_batch.is_empty():
+                if self.min_prefill_tokens is not None:
+                    logger.info(
+                        "[min_prefill] action=DECODE, running_bs=%d, waiting_queue=%d",
+                        len(self.running_batch.reqs), len(self.waiting_queue),
+                    )
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -1914,7 +1924,14 @@ class Scheduler(
         if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and (
             not self.dllm_staging_reqs.non_empty() and self.chunked_req is None
         ):
+            if self.min_prefill_tokens is not None and len(self.waiting_queue) == 0 and self._first_waiting_since is not None:
+                logger.info("[min_prefill] waiting_queue drained, resetting timer")
             self._first_waiting_since = None
+            if self.min_prefill_tokens is not None:
+                logger.debug(
+                    "[min_prefill] early return None: batch_is_full=%s, waiting_queue=%d, running_bs=%d",
+                    self.running_batch.batch_is_full, len(self.waiting_queue), len(self.running_batch.reqs),
+                )
             return None
 
         # Gate: delay prefill until enough tokens accumulate in waiting queue
@@ -1933,11 +1950,16 @@ class Scheduler(
                 pending_tokens < self.min_prefill_tokens
                 and waited < self.min_prefill_timeout
             ):
+                logger.debug(
+                    "[min_prefill] delaying prefill: pending_tokens=%d < threshold=%d, waited=%.3fs, waiting_queue=%d",
+                    pending_tokens, self.min_prefill_tokens, waited, len(self.waiting_queue),
+                )
                 return None
-            # Threshold met or timed out, proceed with prefill.
-            # Do NOT reset _first_waiting_since here — if the prefill batch
-            # can only take a subset of waiting requests, the remaining ones
-            # should not have to wait again from scratch.
+            logger.info(
+                "[min_prefill] gate passed: pending_tokens=%d, threshold=%d, waited=%.3fs, waiting_queue=%d, reason=%s",
+                pending_tokens, self.min_prefill_tokens, waited, len(self.waiting_queue),
+                "tokens_reached" if pending_tokens >= self.min_prefill_tokens else "timeout",
+            )
 
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
@@ -1951,6 +1973,11 @@ class Scheduler(
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
+            if self.min_prefill_tokens is not None:
+                logger.info(
+                    "[min_prefill] no allocatable reqs: running_bs=%d, max_running=%d, waiting_queue=%d",
+                    running_bs, get_global_server_args().pp_max_micro_batch_size, len(self.waiting_queue),
+                )
             return None
 
         if self.enable_hierarchical_cache:
