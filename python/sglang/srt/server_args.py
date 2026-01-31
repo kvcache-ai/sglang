@@ -323,6 +323,8 @@ class ServerArgs:
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
+    min_prefill_tokens: Optional[int] = None
+    min_prefill_timeout: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
@@ -2866,6 +2868,21 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length.",
+        )
+        parser.add_argument(
+            "--min-prefill-tokens",
+            type=int,
+            default=ServerArgs.min_prefill_tokens,
+            help="Minimum total input tokens to accumulate in the waiting queue before starting a prefill batch. "
+            "When set, the scheduler delays prefill until the pending tokens reach this threshold or "
+            "the oldest request has waited longer than --min-prefill-timeout seconds. "
+            "Useful when prefill has a high fixed cost but low marginal cost per token.",
+        )
+        parser.add_argument(
+            "--min-prefill-timeout",
+            type=float,
+            default=ServerArgs.min_prefill_timeout,
+            help="Maximum time (in seconds) to wait for accumulating --min-prefill-tokens before forcing a prefill. Default: 1.0",
         )
         parser.add_argument(
             "--schedule-policy",

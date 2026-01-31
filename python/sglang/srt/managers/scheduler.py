@@ -747,6 +747,11 @@ class Scheduler(
             and self.server_args.enable_mixed_chunk
         )
 
+        # Min prefill tokens: delay prefill until enough tokens accumulate
+        self.min_prefill_tokens = self.server_args.min_prefill_tokens
+        self.min_prefill_timeout = self.server_args.min_prefill_timeout
+        self._first_waiting_since: Optional[float] = None
+
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
             self.server_args.enable_dynamic_chunking and self.pp_size > 1
@@ -1909,7 +1914,28 @@ class Scheduler(
         if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and (
             not self.dllm_staging_reqs.non_empty() and self.chunked_req is None
         ):
+            self._first_waiting_since = None
             return None
+
+        # Gate: delay prefill until enough tokens accumulate in waiting queue
+        if (
+            self.min_prefill_tokens is not None
+            and len(self.waiting_queue) > 0
+            and self.chunked_req is None
+        ):
+            pending_tokens = sum(
+                len(req.origin_input_ids) for req in self.waiting_queue
+            )
+            if self._first_waiting_since is None:
+                self._first_waiting_since = time.time()
+            waited = time.time() - self._first_waiting_since
+            if (
+                pending_tokens < self.min_prefill_tokens
+                and waited < self.min_prefill_timeout
+            ):
+                return None
+            # Threshold met or timed out, proceed with prefill
+            self._first_waiting_since = None
 
         running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
