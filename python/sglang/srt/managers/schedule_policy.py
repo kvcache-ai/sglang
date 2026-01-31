@@ -424,6 +424,16 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
+        logger.debug(
+            "[prefill_adder] INIT: rem_input_tokens=%d, rem_chunk_tokens=%s, "
+            "rem_total_tokens=%d, rem_total_token_offset=%d, "
+            "running_bs=%d, new_token_ratio=%.3f, CLIP_MAX_NEW_TOKENS=%d",
+            self.rem_input_tokens, self.rem_chunk_tokens,
+            self.rem_total_tokens, self.rem_total_token_offset,
+            len(running_batch.reqs) if running_batch else 0,
+            self.new_token_ratio, CLIP_MAX_NEW_TOKENS,
+        )
+
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
@@ -710,9 +720,19 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
+            logger.debug(
+                "[prefill_adder] REJECT NO_TOKEN: total_tokens=%d >= rem_total_tokens=%d "
+                "(extend_input=%d, clip_max_new=%d, batch_so_far=%d)",
+                total_tokens, self.rem_total_tokens,
+                req.extend_input_len, CLIP_MAX_NEW_TOKENS, len(self.can_run_list),
+            )
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            logger.debug(
+                "[prefill_adder] REJECT OTHER(input_budget): real_input_tokens=%d >= rem_input_tokens=%d, batch_so_far=%d",
+                real_input_tokens, self.rem_input_tokens, len(self.can_run_list),
+            )
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
