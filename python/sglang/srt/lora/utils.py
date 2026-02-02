@@ -98,7 +98,9 @@ def get_hidden_dim(
             # MoE router gate: input is hidden_size, output is num_experts
             return config.hidden_size, config.num_experts
         else:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                "get_hidden_dim not implemented for " + module_name
+            )
 
 
 def get_normalized_target_modules(
