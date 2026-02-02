@@ -743,5 +743,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if language_weights:
             self.language_model.load_weights(language_weights)
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return DeepseekV3ForCausalLM.get_model_config_for_expert_location(
+            config.text_config
+        )
+
 
 EntryClass = [KimiK25ForConditionalGeneration]
