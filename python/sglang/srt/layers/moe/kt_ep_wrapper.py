@@ -1310,13 +1310,13 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     if _KT_GPU_EXPERTS_MASKS is not None:
         return _KT_GPU_EXPERTS_MASKS
 
-    # Get model config
+    # Get model config (unwrap VL configs that nest the text model config)
     hf_config = server_args.get_hf_config()
-    
+
     # fix for kimi-k2.5 models where text_config holds the actual config
     if getattr(hf_config, "text_config", None) is not None:
         hf_config = hf_config.text_config
-    
+
     num_layers = getattr(hf_config, "num_hidden_layers", None)
     # Try different attribute names for num_experts
     num_experts = getattr(hf_config, "num_local_experts", None)
@@ -1534,8 +1534,10 @@ def create_kt_config_from_server_args(
     # Get mask for this specific layer
     gpu_experts_mask = masks[layer_idx]
 
-    # Get num_layers from model config
+    # Get num_layers from model config (unwrap VL configs)
     hf_config = server_args.get_hf_config()
+    if hasattr(hf_config, "text_config"):
+        hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
 
     return KTConfig(
