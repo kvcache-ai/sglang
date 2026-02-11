@@ -292,7 +292,11 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                    batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    seq_lens_cpu,
+                    logits_output.mm_input_embeds,
                 )
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -533,8 +537,8 @@ class EAGLEWorker(TpModelWorker):
         assert isinstance(spec_info, EagleDraftInput)
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_batch = self.topk
-        spec_info.num_tokens_for_logprob_per_batch = self.topk
+        spec_info.num_tokens_per_req = self.topk
+        spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
@@ -684,7 +688,7 @@ class EAGLEWorker(TpModelWorker):
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
-        spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
+        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -857,6 +861,7 @@ class EAGLEWorker(TpModelWorker):
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
+        mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -868,8 +873,8 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
@@ -881,6 +886,8 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
+        if mm_input_embeds is not None:
+            forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         if self.enable_nan_detection:
             detect_nan(logits_output)
@@ -916,8 +923,8 @@ class EAGLEWorker(TpModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+        batch.spec_info.num_tokens_for_logprob_per_req = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,
