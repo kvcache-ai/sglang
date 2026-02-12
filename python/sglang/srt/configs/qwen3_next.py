@@ -227,7 +227,8 @@ class Qwen3NextConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        if rope_scaling is not None:
+            self.rope_scaling = rope_scaling
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
