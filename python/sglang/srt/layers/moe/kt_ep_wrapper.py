@@ -50,6 +50,45 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+_kt_loader_patched = False
+
+
+def _patch_kt_loader_prefix(wrapper):
+    """Patch KT loader to handle 'model.language_model.' prefix transparently."""
+    global _kt_loader_patched
+    if _kt_loader_patched:
+        return
+    loader = getattr(wrapper, 'loader', None) or getattr(wrapper, 'safetensor_loader', None)
+    if loader is None:
+        return
+    tfm = getattr(loader, 'tensor_file_map', None)
+    if tfm is None:
+        return
+    # Check if checkpoint uses language_model prefix
+    if not any(k.startswith("model.language_model.") for k in list(tfm.keys())[:10]):
+        _kt_loader_patched = True
+        return
+
+    orig_load = loader.load_tensor
+    orig_has = loader.has_tensor
+
+    def _remap(key):
+        if key.startswith("model.layers."):
+            return "model.language_model." + key[len("model."):]
+        return key
+
+    def patched_load(key, device="cpu"):
+        return orig_load(_remap(key), device)
+
+    def patched_has(key):
+        return orig_has(_remap(key))
+
+    loader.load_tensor = patched_load
+    loader.has_tensor = patched_has
+    _kt_loader_patched = True
+    logger.info("Patched KT loader for language_model prefix")
+
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 
@@ -1991,6 +2030,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
             )
+            # Patch KT loader tensor_file_map for models with 'language_model' prefix
+            _patch_kt_loader_prefix(self.wrapper)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.

@@ -145,11 +145,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("in_proj_z", prefix),
         )
+        # in_proj_b and in_proj_a have small output_size (num_v_heads),
+        # which may not meet quantization alignment requirements.
+        # Skip quantization only for these narrow projections.
+        narrow_quant_config = (
+            None if self.num_v_heads < 128 else quant_config
+        )
         self.in_proj_b = ColumnParallelLinear(
             input_size=self.hidden_size,
             output_size=self.num_v_heads,
             bias=False,
-            quant_config=quant_config,
+            quant_config=narrow_quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("in_proj_b", prefix),
@@ -158,7 +164,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=self.num_v_heads,
             bias=False,
-            quant_config=quant_config,
+            quant_config=narrow_quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("in_proj_a", prefix),
