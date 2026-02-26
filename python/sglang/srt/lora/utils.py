@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 
@@ -70,10 +70,7 @@ def get_hidden_dim(
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        if module_name == "q_proj":
-            # For DeepSeek-V2 MLA and similar architectures where q_proj is not merged
-            return config.hidden_size, head_dim * config.num_attention_heads
-        elif module_name == "qkv_proj":
+        if module_name == "qkv_proj":
             return config.hidden_size, head_dim * (
                 config.num_attention_heads + config.num_key_value_heads * 2
             )
@@ -94,9 +91,6 @@ def get_hidden_dim(
             # For lm_head: input is hidden_size, output is vocab_size
             # if contain extra tokens will be added; otherwise is 0.
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
-        elif module_name == "gate":
-            # MoE router gate: input is hidden_size, output is num_experts
-            return config.hidden_size, config.num_experts
         else:
             raise NotImplementedError(
                 "get_hidden_dim not implemented for " + module_name
@@ -104,22 +98,24 @@ def get_hidden_dim(
 
 
 def get_normalized_target_modules(
-    target_modules: Iterable[str],
+    target_modules: Union[str, Iterable[str]],
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
 
-    For DeepSeek-V2/V3 MLA architecture, q_proj is kept separate (not merged into qkv_proj).
+    Also handles PEFT shorthand strings like "all-linear" or "all" by returning
+    {"all"} as a sentinel value (the caller should check for "all" and fall
+    back to the CLI --lora-target-modules to determine the concrete module set).
     """
-    # Check if this is DeepSeek-V2/V3 MLA architecture
-    target_modules_list = list(target_modules)
-    is_deepseek_mla = any(
-        "kv_a_proj_with_mqa" in name or "kv_b_proj" in name
-        for name in target_modules_list
-    )
+    # Handle PEFT shorthand strings — these cannot be resolved to concrete
+    # module names without inspecting the base model, so we return {"all"}
+    # and let the caller fall back to the CLI --lora-target-modules.
+    if isinstance(target_modules, str):
+        return {"all"}
 
     params_mapping = {
+        "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
@@ -130,14 +126,11 @@ def get_normalized_target_modules(
         "word_embeddings": "embed_tokens",
         "lm_head": "lm_head",
         "output": "lm_head",
+        "unembed_tokens": "lm_head",
     }
 
-    # For non-MLA architectures, q_proj should also be mapped to qkv_proj
-    if not is_deepseek_mla:
-        params_mapping["q_proj"] = "qkv_proj"
-
     result = set()
-    for name in target_modules_list:
+    for name in target_modules:
         base_name = name.split(".")[-1]
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
