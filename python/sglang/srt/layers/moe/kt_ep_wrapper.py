@@ -2163,15 +2163,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         Returns:
             Combined computation results from CPU and GPU experts
         """
-        # During CUDA Graph capture (regular or PCG), we cannot call
-        # torch.cuda.synchronize() or do CPU-GPU coordination.
-        # Delegate directly to the underlying GPU method.
-        from sglang.srt.compilation.piecewise_context_manager import (
-            is_in_piecewise_cuda_graph,
-        )
-        if is_in_piecewise_cuda_graph() or torch.cuda.is_current_stream_capturing():
-            return self.gpu_method.apply(layer, dispatch_output)
-
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
         )
