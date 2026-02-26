@@ -24,11 +24,12 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             kwargs["rope_scaling"] = rope_parameters
 
         super().__init__(**kwargs)
-        if self.rope_scaling is None:
+        # Use __dict__ to avoid transformers property redirect (rope_scaling -> rope_parameters)
+        if self.__dict__.get('rope_scaling') is None:
             self.rope_scaling = rope_parameters or {}
 
         # Keep both names for compatibility with model code paths that read either.
-        self.rope_parameters = rope_parameters or self.rope_scaling
+        self.rope_parameters = rope_parameters or self.__dict__.get('rope_scaling', {})
 
 
 class Qwen3_5Config(PretrainedConfig):
