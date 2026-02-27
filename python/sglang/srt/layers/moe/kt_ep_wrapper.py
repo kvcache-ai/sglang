@@ -1335,6 +1335,14 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0)
     moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
 
+    # Normalize list-form moe_layer_freq (e.g., MiMo-V2-Flash: [0, 1, 1, ...])
+    # to standard (first_k_dense_replace, moe_layer_freq=1) form
+    if isinstance(moe_layer_freq, list):
+        # Find first MoE layer index from the mask
+        first_moe = next((i for i, v in enumerate(moe_layer_freq) if v), 0)
+        first_k_dense_replace = max(first_k_dense_replace or 0, first_moe)
+        moe_layer_freq = 1
+
     # Count actual MoE layers
     num_moe_layers = sum(
         1 for i in range(num_layers)
