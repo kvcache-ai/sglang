@@ -643,16 +643,25 @@ class FusedMoE(torch.nn.Module):
             if expert_id < 0 or expert_id >= self.num_local_experts:
                 return
 
-        if isinstance(
-            self.quant_method,
-            KTEPWrapperMethod,
-        ):
-            if self.quant_method.num_gpu_experts != -1:
-                # Check if this expert is on GPU using the mask
-                if not self.quant_method.gpu_experts_mask[expert_id]:
-                    return  # CPU expert, skip loading to GPU weights
-                # Remap logical expert_id to GPU weight index
-                expert_id = self.quant_method.logical_to_gpu_index[expert_id].item()
+        kt_method = None
+        if isinstance(self.quant_method, KTEPWrapperMethod):
+            kt_method = self.quant_method
+        elif hasattr(self, "scheme") and isinstance(self.scheme, KTEPWrapperMethod):
+            # Some code paths store KT wrapper on self.scheme instead of self.quant_method.
+            kt_method = self.scheme
+
+        if kt_method is not None and kt_method.num_gpu_experts != -1:
+            # Check if this expert is on GPU using the mask
+            if expert_id < 0 or expert_id >= len(kt_method.gpu_experts_mask):
+                return
+            if not kt_method.gpu_experts_mask[expert_id]:
+                return  # CPU expert, skip loading to GPU weights
+
+            # Remap logical expert_id to GPU weight index
+            mapped_expert_id = int(kt_method.logical_to_gpu_index[expert_id].item())
+            if mapped_expert_id < 0:
+                return
+            expert_id = mapped_expert_id
 
         self._weight_loader_impl(
             param=param,
@@ -711,6 +720,9 @@ class FusedMoE(torch.nn.Module):
         # based on the shard id. This will be whatever
         # dimension intermediate_size is used.
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+
+        if expert_id < 0 or expert_id >= param.data.shape[0]:
+            return
 
         expert_data = param.data[expert_id]
 
