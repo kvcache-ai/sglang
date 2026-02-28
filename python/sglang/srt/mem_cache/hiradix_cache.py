@@ -1298,6 +1298,7 @@ class HiRadixCache(RadixCache):
         value = params.value
         chunked = params.chunked
         priority = params.priority
+        skip_cache_write = params.skip_cache_write
 
         if priority is None:
             priority = 0
@@ -1331,7 +1332,8 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
                 else:
-                    self._inc_hit_count(node, chunked)
+                    if not skip_cache_write:
+                        self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -1346,7 +1348,8 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
                 else:
-                    self._inc_hit_count(new_node, chunked)
+                    if not skip_cache_write:
+                        self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
                 node = new_node
 
@@ -1371,7 +1374,8 @@ class HiRadixCache(RadixCache):
                 new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
             if self.cache_controller.write_policy != "write_back":
-                self._inc_hit_count(new_node, chunked)
+                if not skip_cache_write:
+                    self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
