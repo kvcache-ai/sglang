@@ -195,11 +195,6 @@ class SharedFullContext:
             )
         self.gpu_layer.quant_method = self.gpu_method
 
-        # Detect quantization type for weight loading
-        self.is_fp8_quant = self._detect_fp8_quant()
-        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
-        self.is_bf16_quant = self._detect_bf16_quant()
-
         self.gpu_method.create_weights(
             layer=self.gpu_layer,
             num_experts=global_num_experts,
@@ -207,6 +202,11 @@ class SharedFullContext:
             intermediate_size_per_partition=intermediate_size_per_partition,
             params_dtype=params_dtype,
         )
+
+        # Detect quantization type for weight loading based on actually created weights.
+        # This is more robust than class-based detection when quant methods are wrapped
+        # (e.g., KT wrapper -> compressed-tensors scheme), especially in layerwise prefill.
+        self._detect_quant_type_from_created_weights()
 
         # Move all parameters to target device
         for param in self.gpu_layer.parameters():
@@ -227,6 +227,70 @@ class SharedFullContext:
         self.gpu_layer.moe_runner_config = runner_config
         self.gpu_method.create_moe_runner(self.gpu_layer, runner_config)
 
+    def _get_base_quant_method(self):
+        """Unwrap nested quant methods to get the underlying base method.
+
+        Some paths may wrap the real quant method with KT wrappers/schemes.
+        """
+        method = self.gpu_method
+        visited = set()
+
+        while method is not None and id(method) not in visited:
+            visited.add(id(method))
+
+            # KT wrapper pattern: method.gpu_method
+            nested = getattr(method, "gpu_method", None)
+            if nested is not None and nested is not method:
+                method = nested
+                continue
+
+            # Compressed-tensors scheme pattern: method.scheme
+            nested = getattr(method, "scheme", None)
+            if nested is not None and nested is not method:
+                method = nested
+                continue
+
+            break
+
+        return method
+
+    def _detect_quant_type_from_created_weights(self) -> None:
+        """Detect quant type from weight attributes created on gpu_layer."""
+        layer = self.gpu_layer
+
+        # INT4 Marlin
+        if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
+        # FP8 block
+        if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
+            self.is_fp8_quant = True
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
+        # FP8 per-channel
+        if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = True
+            self.is_bf16_quant = False
+            return
+
+        # BF16 / unquantized
+        if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = True
+            return
+
+        # Fallback to class-based detection for unknown layouts.
+        self.is_fp8_quant = self._detect_fp8_quant()
+        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
+        self.is_bf16_quant = self._detect_bf16_quant()
+
     def _detect_fp8_quant(self) -> bool:
         """Detect if the quantization method is FP8 block quant.
 
@@ -235,7 +299,7 @@ class SharedFullContext:
         """
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
-        method = self.gpu_method
+        method = self._get_base_quant_method()
         # Check for Fp8MoEMethod with block_quant
         if isinstance(method, Fp8MoEMethod) and getattr(method, "block_quant", False):
             return True
@@ -262,7 +326,7 @@ class SharedFullContext:
         except ImportError:
             return False
 
-        method = self.gpu_method
+        method = self._get_base_quant_method()
         method_name = method.__class__.__name__
 
         # Check for CompressedTensorsW8A8Fp8MoEMethod with channel strategy
@@ -284,7 +348,7 @@ class SharedFullContext:
             UnquantizedFusedMoEMethod,
         )
 
-        method = self.gpu_method
+        method = self._get_base_quant_method()
         # Check for UnquantizedFusedMoEMethod
         if isinstance(method, UnquantizedFusedMoEMethod):
             return True
