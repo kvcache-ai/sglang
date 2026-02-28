@@ -2019,11 +2019,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 get_global_expert_location_metadata,
             )
 
-            physical_to_logical_map_cpu = (
-                get_global_expert_location_metadata()
-                .physical_to_logical_map_cpu[self.kt_config.layer_idx]
-                .contiguous()
-            )
+            metadata = get_global_expert_location_metadata()
+            if (
+                metadata is not None
+                and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
+            ):
+                physical_to_logical_map_cpu = (
+                    metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]
+                    .contiguous()
+                )
+            else:
+                # Fallback for setups without EPLB metadata: identity mapping.
+                physical_to_logical_map_cpu = torch.arange(
+                    layer.num_experts, dtype=torch.int64, device="cpu"
+                )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
 
     def create_moe_runner(
