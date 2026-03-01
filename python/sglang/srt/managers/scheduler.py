@@ -1670,10 +1670,30 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            if req.last_node.backuped:
-                # only to initiate the prefetch if the last node is backuped
-                # otherwise, the allocated GPU memory must be locked for integrity
+            # Prefetch from storage if:
+            # 1. The last node is already backed up locally, OR
+            # 2. The last node is not backed up locally but we should query storage
+            #    (for cross-instance cache sharing)
+            should_prefetch = req.last_node.backuped
+            last_hash = None
+
+            if not should_prefetch:
+                # Node not backed up locally - try to compute hash and check storage
+                # This enables cross-instance prefetch from shared storage backends
+                matched_len = len(req.prefix_indices) + req.host_hit_length
+                if matched_len > 0:
+                    # We have some local match, compute hash from the matched prefix
+                    last_hash = req.last_host_node.get_last_hash_value()
+                    should_prefetch = True
+                else:
+                    # No local match at all - compute hash from scratch
+                    # This handles the case where the requesting instance has an empty cache
+                    should_prefetch = True
+                    last_hash = None
+            else:
                 last_hash = req.last_host_node.get_last_hash_value()
+
+            if should_prefetch:
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
