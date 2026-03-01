@@ -1,3 +1,7 @@
+import functools
+from typing import Optional
+
+import torch
 
 from sglang.srt.utils import is_cuda
 
@@ -5,13 +9,7 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import silu_and_mul
-
-import functools
-from typing import Optional
-
-import torch
-from sgl_kernel.elementwise import silu_and_mul
-from sgl_kernel.moe import moe_sum_reduce
+    from sgl_kernel.moe import moe_sum_reduce
 
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
@@ -104,6 +102,11 @@ def fused_marlin_moe(
     E = w1.shape[0]
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
+
+    # Early return when no experts on GPU (e.g. kt-num-gpu-experts=0)
+    # or no tokens to process. Avoids kernel launch failures with empty tensors.
+    if E == 0 or M == 0:
+        return torch.zeros_like(hidden_states)
 
     get_config_func = functools.partial(
         try_get_optimal_moe_config,

@@ -573,6 +573,7 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                and not isinstance(self.experts.quant_method, KTEPWrapperMethod)
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
