@@ -103,6 +103,13 @@ def fused_marlin_moe(
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
 
+    # KT hybrid dispatch marks CPU-routed experts as -1 after remapping.
+    # Marlin expects expert ids in [0, E), so sanitize invalid ids and
+    # zero out their corresponding weights (GPU path should ignore them).
+    invalid_topk = (topk_ids < 0) | (topk_ids >= E)
+    topk_ids = torch.where(invalid_topk, torch.zeros_like(topk_ids), topk_ids)
+    topk_weights = torch.where(invalid_topk, torch.zeros_like(topk_weights), topk_weights)
+
     # Early return when no experts on GPU (e.g. kt-num-gpu-experts=0)
     # or no tokens to process. Avoids kernel launch failures with empty tensors.
     if E == 0 or M == 0:

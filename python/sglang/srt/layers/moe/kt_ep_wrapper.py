@@ -355,6 +355,47 @@ class SharedFullContext:
 
         return False
 
+    def _resolve_int4_quant_params(self):
+        """Resolve INT4 quant params from potentially wrapped quant methods.
+
+        Some quantization paths (e.g., compressed-tensors) expose INT4 metadata on
+        the underlying scheme instead of the outer fused method wrapper.
+        """
+        candidates = []
+        seen = set()
+
+        def add_candidate(obj):
+            if obj is None:
+                return
+            obj_id = id(obj)
+            if obj_id in seen:
+                return
+            seen.add(obj_id)
+            candidates.append(obj)
+
+        base_method = self._get_base_quant_method()
+        add_candidate(self.gpu_method)
+        add_candidate(getattr(self.gpu_method, "gpu_method", None))
+        add_candidate(getattr(self.gpu_method, "scheme", None))
+        add_candidate(base_method)
+        add_candidate(getattr(base_method, "scheme", None))
+        add_candidate(getattr(self.gpu_layer, "scheme", None))
+
+        required = ("num_bits", "packed_factor", "group_size")
+        for candidate in candidates:
+            if all(hasattr(candidate, attr) for attr in required):
+                return (
+                    getattr(candidate, "num_bits"),
+                    getattr(candidate, "packed_factor"),
+                    getattr(candidate, "group_size"),
+                    getattr(candidate, "actorder", None),
+                )
+
+        raise AttributeError(
+            "Unable to resolve INT4 quantization params: expected attributes "
+            "num_bits/packed_factor/group_size on quant method or scheme"
+        )
+
     @property
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
@@ -515,12 +556,9 @@ class SharedFullContext:
         os.sched_setaffinity(0, {target_cpu})
 
         layer = self.gpu_layer
-        method = self.gpu_method
-
-        num_bits = method.num_bits
-        packed_factor = method.packed_factor
-        group_size = method.group_size
-        actorder = getattr(method, "actorder", None)
+        num_bits, packed_factor, group_size, actorder = (
+            self._resolve_int4_quant_params()
+        )
         num_experts = layer.num_experts
         device = layer.w13_weight_packed.device
 
