@@ -373,12 +373,17 @@ class SharedFullContext:
         self._batch_load_stream = None
 
     def _collect_all_rank_buffer_pointers(self) -> Dict[str, List[int]]:
-        """Collect CPU buffer pointers from all ranks."""
+        """Collect CPU buffer pointers from all ranks.
+
+        On rank 0, also registers remote shared memory buffers with cudaHostRegister
+        so that cudaMemcpyAsync from these buffers is truly asynchronous.
+        """
         tp_rank = get_tensor_model_parallel_rank()
         tp_world_size = get_tensor_model_parallel_world_size()
         buffer_names = list(self.cpu_buffers.keys())
         all_rank_ptrs: Dict[str, List[int]] = {name: [] for name in buffer_names}
         self._opened_shm_refs: Dict[str, shared_memory.SharedMemory] = {}
+        self._registered_remote_bufs: List[tuple] = []  # (ptr, size) for cudaHostUnregister
 
         for rank in range(tp_world_size):
             for name in buffer_names:
@@ -390,6 +395,13 @@ class SharedFullContext:
                         shm = shared_memory.SharedMemory(name=shm_name)
                         self._opened_shm_refs[f"{name}_r{rank}"] = shm
                         ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+                        # Pin remote buffer in rank 0's CUDA context for async DMA
+                        buf_nbytes = self.cpu_buffers[name].numel() * self.cpu_buffers[name].element_size()
+                        if torch.cuda.is_available():
+                            torch.cuda.cudart().cudaHostRegister(
+                                ptr, buf_nbytes, 0
+                            )
+                            self._registered_remote_bufs.append((ptr, buf_nbytes))
                     except FileNotFoundError:
                         logger.error(
                             "Rank %d: Failed to open shared memory '%s'",
@@ -487,7 +499,17 @@ class SharedFullContext:
             logger.info(f"[KT] GPU IPC handles setup complete for {len(weight_names)} weights, {tp_world_size} ranks")
 
     def _cleanup_gpu_ipc_handles(self):
-        """Close opened CUDA IPC handles."""
+        """Close opened CUDA IPC handles and unregister pinned remote buffers."""
+        # Unregister remote shared memory buffers
+        if torch.cuda.is_available():
+            for ptr, _ in getattr(self, '_registered_remote_bufs', []):
+                try:
+                    torch.cuda.cudart().cudaHostUnregister(ptr)
+                except Exception:
+                    pass
+        self._registered_remote_bufs = []
+
+        # Close IPC handles
         try:
             import kt_kernel
             kt_ext = kt_kernel.kt_kernel_ext
@@ -800,8 +822,11 @@ class SharedFullContext:
         gpu_w2_weight_ptrs_per_rank = self.ipc_gpu_ptrs["w2_weight"]
         gpu_w2_scale_ptrs_per_rank = self.ipc_gpu_ptrs["w2_weight_scale_inv"]
 
-        # Create a dedicated CUDA stream for H2D transfers (persistent)
-        self._batch_load_stream = torch.cuda.Stream(device=device)
+        # Create per-rank CUDA streams for parallel H2D transfers
+        # Each rank's memcpy goes on a separate stream so transfers to different GPUs overlap
+        self._batch_load_streams = [torch.cuda.Stream(device=device) for _ in range(tp_world_size)]
+        # Keep first stream as the "primary" for backward compat
+        self._batch_load_stream = self._batch_load_streams[0]
 
         # Register all buffer pointers in the C++ MoE instance
         wrapper.setup_batch_load_buffers(
@@ -814,7 +839,7 @@ class SharedFullContext:
             gpu_w13_scale_ptrs_per_rank=gpu_w13_scale_ptrs_per_rank,
             gpu_w2_weight_ptrs_per_rank=gpu_w2_weight_ptrs_per_rank,
             gpu_w2_scale_ptrs_per_rank=gpu_w2_scale_ptrs_per_rank,
-            cuda_stream=self._batch_load_stream.cuda_stream,
+            cuda_streams=[s.cuda_stream for s in self._batch_load_streams],
             w13_weight_expert_nbytes=w13_weight_expert_nbytes,
             w13_scale_expert_nbytes=w13_scale_expert_nbytes,
             w2_weight_expert_nbytes=w2_weight_expert_nbytes,
@@ -856,8 +881,504 @@ class SharedFullContext:
         # Wait for completion
         wrapper.sync_batch_load_cpu_experts_to_gpu()
 
-        # Synchronize the batch stream with the default stream
-        torch.cuda.current_stream(device).wait_stream(self._batch_load_stream)
+        # Synchronize all per-rank batch streams with the default stream
+        default_stream = torch.cuda.current_stream(device)
+        for s in self._batch_load_streams:
+            default_stream.wait_stream(s)
+
+    # ==================== V3 Polling-Based Batch Load API ====================
+
+    def _create_polling_sync_slots(self):
+        """Create polling sync slots in shared memory for each rank.
+
+        Each rank creates a 64-byte sync slot in POSIX shared memory.
+        These slots are used for CPU-GPU synchronization in polling-based batch load.
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        # Create sync slot in shared memory (64 bytes, cache-line aligned)
+        sync_slot_size = 64
+        shm_name = f"kt_sync_slot_r{tp_rank}_{self.shm_unique_id}"
+        shm = shared_memory.SharedMemory(name=shm_name, create=True, size=sync_slot_size)
+        self._polling_sync_slot_shm = shm
+
+        # Initialize sync slot to IDLE state
+        sync_slot_buf = ctypes.c_char.from_buffer(shm.buf)
+        sync_slot_ptr = ctypes.addressof(sync_slot_buf)
+        # Zero-initialize the slot (signal=0=IDLE)
+        ctypes.memset(sync_slot_ptr, 0, sync_slot_size)
+
+        # Register as pinned memory for GPU polling
+        if torch.cuda.is_available():
+            torch.cuda.cudart().cudaHostRegister(sync_slot_ptr, sync_slot_size, 0)
+
+        self._polling_local_sync_slot_ptr = sync_slot_ptr
+
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group().device_group)
+
+        # Collect all ranks' sync slot pointers (rank 0 opens remote slots)
+        self._polling_all_sync_slot_ptrs = self._collect_polling_sync_slot_pointers()
+
+        # Unlink shared memory (remains accessible via mmap)
+        if dist.is_initialized():
+            dist.barrier(group=get_tp_group().device_group)
+        shm.unlink()
+
+    def _collect_polling_sync_slot_pointers(self) -> List[int]:
+        """Collect sync slot pointers from all ranks.
+
+        On rank 0, also opens and registers remote sync slots.
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
+        sync_slot_size = 64
+
+        all_ptrs = []
+        self._polling_opened_sync_slot_refs = []
+        self._polling_registered_sync_slot_ptrs = []
+
+        for rank in range(tp_world_size):
+            if rank == tp_rank:
+                all_ptrs.append(self._polling_local_sync_slot_ptr)
+            elif tp_rank == 0:
+                shm_name = f"kt_sync_slot_r{rank}_{self.shm_unique_id}"
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    self._polling_opened_sync_slot_refs.append(shm)
+                    ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+                    # Register remote sync slot as pinned for GPU visibility
+                    if torch.cuda.is_available():
+                        torch.cuda.cudart().cudaHostRegister(ptr, sync_slot_size, 0)
+                        self._polling_registered_sync_slot_ptrs.append(ptr)
+                    all_ptrs.append(ptr)
+                except FileNotFoundError:
+                    logger.error(f"Rank 0: Failed to open sync slot for rank {rank}")
+                    all_ptrs.append(0)
+            else:
+                all_ptrs.append(0)
+
+        return all_ptrs
+
+    def _setup_polling_batch_load(self, wrapper, device, tp_world_size):
+        """V3 API: Setup polling-based batch load with persistent kernels.
+
+        Each rank launches a persistent polling kernel that:
+        1. Polls sync slot for DATA_READY signal
+        2. Copies from pinned CPU buffer to local GPU memory
+        3. Signals GPU_DONE
+
+        Args:
+            wrapper: KT wrapper with polling batch load API
+            device: Target CUDA device
+            tp_world_size: Number of tensor parallel ranks
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # Calculate per-expert byte sizes
+        w13_weight_buf = self.cpu_buffers["w13_weight"]
+        w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+        w2_weight_buf = self.cpu_buffers["w2_weight"]
+        w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+
+        w13_weight_expert_nbytes = w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+        w13_scale_expert_nbytes = w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+        w2_weight_expert_nbytes = w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+        w2_scale_expert_nbytes = w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+
+        # Build source buffer pointers - each rank only uses its own local buffers
+        # Format: [w13_w_s0, w13_w_s1, w13_s_s0, w13_s_s1, w2_w_s0, w2_w_s1, w2_s_s0, w2_s_s1]
+        # Note: For the local rank's kernel, we use local buffer pointers
+        # For rank 0's batch_load function (which signals), it uses all_rank_buffer_ptrs
+
+        # Build source buffer pointers for all ranks
+        # Rank 0 has valid pointers for all ranks (via shared memory)
+        # Other ranks only have valid pointers for themselves
+        src_buffer_ptrs_per_rank = []
+        for rank in range(tp_world_size):
+            if rank == tp_rank:
+                # Use local buffer pointers
+                w13_w_base = self.cpu_buffers["w13_weight"].data_ptr()
+                w13_s_base = self.cpu_buffers["w13_weight_scale_inv"].data_ptr()
+                w2_w_base = self.cpu_buffers["w2_weight"].data_ptr()
+                w2_s_base = self.cpu_buffers["w2_weight_scale_inv"].data_ptr()
+            elif tp_rank == 0:
+                # Rank 0 has access to all ranks' shared memory
+                w13_w_base = self.all_rank_buffer_ptrs["w13_weight"][rank]
+                w13_s_base = self.all_rank_buffer_ptrs["w13_weight_scale_inv"][rank]
+                w2_w_base = self.all_rank_buffer_ptrs["w2_weight"][rank]
+                w2_s_base = self.all_rank_buffer_ptrs["w2_weight_scale_inv"][rank]
+            else:
+                # Non-rank-0 ranks don't have access to other ranks' buffers
+                w13_w_base = 0
+                w13_s_base = 0
+                w2_w_base = 0
+                w2_s_base = 0
+
+            if w13_w_base != 0:
+                rank_buffers = [
+                    w13_w_base,  # slot 0
+                    w13_w_base + w13_weight_expert_nbytes,  # slot 1
+                    w13_s_base,  # slot 0
+                    w13_s_base + w13_scale_expert_nbytes,  # slot 1
+                    w2_w_base,  # slot 0
+                    w2_w_base + w2_weight_expert_nbytes,  # slot 1
+                    w2_s_base,  # slot 0
+                    w2_s_base + w2_scale_expert_nbytes,  # slot 1
+                ]
+            else:
+                rank_buffers = [0] * 8
+            src_buffer_ptrs_per_rank.append(rank_buffers)
+
+        # Get GPU destination pointers - each rank only has its own
+        dst_w13_weight_per_rank = []
+        dst_w13_scale_per_rank = []
+        dst_w2_weight_per_rank = []
+        dst_w2_scale_per_rank = []
+        for rank in range(tp_world_size):
+            if rank == tp_rank:
+                dst_w13_weight_per_rank.append(getattr(self.gpu_layer, "w13_weight").data_ptr())
+                dst_w13_scale_per_rank.append(getattr(self.gpu_layer, "w13_weight_scale_inv").data_ptr())
+                dst_w2_weight_per_rank.append(getattr(self.gpu_layer, "w2_weight").data_ptr())
+                dst_w2_scale_per_rank.append(getattr(self.gpu_layer, "w2_weight_scale_inv").data_ptr())
+            else:
+                # Other ranks' GPU pointers are not accessible without IPC
+                dst_w13_weight_per_rank.append(0)
+                dst_w13_scale_per_rank.append(0)
+                dst_w2_weight_per_rank.append(0)
+                dst_w2_scale_per_rank.append(0)
+
+        # Create CUDA stream for this rank's persistent kernel
+        self._polling_stream = torch.cuda.Stream(device=device)
+        # Build stream list (only this rank's stream is valid)
+        stream_ptrs = [0] * tp_world_size
+        stream_ptrs[tp_rank] = self._polling_stream.cuda_stream
+
+        # Setup polling batch load in C++
+        wrapper.setup_polling_batch_load(
+            num_ranks=tp_world_size,
+            sync_slot_ptrs=self._polling_all_sync_slot_ptrs,
+            src_buffer_ptrs_per_rank=src_buffer_ptrs_per_rank,
+            dst_w13_weight_per_rank=dst_w13_weight_per_rank,
+            dst_w13_scale_per_rank=dst_w13_scale_per_rank,
+            dst_w2_weight_per_rank=dst_w2_weight_per_rank,
+            dst_w2_scale_per_rank=dst_w2_scale_per_rank,
+            stream_ptrs=stream_ptrs,
+            w13_weight_size=w13_weight_expert_nbytes,
+            w13_scale_size=w13_scale_expert_nbytes,
+            w2_weight_size=w2_weight_expert_nbytes,
+            w2_scale_size=w2_scale_expert_nbytes,
+        )
+
+        # Launch persistent polling kernel for this rank
+        wrapper.launch_polling_kernel(local_rank=tp_rank, total_experts=-1)
+
+        logger.info(f"[KT] Rank {tp_rank}: V3 polling batch load setup complete")
+
+    def _prepare_weight_fp8_polling_api(self, wrapper, weight_infos, cpu_expert_ids, device, tp_world_size):
+        """V3 Polling API implementation for FP8 CPU expert weight loading.
+
+        Uses persistent polling kernels launched during setup. Each rank's GPU
+        independently polls a shared CPU memory flag and copies data when signaled.
+
+        Args:
+            wrapper: KT wrapper with polling batch load API
+            weight_infos: List of (name, cpu_buf, gpu_t) tuples
+            cpu_expert_ids: List of CPU expert IDs to load
+            device: Target CUDA device
+            tp_world_size: Number of tensor parallel ranks
+        """
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # Setup polling batch load once per C++ moe instance
+        if not hasattr(self, '_polling_configured_wrappers'):
+            self._polling_configured_wrappers = set()
+        wrapper_id = id(wrapper.moe)
+        if wrapper_id not in self._polling_configured_wrappers:
+            # Create sync slots if not yet created
+            if not hasattr(self, '_polling_all_sync_slot_ptrs'):
+                self._create_polling_sync_slots()
+            self._setup_polling_batch_load(wrapper, device, tp_world_size)
+            self._polling_configured_wrappers.add(wrapper_id)
+
+        # Only rank 0 submits the batch load task (writes to all ranks' buffers and signals)
+        if tp_rank == 0:
+            wrapper.submit_batch_load_cpu_experts_polling(cpu_expert_ids)
+            wrapper.sync_batch_load_cpu_experts_polling()
+
+        # Wait for local polling stream to complete
+        default_stream = torch.cuda.current_stream(device)
+        default_stream.wait_stream(self._polling_stream)
+
+    def _cleanup_polling_sync_slots(self):
+        """Clean up polling sync slots and unregister pinned memory."""
+        # Unregister remote sync slots
+        if torch.cuda.is_available():
+            for ptr in getattr(self, '_polling_registered_sync_slot_ptrs', []):
+                try:
+                    torch.cuda.cudart().cudaHostUnregister(ptr)
+                except Exception:
+                    pass
+
+        # Unregister local sync slot
+        local_ptr = getattr(self, '_polling_local_sync_slot_ptr', None)
+        if local_ptr and torch.cuda.is_available():
+            try:
+                torch.cuda.cudart().cudaHostUnregister(local_ptr)
+            except Exception:
+                pass
+
+        # Close opened shared memory refs
+        for shm in getattr(self, '_polling_opened_sync_slot_refs', []):
+            try:
+                shm.close()
+            except Exception:
+                pass
+
+        # Close local sync slot shm
+        shm = getattr(self, '_polling_sync_slot_shm', None)
+        if shm:
+            try:
+                shm.close()
+            except Exception:
+                pass
+
+    # ==================== V4 Polling Memcpy Worker API ====================
+
+    def _get_worker_cpu_core(self, tp_rank: int, tp_world_size: int) -> int:
+        """Get CPU core for polling memcpy worker, avoiding cpuinfer cores.
+
+        Strategy: Use the last N cores on the system, where N = tp_world_size.
+        This avoids conflict with cpuinfer threads which typically bind to
+        earlier cores on NUMA node 0.
+
+        Args:
+            tp_rank: Tensor parallel rank
+            tp_world_size: Total number of TP ranks
+
+        Returns:
+            CPU core ID to bind the worker to
+        """
+        num_cpus = os.cpu_count()
+        # Use last tp_world_size cores, one per rank
+        # Rank 0 gets the last core, Rank 1 gets second to last, etc.
+        return num_cpus - 1 - tp_rank
+
+    def _setup_polling_memcpy_worker(self, wrapper, device, tp_world_size):
+        """V4 API: Setup polling memcpy worker for the local rank.
+
+        Each rank creates a dedicated C++ worker thread that:
+        1. Polls sync slot for DATA_READY signal
+        2. Calls cudaMemcpyAsync (DMA, doesn't use GPU SM)
+        3. Waits for completion and signals GPU_DONE
+
+        Args:
+            wrapper: KT wrapper (used for write_weight_scale_to_buffer)
+            device: Target CUDA device
+            tp_world_size: Number of tensor parallel ranks
+        """
+        from kt_kernel.utils.amx import (
+            create_polling_memcpy_worker,
+            start_polling_memcpy_worker,
+        )
+
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # Calculate per-expert byte sizes
+        w13_weight_buf = self.cpu_buffers["w13_weight"]
+        w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+        w2_weight_buf = self.cpu_buffers["w2_weight"]
+        w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+
+        w13_weight_expert_nbytes = w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+        w13_scale_expert_nbytes = w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+        w2_weight_expert_nbytes = w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+        w2_scale_expert_nbytes = w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+
+        # Build source buffer pointers for this rank
+        # Format: [w13_w_s0, w13_w_s1, w13_s_s0, w13_s_s1, w2_w_s0, w2_w_s1, w2_s_s0, w2_s_s1]
+        w13_w_base = self.cpu_buffers["w13_weight"].data_ptr()
+        w13_s_base = self.cpu_buffers["w13_weight_scale_inv"].data_ptr()
+        w2_w_base = self.cpu_buffers["w2_weight"].data_ptr()
+        w2_s_base = self.cpu_buffers["w2_weight_scale_inv"].data_ptr()
+
+        src_buffer_ptrs = [
+            w13_w_base,  # slot 0
+            w13_w_base + w13_weight_expert_nbytes,  # slot 1
+            w13_s_base,  # slot 0
+            w13_s_base + w13_scale_expert_nbytes,  # slot 1
+            w2_w_base,  # slot 0
+            w2_w_base + w2_weight_expert_nbytes,  # slot 1
+            w2_s_base,  # slot 0
+            w2_s_base + w2_scale_expert_nbytes,  # slot 1
+        ]
+
+        # Get GPU destination pointers for this rank
+        dst_w13_weight = getattr(self.gpu_layer, "w13_weight").data_ptr()
+        dst_w13_scale = getattr(self.gpu_layer, "w13_weight_scale_inv").data_ptr()
+        dst_w2_weight = getattr(self.gpu_layer, "w2_weight").data_ptr()
+        dst_w2_scale = getattr(self.gpu_layer, "w2_weight_scale_inv").data_ptr()
+
+        # Get CPU core for this rank's worker
+        cpu_core = self._get_worker_cpu_core(tp_rank, tp_world_size)
+        cuda_device = torch.cuda.current_device()
+
+        # Create and start the worker
+        create_polling_memcpy_worker(
+            rank=tp_rank,
+            cuda_device=cuda_device,
+            cpu_core=cpu_core,
+            sync_slot_ptr=self._polling_local_sync_slot_ptr,
+            src_buffer_ptrs=src_buffer_ptrs,
+            dst_w13_weight=dst_w13_weight,
+            dst_w13_scale=dst_w13_scale,
+            dst_w2_weight=dst_w2_weight,
+            dst_w2_scale=dst_w2_scale,
+            w13_weight_size=w13_weight_expert_nbytes,
+            w13_scale_size=w13_scale_expert_nbytes,
+            w2_weight_size=w2_weight_expert_nbytes,
+            w2_scale_size=w2_scale_expert_nbytes,
+        )
+        start_polling_memcpy_worker()
+
+        logger.info(f"[KT] Rank {tp_rank}: V4 polling memcpy worker started on core {cpu_core}")
+
+    def _prepare_weight_fp8_worker_api(self, wrapper, weight_infos, cpu_expert_ids, device, tp_world_size):
+        """V4 Worker API implementation for FP8 CPU expert weight loading.
+
+        Uses dedicated polling memcpy workers launched during setup. Each rank's
+        worker thread independently polls a shared CPU memory flag and performs
+        cudaMemcpyAsync (DMA) when signaled.
+
+        Pipeline: write(e) -> signal(e) -> [GPU copy overlaps] -> write(e+1) -> wait(e) -> ...
+
+        Args:
+            wrapper: KT wrapper with write_weight_scale_to_buffer API
+            weight_infos: List of (name, cpu_buf, gpu_t) tuples
+            cpu_expert_ids: List of CPU expert IDs to load
+            device: Target CUDA device
+            tp_world_size: Number of tensor parallel ranks
+        """
+        from kt_kernel.utils.amx import stop_polling_memcpy_worker
+
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # Setup worker once per SharedFullContext (not per C++ moe instance)
+        if not hasattr(self, '_polling_worker_started'):
+            self._polling_worker_started = False
+
+        if not self._polling_worker_started:
+            # Create sync slots if not yet created
+            if not hasattr(self, '_polling_all_sync_slot_ptrs'):
+                self._create_polling_sync_slots()
+            self._setup_polling_memcpy_worker(wrapper, device, tp_world_size)
+            self._polling_worker_started = True
+
+        # Calculate per-expert byte sizes for buffer addressing
+        w13_weight_buf = self.cpu_buffers["w13_weight"]
+        w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+        w2_weight_buf = self.cpu_buffers["w2_weight"]
+        w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+
+        w13_weight_expert_nbytes = w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+        w13_scale_expert_nbytes = w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+        w2_weight_expert_nbytes = w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+        w2_scale_expert_nbytes = w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+
+        def submit_write_expert(expert_id, slot):
+            """Submit write task for an expert to the given double buffer slot."""
+            w13_weight_ptrs = [
+                ptr + slot * w13_weight_expert_nbytes
+                for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+            ]
+            w13_scale_ptrs = [
+                ptr + slot * w13_scale_expert_nbytes
+                for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
+            ]
+            w2_weight_ptrs = [
+                ptr + slot * w2_weight_expert_nbytes
+                for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+            ]
+            w2_scale_ptrs = [
+                ptr + slot * w2_scale_expert_nbytes
+                for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
+            ]
+            wrapper.submit_write_weight_scale_to_buffer(
+                tp_world_size,
+                expert_id,
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+
+        def cpu_signal_data_ready(slot_ptr, expert_id, slot_idx):
+            """Signal that data is ready for GPU to copy (matches C++ protocol)."""
+            import ctypes
+            # BatchSyncSlot: signal(4B), expert_id(4B), slot_idx(4B), ...
+            slot_array = (ctypes.c_int32 * 3).from_address(slot_ptr)
+            slot_array[1] = expert_id  # expert_id
+            slot_array[2] = slot_idx   # slot_idx
+            ctypes.memmove(slot_ptr, ctypes.addressof(slot_array), 12)
+            # Memory fence then set signal
+            slot_array[0] = 1  # SIGNAL_DATA_READY
+
+        def cpu_wait_gpu_done(slot_ptr) -> bool:
+            """Wait for GPU to complete copy (matches C++ protocol)."""
+            import ctypes
+            import time
+            slot_array = (ctypes.c_int32 * 1).from_address(slot_ptr)
+            while True:
+                sig = slot_array[0]
+                if sig == 2:  # SIGNAL_GPU_DONE
+                    slot_array[0] = 0  # Reset to SIGNAL_IDLE
+                    return True
+                # Busy-wait (could add sleep for between-prefill mode)
+                time.sleep(0)  # Yield
+
+        num_experts = len(cpu_expert_ids)
+        do_write = tp_rank == 0 and wrapper is not None
+
+        for idx in range(num_experts):
+            expert_id = cpu_expert_ids[idx]
+            slot = idx % 2
+
+            # 1. Write current expert to buffer (Rank 0 writes to all ranks' buffers)
+            if do_write:
+                submit_write_expert(expert_id, slot)
+                wrapper.sync_write_weight_scale_to_buffer()
+
+            # Barrier: ensure all ranks see the written data
+            if dist.is_initialized():
+                dist.barrier(group=get_tp_group().device_group)
+
+            # 2. Wait for PREVIOUS expert's GPU copy to complete (if not first expert)
+            #    This ensures the slot we're about to write to (next iteration) is free
+            if idx > 0:
+                cpu_wait_gpu_done(self._polling_local_sync_slot_ptr)
+
+            # 3. Signal current expert ready for this rank
+            cpu_signal_data_ready(self._polling_local_sync_slot_ptr, expert_id, slot)
+
+            # Pipeline: Now GPU worker starts copying expert[idx] while we loop back
+
+        # 4. Wait for the last expert's GPU copy to complete
+        if num_experts > 0:
+            cpu_wait_gpu_done(self._polling_local_sync_slot_ptr)
+
+    def _stop_polling_memcpy_worker(self):
+        """Stop the polling memcpy worker for the local rank."""
+        if not getattr(self, '_polling_worker_started', False):
+            return
+
+        try:
+            from kt_kernel.utils.amx import stop_polling_memcpy_worker
+            stop_polling_memcpy_worker()
+            self._polling_worker_started = False
+            logger.info("[KT] Polling memcpy worker stopped")
+        except Exception as e:
+            logger.warning(f"[KT] Failed to stop polling memcpy worker: {e}")
 
     # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
     # The conversion is handled separately in the normal weight loading path.
