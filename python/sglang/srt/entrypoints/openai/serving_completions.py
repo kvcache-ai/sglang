@@ -121,6 +121,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            skip_cache_write=request.skip_cache_write,
         )
 
         return adapted_request, request
