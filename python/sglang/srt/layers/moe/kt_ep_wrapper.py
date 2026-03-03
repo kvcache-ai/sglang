@@ -2002,6 +2002,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._full_init_args = None
         self.wrapper: Optional[KTMoEWrapper] = None
 
+        # flag used by the full-GPU fallback path; wrappers that do not provide
+        # a write-buffer API (e.g. Llamafile) cannot export their CPU weights
+        # back into the shared context, so we must disable automatic fallback.
+        # the check is computed later once the wrapper instance is created.
+        self._wrapper_supports_export: Optional[bool] = None
+
         # Dual-stream parallelism: cpu_stream for CPU expert operations,
         # main stream for GPU computation (initialized in create_weights)
         self._cpu_stream: Optional[torch.cuda.Stream] = None
@@ -2100,6 +2106,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+            )
+
+        # determine whether this wrapper implements the APIs used by
+        # SharedFullContext when populating the full-GPU layer
+        self._wrapper_supports_export = (
+            hasattr(self.wrapper, "submit_write_weight_scale_to_buffer")
+            and hasattr(self.wrapper, "sync_write_weight_scale_to_buffer")
+        )
+        if not self._wrapper_supports_export:
+            # explicitly log the reason so users understand why the
+            # gpu_prefill_token_threshold check will be ignored later.
+            logger.info(
+                "KT wrapper %s does not support weight export; full-GPU "
+                "fallback disabled",
+                type(self.wrapper).__name__,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -2303,6 +2324,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
+            and (self._wrapper_supports_export or False)
         ):
             ctx = self._build_full_context(layer)
 
