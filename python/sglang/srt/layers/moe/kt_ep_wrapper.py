@@ -697,6 +697,11 @@ class SharedFullContext:
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
                 if e + 1 < num_experts:
+                    # Before writing to slot (e+1)%2, make sure the previous
+                    # copy from that slot has completed to avoid overwriting
+                    # pinned host memory while DMA is in-flight.
+                    if e > 0:
+                        events[e - 1].synchronize()
                     submit_write_expert(e + 1)
 
             # Barrier to ensure all ranks see the written data
