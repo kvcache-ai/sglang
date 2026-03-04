@@ -722,6 +722,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
                     shard_size=shard_size, shard_offset=shard_offset
                 )
+            elif isinstance(param, BlockQuantScaleParameter):
+                weight_block_size = self.quant_method.quant_config.weight_block_size
+                block_n = 1 if getattr(param, "format_ue8m0", False) else weight_block_size[0]
+                shard_offset = (shard_offset + block_n - 1) // block_n
+                shard_size = (shard_size + block_n - 1) // block_n
 
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
