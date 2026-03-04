@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -138,11 +138,11 @@ test = [
   "tabulate",
 ]
 
-dev = ["sglang[test]"]
+dev = ["sglang-kt[test]"]
 
 all = [
-  "sglang[diffusion]",
-  "sglang[tracing]",
+  "sglang-kt[diffusion]",
+  "sglang-kt[tracing]",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -184,9 +184,6 @@ exclude = [
   "tests*",
 ]
 
-[tool.setuptools_scm]
-root = ".."
-version_file = "sglang/_version.py"
-git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
-# Allow editable installs even when .git metadata is not available.
-fallback_version = "0.0.0.dev0"
+# sglang-kt version is injected at build time via SGLANG_KT_VERSION env var.
+# When built from ktransformers (install.sh or CI), it reads version.py automatically.
+# Fallback: setup.py defaults to "0.0.0.dev0" if env var is not set.
