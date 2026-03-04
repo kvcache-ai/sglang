@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-kt"
-version = "0.5.2"
+dynamic = ["version"]
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -138,11 +138,11 @@ test = [
   "tabulate",
 ]
 
-dev = ["sglang[test]"]
+dev = ["sglang-kt[test]"]
 
 all = [
-  "sglang[diffusion]",
-  "sglang[tracing]",
+  "sglang-kt[diffusion]",
+  "sglang-kt[tracing]",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -184,6 +184,6 @@ exclude = [
   "tests*",
 ]
 
-# sglang-kt uses static versioning (independent from upstream sglang).
-# To release a new version: update `version` in [project] above.
-# Version scheme: MAJOR.MINOR.PATCH (e.g., 0.5.2 → 0.5.3 → 0.6.0)
+# sglang-kt version is injected at build time via SGLANG_KT_VERSION env var.
+# When built from ktransformers (install.sh or CI), it reads version.py automatically.
+# Fallback: setup.py defaults to "0.0.0.dev0" if env var is not set.
