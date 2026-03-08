@@ -2446,13 +2446,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     def _set_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         """Validates the request priority and assigns a default or fallback value if it is missing or invalid."""
         if self.enable_priority_scheduling:
-            if obj.priority is None and self.default_priority_value is not None:
+            if obj.priority is None:
                 obj.priority = self.default_priority_value
 
-            if obj.priority not in self.valid_priority_values:
-                obj.priority = None
-
-            if obj.priority is None:
+            if obj.priority is None or obj.priority not in self.valid_priority_values:
                 if self.schedule_low_priority_values_first:
                     obj.priority = max(self.valid_priority_values, default=sys.maxsize)
                 else:
