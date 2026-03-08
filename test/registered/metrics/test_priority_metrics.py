@@ -92,6 +92,8 @@ class TestPriorityMetrics(CustomTestCase):
                 "--enable-priority-scheduling",
                 "--default-priority-value",
                 "0",
+                "--valid-priority-values",
+                "-1 0 1 5 10",
             ],
         )
 
@@ -215,6 +217,35 @@ class TestPriorityMetrics(CustomTestCase):
             "0",
             priority_values,
             f"Expected priority='0' from default, got: {priority_values}",
+        )
+
+    def test_valid_priority_values(self):
+        """Tests the validation and handling logic for the valid priority values parameter.set valid-priority-values: -1 0 1 5 10"""
+
+        # Send request with priority 6 — should get priority -1
+        response = requests.post(
+            f"{DEFAULT_URL_FOR_TEST}/generate",
+            json={
+                "text": "Hello world",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 5},
+                "priority": 6,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
+        self.assertEqual(metrics_response.status_code, 200)
+        metrics = _parse_prometheus_metrics(metrics_response.text)
+
+        # Check that e2e latency has samples with priority="0" (the default)
+        e2e_count = _get_samples_by_name(
+            metrics, "sglang:e2e_request_latency_seconds_count"
+        )
+        priority_values = {s.labels.get("priority", "") for s in e2e_count}
+        self.assertIn(
+            "-1",
+            priority_values,
+            f"Expected priority='-1' from valid, got: {priority_values}",
         )
 
 

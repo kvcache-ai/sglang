@@ -219,6 +219,8 @@ MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
 
+DEFAULT_VALID_PRIORITY_VALUES = [1, 2, 3, 4, 5]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -342,6 +344,9 @@ class ServerArgs:
     enable_priority_scheduling: bool = False
     disable_priority_preemption: bool = False
     default_priority_value: Optional[int] = None
+    valid_priority_values: List[int] = dataclasses.field(
+        default_factory=lambda: list(DEFAULT_VALID_PRIORITY_VALUES)
+    )
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
@@ -3580,6 +3585,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.default_priority_value,
             help="Default priority for requests without explicit priority.",
+        )
+        parser.add_argument(
+            "--valid-priority-values",
+            type=int,
+            nargs="+",
+            default=DEFAULT_VALID_PRIORITY_VALUES,
+            help="Specify the list of valid priority values.",
         )
         parser.add_argument(
             "--abort-on-priority-when-disabled",
