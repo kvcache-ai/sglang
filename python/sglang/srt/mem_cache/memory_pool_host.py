@@ -1176,17 +1176,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             + self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
         )
 
-    def get_storage_key_suffixes(self) -> list[str]:
-        return ["k", "index"]
-
-    def get_registered_tensors(self) -> list[torch.Tensor]:
-        tensors = super().get_registered_tensors()
-        if self.layout == "layer_first":
-            tensors.extend(self.index_k_with_scale_buffer)
-        else:
-            tensors.append(self.index_k_with_scale_buffer)
-        return tensors
-
     def _init_indexer_buffers(self):
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         self.index_k_device_ptrs = torch.tensor(
@@ -1243,111 +1232,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         )
         return host_page_indices, device_page_indices
-
-    def _get_indexer_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
-        page_index = index // self.page_size
-        if self.layout == "layer_first":
-            data_page = torch.stack(
-                [
-                    self.index_k_with_scale_buffer[layer_id][
-                        page_index : page_index + 1, :
-                    ]
-                    for layer_id in range(self.layer_num)
-                ],
-                dim=0,
-            )
-        elif self.layout in ["page_first", "page_first_direct"]:
-            data_page = self.index_k_with_scale_buffer[
-                page_index : page_index + 1, :, :, :
-            ]
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
-
-        return data_page.flatten() if flat else data_page
-
-    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        kv_page = super().get_data_page(index, flat=False)
-        index_page = self._get_indexer_data_page(index, flat=False)
-        if flat:
-            return torch.cat([kv_page.flatten(), index_page.flatten()])
-        return [kv_page, index_page]
-
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
-        index_page = torch.zeros(
-            (
-                self.layer_num,
-                1,
-                self.indexer_page_stride_size,
-            ),
-            dtype=self.indexer_dtype,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        ).flatten()
-        return torch.cat([super().get_dummy_flat_data_page(), index_page])
-
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        kv_numel = super().get_dummy_flat_data_page().numel()
-        kv_page = data_page[:kv_numel]
-        index_page = data_page[kv_numel:]
-        super().set_from_flat_data_page(index, kv_page)
-
-        page_index = index // self.page_size
-        if self.layout == "layer_first":
-            reshaped = index_page.reshape(
-                self.layer_num,
-                1,
-                self.indexer_page_stride_size,
-            )
-            for layer_id in range(self.layer_num):
-                self.index_k_with_scale_buffer[layer_id][
-                    page_index : page_index + 1, :
-                ] = reshaped[layer_id]
-        elif self.layout in ["page_first", "page_first_direct"]:
-            self.index_k_with_scale_buffer[page_index : page_index + 1, :, :, :] = (
-                index_page.reshape(
-                    1,
-                    self.layer_num,
-                    1,
-                    self.indexer_page_stride_size,
-                )
-            )
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
-
-    def get_page_buffer_meta(self, indices):
-        ptr_list, element_size_list = super().get_page_buffer_meta(indices)
-        index_ptrs = []
-        indices = indices.tolist()
-
-        if self.layout == "layer_first":
-            for index in range(0, len(indices), self.page_size):
-                page_index = indices[index] // self.page_size
-                for layer_id in range(self.layer_num):
-                    index_ptr = self.index_k_with_scale_buffer[layer_id][
-                        page_index : page_index + 1, :
-                    ].data_ptr()
-                    index_ptrs.append(index_ptr)
-            index_element_size = (
-                self.indexer_page_stride_size * self.indexer_dtype.itemsize
-            )
-            index_element_size_list = [index_element_size] * len(index_ptrs)
-        elif self.layout in ["page_first", "page_first_direct"]:
-            for index in range(0, len(indices), self.page_size):
-                page_index = indices[index] // self.page_size
-                index_ptr = self.index_k_with_scale_buffer[
-                    page_index : page_index + 1, :, :, :
-                ].data_ptr()
-                index_ptrs.append(index_ptr)
-            index_element_size = (
-                self.layer_num
-                * self.indexer_page_stride_size
-                * self.indexer_dtype.itemsize
-            )
-            index_element_size_list = [index_element_size] * len(index_ptrs)
-        else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
-
-        return ptr_list + index_ptrs, element_size_list + index_element_size_list
 
     def _load_indexer_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend

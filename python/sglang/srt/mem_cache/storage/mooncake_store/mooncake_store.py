@@ -525,23 +525,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
-    def _get_generic_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        suffixes = self.mem_pool_host.get_storage_key_suffixes()
-        key_list = []
-        for key_ in keys:
-            for suffix in suffixes:
-                key_list.append(f"{key_}_{suffix}")
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
-
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         if self.storage_config.should_split_heads:
             return self._get_mha_split_heads_buffer_meta(keys, host_indices)
-        if self.storage_config.is_nsa_model:
-            return self._get_generic_buffer_meta(keys, host_indices)
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         return self._get_mha_buffer_meta(keys, host_indices)
