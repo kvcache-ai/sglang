@@ -544,10 +544,6 @@ class HiCacheHF3FS(HiCacheStorage):
             _keys.append(f"{k}-v")
         return _keys
 
-    def _get_zero_copy_keys(self, keys: List[str]) -> List[str]:
-        suffixes = self.mem_pool_host.get_storage_key_suffixes()
-        return [f"{key}-{suffix}" for key in keys for suffix in suffixes]
-
     def _get_mha_zero_copy_values(
         self, values: List[torch.Tensor]
     ) -> List[torch.Tensor]:
@@ -556,15 +552,6 @@ class HiCacheHF3FS(HiCacheStorage):
             _values.append(value[0])
             _values.append(value[1])
         return _values
-
-    def _get_zero_copy_values(self, values: List[torch.Tensor]) -> List[torch.Tensor]:
-        payloads = self.mem_pool_host.get_storage_payload_count_per_page()
-        if payloads == 1:
-            return values
-        flattened = []
-        for value in values:
-            flattened.extend(value)
-        return flattened
 
     def _batch_get_preprocess(self, keys, host_indices):
         page_num = len(host_indices) // self.mem_pool_host.page_size
@@ -583,9 +570,9 @@ class HiCacheHF3FS(HiCacheStorage):
             ]
         )
 
-        if self.is_zero_copy:
-            keys = self._get_zero_copy_keys(keys)
-            values = self._get_zero_copy_values(values)
+        if self.is_zero_copy and not self.is_mla_model:
+            keys = self._get_mha_zero_copy_keys(keys)
+            values = self._get_mha_zero_copy_values(values)
 
         return keys, values
 
@@ -593,12 +580,11 @@ class HiCacheHF3FS(HiCacheStorage):
         page_num = len(host_indices) // self.mem_pool_host.page_size
 
         if self.is_zero_copy:
-            payloads = self.mem_pool_host.get_storage_payload_count_per_page()
-            if payloads > 1:
+            if not self.is_mla_model:
                 results = [
-                    all(results[payloads * i : payloads * (i + 1)])
-                    for i in range(page_num)
+                    (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
                 ]
+                results = results[:page_num]
             return results
 
         for i in range(page_num):
@@ -631,9 +617,9 @@ class HiCacheHF3FS(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if self.is_zero_copy:
-            keys = self._get_zero_copy_keys(keys)
-            values = self._get_zero_copy_values(values)
+        if self.is_zero_copy and not self.is_mla_model:
+            keys = self._get_mha_zero_copy_keys(keys)
+            values = self._get_mha_zero_copy_values(values)
 
         return keys, values
 

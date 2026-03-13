@@ -331,7 +331,9 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
-            key_denominator = self.mem_pool_host.get_storage_payload_count_per_page()
+            key_denominator = (
+                1 if not self.is_mla_model else 2
+            )  # MLA model only has k buffer, no separate v buffer
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_denominator = 1
@@ -357,12 +359,18 @@ class HiCacheNixl(HiCacheStorage):
         return len(query_res) // key_denominator
 
     def _get_key_list_from_meta(self, keys: List[str]) -> List[str]:
-        suffixes = self.mem_pool_host.get_storage_key_suffixes()
-        return [
-            f"{self._get_suffixed_key(key_)}_{suffix}"
-            for key_ in keys
-            for suffix in suffixes
-        ]
+        # construct the key list for NIXL transfer based on the keys and the suffix, for each key, we will have one suffixed key for k buffer and one suffixed key for v buffer if it's not an MLA model, and only one suffixed key for k buffer if it's an MLA model, since MLA model only has k/v interleaved buffer
+        key_list = []
+
+        for key_ in keys:
+            suffixed_key = self._get_suffixed_key(key_)
+            if self.is_mla_model:
+                key_list.append(f"{suffixed_key}_k")
+            else:
+                key_list.append(f"{suffixed_key}_k")
+                key_list.append(f"{suffixed_key}_v")
+
+        return key_list
 
     def _get_location_and_size_list_from_meta(
         self, keys: List[str], host_indices: torch.Tensor
@@ -453,12 +461,13 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.is_zero_copy:
             # zero copy: update final results based on the boolean results from NIXL transfer
-            payloads = self.mem_pool_host.get_storage_payload_count_per_page()
-            if payloads == 1:
+            if self.is_mla_model:
                 return results
-            return [
-                all(results[payloads * i : payloads * (i + 1)]) for i in range(page_num)
-            ]
+            else:
+                results = [
+                    (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
+                ]
+                return results
         else:
             # non zero copy: copy data from temporary tensors to mem_pool_host page by page
             for i in range(page_num):
@@ -522,7 +531,7 @@ class HiCacheNixl(HiCacheStorage):
             # non zero copy: NIXL still requires contiguous tensors for transfer
             target_tensors = [
                 self.mem_pool_host.get_data_page(
-                    host_indices[i * self.mem_pool_host.page_size], flat=True
+                    host_indices[i * self.mem_pool_host.page_size], flat=False
                 ).contiguous()
                 for i in range(page_num)
             ]

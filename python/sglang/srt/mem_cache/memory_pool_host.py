@@ -209,25 +209,6 @@ class HostKVCache(abc.ABC):
     def init_kv_buffer(self):
         raise NotImplementedError()
 
-    def get_registered_tensors(self) -> list[torch.Tensor]:
-        return [self.kv_buffer]
-
-    def _get_storage_payload_key_suffixes(self) -> list[str]:
-        return (
-            ["k"]
-            if self.device_pool.__class__.__name__.startswith("MLA")
-            else [
-                "k",
-                "v",
-            ]
-        )
-
-    def get_storage_payload_count_per_page(self) -> int:
-        return len(self.get_storage_key_suffixes())
-
-    def get_storage_key_suffixes(self) -> list[str]:
-        return self._get_storage_payload_key_suffixes()
-
     def _raise_no_growth(self, need_size: int) -> None:
         logger.debug(
             "Host KV cache allocation failed: requested %d tokens, available %d tokens.",
@@ -361,9 +342,6 @@ class MHATokenToKVPoolHost(HostKVCache):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token() // 2
-
-    def get_storage_key_suffixes(self) -> list[str]:
-        return ["k", "v"]
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
@@ -821,9 +799,6 @@ class MLATokenToKVPoolHost(HostKVCache):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
-
-    def get_storage_key_suffixes(self) -> list[str]:
-        return ["k"]
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":

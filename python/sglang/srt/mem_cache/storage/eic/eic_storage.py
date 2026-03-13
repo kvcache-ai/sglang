@@ -303,12 +303,12 @@ class EICStorage(HiCacheStorage):
         meminfo.type = eic.MemoryType.MEMORY_CUDA
         meminfo.cuda_id = 0
         vals = eic.IOBuffers()
-        for buffer in memory_pool_host.get_registered_tensors():
-            vals.append(
-                buffer.data_ptr(),
-                buffer.numel() * buffer.element_size(),
-                True,
-            )
+        buffer = memory_pool_host.kv_buffer
+        vals.append(
+            buffer.data_ptr(),
+            buffer.numel() * buffer.element_size(),
+            True,
+        )
         self.connection.register_memory(vals, meminfo)
 
     def _init_eic_prefix(self):
@@ -687,10 +687,6 @@ class EICStorage(HiCacheStorage):
             new_keys.append(f"{k}_v")
         return new_keys
 
-    def _get_zero_copy_keys(self, keys: List[str]) -> List[str]:
-        suffixes = self.memory_pool_host.get_storage_key_suffixes()
-        return [f"{key}_{suffix}" for key in keys for suffix in suffixes]
-
     def _get_mha_zero_copy_values(
         self, values: List[torch.Tensor]
     ) -> List[torch.Tensor]:
@@ -698,15 +694,6 @@ class EICStorage(HiCacheStorage):
         for value in values:
             new_values.append(value[0])
             new_values.append(value[1])
-        return new_values
-
-    def _get_zero_copy_values(self, values: List[torch.Tensor]) -> List[torch.Tensor]:
-        payloads = self.memory_pool_host.get_storage_payload_count_per_page()
-        if payloads == 1:
-            return values
-        new_values = []
-        for value in values:
-            new_values.extend(value)
         return new_values
 
     def _batch_get_preprocess(self, keys, host_indices):
@@ -726,9 +713,9 @@ class EICStorage(HiCacheStorage):
             ]
         )
 
-        if self.use_zero_copy:
-            keys = self._get_zero_copy_keys(keys)
-            values = self._get_zero_copy_values(values)
+        if self.use_zero_copy and not self.is_mla_model:
+            keys = self._get_mha_zero_copy_keys(keys)
+            values = self._get_mha_zero_copy_values(values)
 
         return keys, values
 
@@ -736,12 +723,11 @@ class EICStorage(HiCacheStorage):
         page_num = len(host_indices) // self.page_size
 
         if self.use_zero_copy:
-            payloads = self.memory_pool_host.get_storage_payload_count_per_page()
-            if payloads > 1:
+            if not self.is_mla_model:
                 results = [
-                    all(results[payloads * i : payloads * (i + 1)])
-                    for i in range(page_num)
+                    (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
                 ]
+                results = results[:page_num]
             return results
 
         # dummy page copy to host memory pool
@@ -774,9 +760,9 @@ class EICStorage(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if self.use_zero_copy:
-            keys = self._get_zero_copy_keys(keys)
-            values = self._get_zero_copy_values(values)
+        if self.use_zero_copy and not self.is_mla_model:
+            keys = self._get_mha_zero_copy_keys(keys)
+            values = self._get_mha_zero_copy_values(values)
 
         return keys, values
 
