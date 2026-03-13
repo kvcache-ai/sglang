@@ -455,9 +455,15 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
-            )
+            if (
+                getattr(self.mem_pool_host, "host_memory_mode", "cache")
+                == "buffer_only"
+            ):
+                self.prefetch_capacity_limit = self.mem_pool_host.size
+            else:
+                self.prefetch_capacity_limit = max(
+                    0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
+                )
             # granularity of batch storage IO operations, in number of pages
             self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
@@ -591,6 +597,7 @@ class HiCacheController:
             self.dp_rank = 0
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
+        is_nsa_backend = hasattr(self.mem_pool_device, "index_k_with_scale_buffer")
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
@@ -612,6 +619,7 @@ class HiCacheController:
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
+            is_nsa_model=is_nsa_backend,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,

@@ -547,8 +547,10 @@ class ServerArgs:
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
+    hicache_host_memory_mode: str = "cache"
     hicache_ratio: float = 2.0
     hicache_size: int = 0
+    hicache_buffer_pages: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
@@ -2657,6 +2659,44 @@ class ServerArgs:
             )
 
     def _handle_hicache(self):
+        if self.hicache_host_memory_mode not in ["cache", "buffer_only"]:
+            raise ValueError(
+                "hicache_host_memory_mode must be either 'cache' or 'buffer_only', "
+                f"got {self.hicache_host_memory_mode!r}"
+            )
+
+        if self.hicache_host_memory_mode == "buffer_only":
+            if self.hicache_ratio != ServerArgs.hicache_ratio:
+                raise ValueError(
+                    "--hicache-ratio is not supported when "
+                    "--hicache-host-memory-mode=buffer_only. "
+                    "Use --hicache-buffer-pages."
+                )
+            if self.hicache_size != 0:
+                raise ValueError(
+                    "--hicache-size is not supported when "
+                    "--hicache-host-memory-mode=buffer_only. "
+                    "Use --hicache-buffer-pages."
+                )
+            if self.hicache_buffer_pages <= 0:
+                cps = self.chunked_prefill_size
+                ps = self.page_size
+                if cps is not None and cps > 0 and ps is not None and ps > 0:
+                    self.hicache_buffer_pages = 2 * (cps // ps)
+                    logger.info(
+                        "Auto-computed hicache_buffer_pages=%d "
+                        "(2 * chunked_prefill_size(%d) / page_size(%d))",
+                        self.hicache_buffer_pages,
+                        cps,
+                        ps,
+                    )
+                else:
+                    raise ValueError(
+                        "hicache_buffer_pages must be > 0 when "
+                        "hicache_host_memory_mode=buffer_only, and could not "
+                        "auto-compute (chunked_prefill_size or page_size unavailable)."
+                    )
+
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
@@ -4751,6 +4791,13 @@ class ServerArgs:
             help="Enable hierarchical cache",
         )
         parser.add_argument(
+            "--hicache-host-memory-mode",
+            type=str,
+            choices=["cache", "buffer_only"],
+            default=ServerArgs.hicache_host_memory_mode,
+            help="Choose whether host memory is a persistent HiCache tier or a transient staging buffer only.",
+        )
+        parser.add_argument(
             "--hicache-ratio",
             type=float,
             default=ServerArgs.hicache_ratio,
@@ -4761,6 +4808,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.hicache_size,
             help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        )
+        parser.add_argument(
+            "--hicache-buffer-pages",
+            type=int,
+            default=ServerArgs.hicache_buffer_pages,
+            help="Host staging buffer size in pages when --hicache-host-memory-mode=buffer_only.",
         )
         parser.add_argument(
             "--hicache-write-policy",

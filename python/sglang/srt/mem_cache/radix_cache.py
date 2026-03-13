@@ -138,6 +138,8 @@ class TreeNode:
         self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+        # whether the page range is durably backed by storage even if host_value is absent
+        self.storage_backed = False
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
@@ -153,6 +155,10 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
+
+    @property
+    def storage_ready(self):
+        return self.backuped or self.storage_backed
 
     def protect_host(self):
         """Protect the host value from eviction."""
@@ -360,6 +366,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
         self.root_node.value = []
         self.root_node.host_value = []
+        self.root_node.storage_backed = True
         self.root_node.lock_ref = 1
         self.root_node.hash_value = []
         self.evictable_size_ = 0

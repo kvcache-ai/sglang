@@ -1802,7 +1802,14 @@ class Scheduler(
                 if req.last_host_backup_node is not None
                 else req.last_host_node
             )
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+            if (
+                getattr(
+                    last_host_node,
+                    "storage_ready",
+                    getattr(last_host_node, "backuped", False),
+                )
+                or last_host_node is self.tree_cache.root_node
+            ):
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]

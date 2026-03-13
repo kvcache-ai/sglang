@@ -484,9 +484,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first_direct",
             "page_head",
         ], "mooncake store storage backend only support page first or page first direct layout"
-        buffer = self.mem_pool_host.kv_buffer
         try:
-            super().register_buffer(buffer)
+            for buffer in self.mem_pool_host.get_registered_tensors():
+                super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -525,16 +525,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
+    def _get_generic_buffer_meta(self, keys, indices):
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+        suffixes = self.mem_pool_host.get_storage_key_suffixes()
+        key_list = []
+        for key_ in keys:
+            for suffix in suffixes:
+                key_list.append(f"{key_}_{suffix}")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        if self.storage_config.should_split_heads:
+            return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+        if self.storage_config.is_nsa_model:
+            return self._get_generic_buffer_meta(keys, host_indices)
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
-        else:
-            if self.storage_config.should_split_heads:
-                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
-            else:
-                return self._get_mha_buffer_meta(keys, host_indices)
+        return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         """
@@ -544,32 +554,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for batch_put_from, results is Vector of integers,
             where each element is 0 on success, or a negative value on error
         """
-        if self.is_mla_backend:
-            return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
+        if self.storage_config.should_split_heads:
+            payloads_per_page = self.split_factor * 2
         else:
-            if self.storage_config.should_split_heads:
-                kv_groups = [
-                    results[i : i + self.split_factor * 2]
-                    for i in range(0, len(results), self.split_factor * 2)
-                ]
-                return [
-                    (
-                        all(res == 0 for res in kv_group)
-                        if is_set_operate
-                        else all(res > 0 for res in kv_group)
-                    )
-                    for kv_group in kv_groups
-                ]
-            else:
-                kv_pairs = zip(results[::2], results[1::2])
-                return [
-                    (
-                        (k_res == 0 and v_res == 0)
-                        if is_set_operate
-                        else (k_res > 0 and v_res > 0)
-                    )
-                    for k_res, v_res in kv_pairs
-                ]
+            payloads_per_page = self.mem_pool_host.get_storage_payload_count_per_page()
+
+        if payloads_per_page == 1:
+            return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
+
+        payload_groups = [
+            results[i : i + payloads_per_page]
+            for i in range(0, len(results), payloads_per_page)
+        ]
+        return [
+            (
+                all(res == 0 for res in payload_group)
+                if is_set_operate
+                else all(res > 0 for res in payload_group)
+            )
+            for payload_group in payload_groups
+        ]
 
     def batch_get_v1(
         self,
