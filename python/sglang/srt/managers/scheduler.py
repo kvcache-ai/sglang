@@ -1797,31 +1797,35 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            prefetch_node = req.last_host_node
-            # In buffer_only mode last_host_node is root; use the device node
-            # which carries the correct hash at the GPU cache boundary.
+            last_host_node = (
+                req.last_host_backup_node
+                if req.last_host_backup_node is not None
+                else req.last_host_node
+            )
+            # In buffer_only mode last_host_node is root; the device node
+            # carries the correct hash at the GPU cache boundary.
             if (
-                prefetch_node is self.tree_cache.root_node
+                last_host_node is self.tree_cache.root_node
                 and req.last_node is not self.tree_cache.root_node
             ):
-                prefetch_node = req.last_node
+                last_host_node = req.last_node
             if (
-                prefetch_node.backuped
-                or prefetch_node is self.tree_cache.root_node
-                or prefetch_node.hash_value is not None
+                last_host_node.backuped
+                or last_host_node is self.tree_cache.root_node
+                or last_host_node.hash_value is not None
             ):
-                last_hash = prefetch_node.get_last_hash_value()
+                last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
-                    prefetch_node.get_prefix_hash_values(prefetch_node.parent)
+                    last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
-                    prefetch_node,
+                    last_host_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
