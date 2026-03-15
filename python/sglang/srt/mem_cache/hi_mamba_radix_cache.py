@@ -744,7 +744,6 @@ class HiMambaRadixCache(MambaRadixCache):
                 device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
-                last_host_backup_node=self.root_node,
                 host_hit_length=0,
             )
 
@@ -851,14 +850,6 @@ class HiMambaRadixCache(MambaRadixCache):
 
         last_host_node = best_last_node
 
-        # last_host_backup_node: from deepest_node, find backuped ancestor
-        last_host_backup_node = deepest_node
-        while (
-            last_host_backup_node is not self.root_node
-            and not last_host_backup_node.backuped
-        ):
-            last_host_backup_node = last_host_backup_node.parent
-
         mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
@@ -887,7 +878,6 @@ class HiMambaRadixCache(MambaRadixCache):
             device_indices=value,
             last_device_node=last_device_node,
             last_host_node=last_host_node,
-            last_host_backup_node=last_host_backup_node,
             host_hit_length=host_hit_length,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )

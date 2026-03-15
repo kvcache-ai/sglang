@@ -522,11 +522,9 @@ class HiRadixCache(RadixCache):
                 if entry is not None:
                     if self.host_memory_mode == "buffer_only":
                         node, host_indices = entry
-                        node.storage_backed = operation.completed_tokens > 0
                         node.release_host()
                         cc.mem_pool_host.free(host_indices)
                     else:
-                        entry.storage_backed = operation.completed_tokens > 0
                         entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
@@ -731,7 +729,7 @@ class HiRadixCache(RadixCache):
             if (
                 node.parent is None
                 or node.value is None
-                or node.storage_ready
+                or node.backuped
                 or node.id in self.ongoing_write_through
             ):
                 reason = (
@@ -739,8 +737,8 @@ class HiRadixCache(RadixCache):
                     if node.parent is None
                     else "evicted"
                     if node.value is None
-                    else "storage_ready"
-                    if node.storage_ready
+                    else "backuped"
+                    if node.backuped
                     else "already_in_flight"
                 )
                 logger.info(
@@ -783,7 +781,7 @@ class HiRadixCache(RadixCache):
             return
         node.hit_count += 1
 
-        if not node.storage_ready:
+        if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
                 self.write_backup(node)
@@ -1008,7 +1006,7 @@ class HiRadixCache(RadixCache):
 
             if self._is_pinned(x):
                 # Still active: demote to host if possible
-                if x.storage_ready:
+                if x.backuped:
                     num_evicted += self._evict_backuped(x)
                     continue
                 written = self.write_backup(x, write_back=True)
@@ -1026,7 +1024,7 @@ class HiRadixCache(RadixCache):
                 # Expired pin: clear and fall through to normal eviction
                 self._clear_pin(x)
 
-            if not x.storage_ready:
+            if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     num_evicted += self.write_backup(x, write_back=True)
@@ -1049,7 +1047,7 @@ class HiRadixCache(RadixCache):
         if self.cache_controller.write_policy == "write_back":
             self.writing_check(write_back=True)
             for node in write_back_nodes:
-                assert node.storage_ready
+                assert node.backuped
                 self._evict_backuped(node)
 
         self.update_eviction_metrics(num_evicted, start_time)
@@ -1068,15 +1066,6 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
-        if node.storage_backed:
-            num_evicted = self.cache_controller.evict_device(node.value)
-            assert num_evicted > 0
-            self.evictable_size_ -= num_evicted
-            node.value = None
-            self._update_leaf_status(node)
-            self._update_host_leaf_status(node)
-            self._update_leaf_status(node.parent)
-            return num_evicted
         # evict a node not initiated write to host -- emit BlockRemoved
         self._record_remove_event(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
@@ -1454,7 +1443,6 @@ class HiRadixCache(RadixCache):
 
         host_hit_length = 0
         last_host_node = last_node
-        last_host_backup_node = last_node
         if self.host_memory_mode == "cache":
             while last_node.evicted:
                 host_hit_length += len(last_node.host_value)
@@ -1465,14 +1453,11 @@ class HiRadixCache(RadixCache):
             while last_node.evicted:
                 last_node = last_node.parent
             last_host_node = self.root_node
-        while not last_host_backup_node.storage_ready:
-            last_host_backup_node = last_host_backup_node.parent
 
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
-            last_host_backup_node=last_host_backup_node,
             host_hit_length=host_hit_length,
         )
 
@@ -1542,11 +1527,9 @@ class HiRadixCache(RadixCache):
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
-            node.storage_backed = True
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
-                new_node.storage_backed = True
                 node = new_node
 
             if len(key):
@@ -1559,7 +1542,6 @@ class HiRadixCache(RadixCache):
             new_node.value = None
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
-            new_node.storage_backed = True
             node.children[child_key] = new_node
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
@@ -1585,10 +1567,8 @@ class HiRadixCache(RadixCache):
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
-            node.storage_backed = True
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
-                new_node.storage_backed = True
                 node = new_node
 
             if len(key):
@@ -1600,7 +1580,6 @@ class HiRadixCache(RadixCache):
             new_node.key = key
             new_node.value = value.clone()
             new_node.hash_value = hash_value
-            new_node.storage_backed = True
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)
@@ -1660,7 +1639,6 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
-        new_node.storage_backed = child.storage_backed
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
