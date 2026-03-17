@@ -165,11 +165,15 @@ class HostKVCache(abc.ABC):
             else:
                 self.size = int(device_pool.size * host_to_device_ratio)
         else:
-            if buffer_pages <= 0:
+            if buffer_pages > 0:
+                self.size = buffer_pages * self.page_size
+            elif host_size > 0:
+                self.size = int(host_size * 1e9 // self.size_per_token)
+            else:
                 raise ValueError(
-                    "buffer_pages must be > 0 when host_memory_mode=buffer_only"
+                    "buffer_pages or host_size must be > 0 when "
+                    "host_memory_mode=buffer_only"
                 )
-            self.size = buffer_pages * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         # Align up the host memory pool size to the page size.

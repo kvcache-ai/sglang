@@ -2696,36 +2696,26 @@ class ServerArgs:
             )
 
         if self.hicache_host_memory_mode == "buffer_only":
-            if self.hicache_ratio != ServerArgs.hicache_ratio:
-                raise ValueError(
-                    "--hicache-ratio is not supported when "
-                    "--hicache-host-memory-mode=buffer_only. "
-                    "Use --hicache-buffer-pages."
-                )
-            if self.hicache_size != 0:
-                raise ValueError(
-                    "--hicache-size is not supported when "
-                    "--hicache-host-memory-mode=buffer_only. "
-                    "Use --hicache-buffer-pages."
-                )
-            if self.hicache_buffer_pages <= 0:
+            if self.hicache_size <= 0:
                 cps = self.chunked_prefill_size
                 ps = self.page_size
                 if cps is not None and cps > 0 and ps is not None and ps > 0:
-                    self.hicache_buffer_pages = 2 * (cps // ps)
+                    self.hicache_buffer_pages = 4 * (cps // ps)
                     logger.info(
                         "Auto-computed hicache_buffer_pages=%d "
-                        "(2 * chunked_prefill_size(%d) / page_size(%d))",
+                        "(4 * chunked_prefill_size(%d) / page_size(%d))",
                         self.hicache_buffer_pages,
                         cps,
                         ps,
                     )
                 else:
                     raise ValueError(
-                        "hicache_buffer_pages must be > 0 when "
+                        "hicache_size must be > 0 when "
                         "hicache_host_memory_mode=buffer_only, and could not "
                         "auto-compute (chunked_prefill_size or page_size unavailable)."
                     )
+            else:
+                self.hicache_buffer_pages = 0
 
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -4862,19 +4852,13 @@ class ServerArgs:
             "--hicache-ratio",
             type=float,
             default=ServerArgs.hicache_ratio,
-            help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+            help="The ratio of the size of host KV cache memory pool to the size of device pool. This is only used when --hicache-host-memory-mode=cache.",
         )
         parser.add_argument(
             "--hicache-size",
             type=int,
             default=ServerArgs.hicache_size,
-            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
-        )
-        parser.add_argument(
-            "--hicache-buffer-pages",
-            type=int,
-            default=ServerArgs.hicache_buffer_pages,
-            help="Host staging buffer size in pages when --hicache-host-memory-mode=buffer_only.",
+            help="The size of host KV cache memory pool in gigabytes. In cache mode it overrides --hicache-ratio; in buffer_only mode it overrides the default staging buffer size.",
         )
         parser.add_argument(
             "--hicache-write-policy",
@@ -5698,7 +5682,7 @@ class ServerArgs:
         args.ep_size = args.expert_parallel_size
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        return cls(**{attr: getattr(args, attr, getattr(cls, attr)) for attr in attrs})
 
     def url(self):
         scheme = "https" if self.ssl_certfile else "http"
