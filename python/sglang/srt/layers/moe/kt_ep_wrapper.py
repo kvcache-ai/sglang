@@ -82,6 +82,7 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    numa_nodes: Optional[List[int]] = None
 
 
 _SHARED_FULL_CONTEXT = None
@@ -1667,6 +1668,7 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        numa_nodes=[int(x) for x in server_args.kt_numa_nodes.split(",")] if server_args.kt_numa_nodes else None,
     )
 
 
@@ -2105,6 +2107,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
                 max_deferred_experts_per_token=layer_max_deferred,
+                numa_nodes=self.kt_config.numa_nodes,
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
