@@ -74,6 +74,21 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.host_memory_mode = server_args.hicache_host_memory_mode
 
+        buffer_pages = 0
+        if (
+            server_args.hicache_host_memory_mode == "buffer_only"
+            and server_args.hicache_size <= 0
+        ):
+            cps = server_args.chunked_prefill_size
+            buffer_pages = 4 * (cps // self.page_size)
+            logger.info(
+                "Auto-computed buffer_pages=%d "
+                "(4 * chunked_prefill_size(%d) / page_size(%d))",
+                buffer_pages,
+                cps,
+                self.page_size,
+            )
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -83,7 +98,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
                 host_memory_mode=server_args.hicache_host_memory_mode,
-                buffer_pages=server_args.hicache_buffer_pages,
+                buffer_pages=buffer_pages,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
@@ -94,7 +109,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
                 host_memory_mode=server_args.hicache_host_memory_mode,
-                buffer_pages=server_args.hicache_buffer_pages,
+                buffer_pages=buffer_pages,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -105,7 +120,7 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
                 host_memory_mode=server_args.hicache_host_memory_mode,
-                buffer_pages=server_args.hicache_buffer_pages,
+                buffer_pages=buffer_pages,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")

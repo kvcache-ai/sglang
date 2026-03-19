@@ -552,7 +552,6 @@ class ServerArgs:
     hicache_host_memory_mode: str = "cache"
     hicache_ratio: float = 2.0
     hicache_size: int = 0
-    hicache_buffer_pages: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
@@ -2744,27 +2743,6 @@ class ServerArgs:
                 f"got {self.hicache_host_memory_mode!r}"
             )
 
-        if self.hicache_host_memory_mode == "buffer_only":
-            if self.hicache_size <= 0:
-                cps = self.chunked_prefill_size
-                ps = self.page_size
-                if cps is not None and cps > 0 and ps is not None and ps > 0:
-                    self.hicache_buffer_pages = 4 * (cps // ps)
-                    logger.info(
-                        "Auto-computed hicache_buffer_pages=%d "
-                        "(4 * chunked_prefill_size(%d) / page_size(%d))",
-                        self.hicache_buffer_pages,
-                        cps,
-                        ps,
-                    )
-                else:
-                    raise ValueError(
-                        "hicache_size must be > 0 when "
-                        "hicache_host_memory_mode=buffer_only, and could not "
-                        "auto-compute (chunked_prefill_size or page_size unavailable)."
-                    )
-            else:
-                self.hicache_buffer_pages = 0
 
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -5768,7 +5746,7 @@ class ServerArgs:
         args.ep_size = args.expert_parallel_size
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr, getattr(cls, attr)) for attr in attrs})
+        return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
         scheme = "https" if self.ssl_certfile else "http"
