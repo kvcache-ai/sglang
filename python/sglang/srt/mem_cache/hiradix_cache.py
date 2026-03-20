@@ -682,13 +682,13 @@ class HiRadixCache(RadixCache):
 
     def write_backup(self, node: TreeNode, write_back=False):
         if self.host_memory_mode == "buffer_only":
-            if not self.enable_storage or write_back:
-                return 0
-            if (
-                node.id in self.ongoing_write_through
-                or node.id in self.pending_write_node_ids
-            ):
-                return 0
+          if (
+              not self.enable_storage
+              or write_back
+              or node.id in self.ongoing_write_through
+              or node.id in self.pending_write_node_ids
+          ):
+              return 0
             self.pending_write_queue.append(node)
             self.pending_write_node_ids.add(node.id)
             return 0
