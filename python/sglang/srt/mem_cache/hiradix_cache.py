@@ -753,13 +753,9 @@ class HiRadixCache(RadixCache):
                 reason = (
                     "evicted"
                     if node.value is None
-                    else "backuped"
-                    if node.backuped
-                    else "already_in_flight"
+                    else "backuped" if node.backuped else "already_in_flight"
                 )
-                logger.info(
-                    "Pending write node %d dropped: %s", node.id, reason
-                )
+                logger.info("Pending write node %d dropped: %s", node.id, reason)
                 self.pending_write_queue.popleft()
                 self.pending_write_node_ids.discard(node.id)
                 stale += 1
@@ -1086,9 +1082,9 @@ class HiRadixCache(RadixCache):
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
         self._record_remove_event(node)
+        num_evicted = len(node.value)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         node.value = None
-        num_evicted = len(node.value)
         self._delete_leaf(node)
         return num_evicted
 
