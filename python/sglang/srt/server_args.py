@@ -2782,7 +2782,6 @@ class ServerArgs:
                 f"got {self.hicache_host_memory_mode!r}"
             )
 
-
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
