@@ -746,15 +746,12 @@ class HiRadixCache(RadixCache):
         while self.pending_write_queue and scanned < scan_limit:
             node = self.pending_write_queue[0]
             if (
-                node.parent is None
-                or node.value is None
+                node.value is None
                 or node.backuped
                 or node.id in self.ongoing_write_through
             ):
                 reason = (
-                    "detached"
-                    if node.parent is None
-                    else "evicted"
+                    "evicted"
                     if node.value is None
                     else "backuped"
                     if node.backuped
@@ -1090,6 +1087,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host -- emit BlockRemoved
         self._record_remove_event(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
+        node.value = None
         num_evicted = len(node.value)
         self._delete_leaf(node)
         return num_evicted
