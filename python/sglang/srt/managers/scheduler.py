@@ -1818,11 +1818,7 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = (
-                req.last_host_backup_node
-                if req.last_host_backup_node is not None
-                else req.last_host_node
-            )
+            last_host_node = req.last_host_node
             # In buffer_only mode last_host_node is root; the device node
             # carries the correct hash at the GPU cache boundary.
             if (
