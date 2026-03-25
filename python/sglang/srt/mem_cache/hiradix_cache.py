@@ -73,11 +73,13 @@ class HiRadixCache(RadixCache):
             and server_args.hicache_size <= 0
         ):
             cps = server_args.chunked_prefill_size
+            if cps is None or cps <= 0:
+                cps = server_args.max_prefill_tokens
             multiplier = envs.SGLANG_HICACHE_BUFFER_SIZE_MULTIPLIER
             buffer_pages = multiplier * (cps // self.page_size)
             logger.info(
                 "Auto-computed buffer_pages=%d "
-                "(%d * chunked_prefill_size(%d) / page_size(%d))",
+                "(%d * prefill_budget(%d) / page_size(%d))",
                 buffer_pages,
                 multiplier,
                 cps,
