@@ -463,11 +463,7 @@ class HiRadixCache(RadixCache):
 
         # Force release leftover backup ops: drop host protection on nodes.
         try:
-            for ack_id, entry in list(self.ongoing_backup.items()):
-                if self.host_memory_mode == "buffer_only":
-                    node, host_indices = entry
-                else:
-                    node, host_indices = entry, None
+            for ack_id, (node, host_indices) in list(self.ongoing_backup.items()):
                 try:
                     node.release_host()
                 except Exception:
@@ -536,12 +532,10 @@ class HiRadixCache(RadixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
-                    if self.host_memory_mode == "buffer_only":
-                        node, host_indices = entry
-                        node.release_host()
+                    node, host_indices = entry
+                    node.release_host()
+                    if host_indices is not None:
                         cc.mem_pool_host.free(host_indices)
-                    else:
-                        entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -704,7 +698,7 @@ class HiRadixCache(RadixCache):
             if host_indices is not None:
                 node.host_value = host_indices
                 assert len(node.host_value) > 0
-                self.ongoing_write_through[node.id] = node
+                self.ongoing_write_through[node.id] = (node, None)
                 if not write_back:
                     # no need to lock nodes if write back
                     self.inc_lock_ref(node)
@@ -719,16 +713,17 @@ class HiRadixCache(RadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
+        # host_indices is non-None only in buffer_only mode where the buffer
+        # pages are separately allocated and must be freed after the write.
+        # In cache mode we read from node.host_value which belongs to the node.
+        free_indices = host_indices
         if host_indices is None:
             host_indices = node.host_value
 
         operation_id = self.cache_controller.write_storage(
             host_indices, node.key, node.hash_value, prefix_keys
         )
-        if self.host_memory_mode == "buffer_only":
-            self.ongoing_backup[operation_id] = (node, host_indices)
-        else:
-            self.ongoing_backup[operation_id] = node
+        self.ongoing_backup[operation_id] = (node, free_indices)
         node.protect_host()
 
     def _flush_pending_writes(self):
@@ -800,11 +795,9 @@ class HiRadixCache(RadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        backuped = self.ongoing_write_through.pop(ack_id)
-                        if self.host_memory_mode == "buffer_only":
-                            backuped_node, host_indices = backuped
-                        else:
-                            backuped_node, host_indices = backuped, None
+                        backuped_node, host_indices = self.ongoing_write_through.pop(
+                            ack_id
+                        )
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node, host_indices)
                 self.cache_controller.ack_write_queue.clear()
@@ -834,11 +827,7 @@ class HiRadixCache(RadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                backuped = self.ongoing_write_through.pop(ack_id)
-                if self.host_memory_mode == "buffer_only":
-                    backuped_node, host_indices = backuped
-                else:
-                    backuped_node, host_indices = backuped, None
+                backuped_node, host_indices = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node, host_indices)
