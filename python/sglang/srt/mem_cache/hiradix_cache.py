@@ -1024,7 +1024,12 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # GPU -> slower tier demotion: no BlockRemoved since block remains reachable.
+        # GPU -> host demotion: block is still locally reachable via load_back,
+        # so no BlockRemoved in cache mode.  In buffer_only mode the host tier
+        # is transient and data lives in shared storage — this worker has no
+        # local advantage, so we notify the router.
+        if self.host_memory_mode == "buffer_only":
+            self._record_remove_event(node)
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
