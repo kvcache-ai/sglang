@@ -1430,15 +1430,15 @@ class HiRadixCache(RadixCache):
 
         host_hit_length = 0
         last_host_node = last_node
-        if self.host_memory_mode == "cache":
-            while last_node.evicted:
+        while last_node.evicted:
+            if last_node.host_value is not None:
                 host_hit_length += len(last_node.host_value)
-                last_node = last_node.parent
+            last_node = last_node.parent
+
+        if self.host_memory_mode == "cache":
             while not last_host_node.backuped:
                 last_host_node = last_host_node.parent
         else:
-            while last_node.evicted:
-                last_node = last_node.parent
             last_host_node = self.root_node
 
         return MatchResult(
