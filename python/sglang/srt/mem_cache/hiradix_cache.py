@@ -680,38 +680,36 @@ class HiRadixCache(RadixCache):
     def write_backup(self, node: TreeNode, write_back=False):
         if self.host_memory_mode == "buffer_only":
             if (
-                not self.enable_storage
-                or write_back
-                or node.id in self.ongoing_write_through
-                or node.id in self.pending_write_node_ids
+                self.enable_storage
+                and not write_back
+                and node.id not in self.ongoing_write_through
+                and node.id not in self.pending_write_node_ids
             ):
-                return 0
-            self.pending_write_queue.append(node)
-            self.pending_write_node_ids.add(node.id)
+                self.pending_write_queue.append(node)
+                self.pending_write_node_ids.add(node.id)
             return 0
 
-        if node.id in self.ongoing_write_through:
-            return 0
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-        )
-        if host_indices is None:
-            self.evict_host(len(node.value))
+        written = 0
+        if node.id not in self.ongoing_write_through:
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
             )
-        if host_indices is not None:
-            node.host_value = host_indices
-            assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = node
-            if not write_back:
-                self.inc_lock_ref(node)
-        else:
-            return 0
-
-        return len(host_indices)
+            if host_indices is None:
+                self.evict_host(len(node.value))
+                host_indices = self.cache_controller.write(
+                    device_indices=node.value,
+                    node_id=node.id,
+                )
+            if host_indices is not None:
+                node.host_value = host_indices
+                assert len(node.host_value) > 0
+                self.ongoing_write_through[node.id] = node
+                if not write_back:
+                    # no need to lock nodes if write back
+                    self.inc_lock_ref(node)
+                written = len(host_indices)
+        return written
 
     def write_backup_storage(
         self, node: TreeNode, host_indices: Optional[torch.Tensor] = None
