@@ -1158,6 +1158,30 @@ class HiRadixCache(RadixCache):
 
         return device_indices
 
+    def _load_to_device(
+        self, host_indices: torch.Tensor, node_id: int
+    ) -> Optional[torch.Tensor]:
+        """Allocate device memory and synchronously copy host data into it."""
+        device_indices = self.cache_controller.load(
+            host_indices=host_indices, node_id=node_id
+        )
+        if device_indices is None:
+            self.evict(EvictParams(num_tokens=len(host_indices)))
+            device_indices = self.cache_controller.load(
+                host_indices=host_indices, node_id=node_id
+            )
+        if device_indices is None:
+            logger.warning(
+                "Could not allocate device memory for %d tokens", len(host_indices)
+            )
+            return None
+        self.cache_controller.start_loading()
+        _start_event, finish_event, _ack_ids = self.cache_controller.ack_load_queue.pop(
+            0
+        )
+        finish_event.synchronize()
+        return device_indices
+
     def init_load_back(
         self,
         params: InitLoadBackParams,
@@ -1320,23 +1344,11 @@ class HiRadixCache(RadixCache):
             )
             min_completed_tokens = completed_tokens_tensor.item()
         fetched_token_ids = token_ids[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
         matched_length = 0
         if self.host_memory_mode == "buffer_only":
-            written_indices = host_indices[:min_completed_tokens]
-            device_indices = self.cache_controller.load(
-                host_indices=written_indices, node_id=last_host_node.id
-            )
-            if device_indices is None:
-                self.evict(EvictParams(num_tokens=len(written_indices)))
-                device_indices = self.cache_controller.load(
-                    host_indices=written_indices, node_id=last_host_node.id
-                )
+            device_indices = self._load_to_device(written_indices, last_host_node.id)
             if device_indices is not None:
-                self.cache_controller.start_loading()
-                _start_event, finish_event, _ack_ids = (
-                    self.cache_controller.ack_load_queue.pop(0)
-                )
-                finish_event.synchronize()
                 matched_length = self._insert_helper_storage_device(
                     last_host_node,
                     RadixKey(
@@ -1348,18 +1360,13 @@ class HiRadixCache(RadixCache):
                 )
                 if matched_length > 0:
                     self.cache_controller.evict_device(device_indices[:matched_length])
-            else:
-                logger.warning(
-                    "buffer_only prefetch could not allocate device memory for %d tokens",
-                    len(written_indices),
-                )
             self.cache_controller.mem_pool_host.free(host_indices)
         else:
-            written_indices = host_indices[:min_completed_tokens]
             matched_length = self._insert_helper_host(
                 last_host_node,
                 RadixKey(
-                    token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+                    token_ids=fetched_token_ids,
+                    extra_key=last_host_node.key.extra_key,
                 ),
                 written_indices,
                 hash_value[: min_completed_tokens // self.page_size],
