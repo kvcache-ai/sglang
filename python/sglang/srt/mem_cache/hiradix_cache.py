@@ -727,55 +727,27 @@ class HiRadixCache(RadixCache):
         node.protect_host()
 
     def _flush_pending_writes(self):
-        """Process queued write_backup requests that failed due to full host buffer."""
-        flushed = 0
-        stale = 0
-        available = self.cache_controller.mem_pool_host.available_size()
-        scan_limit = len(self.pending_write_queue)
-        scanned = 0
-        while self.pending_write_queue and scanned < scan_limit:
+        """Flush queued buffer_only writes to host memory."""
+        while self.pending_write_queue:
             node = self.pending_write_queue[0]
             if (
                 node.value is None
                 or node.backuped
                 or node.id in self.ongoing_write_through
             ):
-                reason = (
-                    "evicted"
-                    if node.value is None
-                    else "backuped" if node.backuped else "already_in_flight"
-                )
-                logger.info("Pending write node %d dropped: %s", node.id, reason)
                 self.pending_write_queue.popleft()
                 self.pending_write_node_ids.discard(node.id)
-                stale += 1
-                continue
-            need = len(node.value)
-            if need > available:
-                self.pending_write_queue.rotate(-1)
-                scanned += 1
                 continue
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
             )
             if host_indices is None:
-                self.pending_write_queue.rotate(-1)
-                scanned += 1
-                continue
+                break
             self.pending_write_queue.popleft()
             self.pending_write_node_ids.discard(node.id)
             self.ongoing_write_through[node.id] = (node, host_indices)
             self.inc_lock_ref(node)
-            available -= need
-            flushed += 1
-        if flushed or stale or self.pending_write_queue:
-            logger.info(
-                "Pending write queue: flushed=%d, stale=%d, remaining=%d",
-                flushed,
-                stale,
-                len(self.pending_write_queue),
-            )
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
