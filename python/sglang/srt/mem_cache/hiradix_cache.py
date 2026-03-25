@@ -1539,10 +1539,16 @@ class HiRadixCache(RadixCache):
     def _insert_helper_storage_device(
         self, node: TreeNode, key: RadixKey, value, hash_value
     ):
-        node.last_access_time = time.monotonic()
+        """Insert storage-prefetched data as device nodes from a subtree anchor.
+
+        Analogous to _insert_helper_host but targets the device tier. Skips
+        write_backup (data already in storage) and hash computation (hash
+        provided by storage backend).
+        """
         if len(key) == 0:
             return 0
 
+        node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
         matched_length = 0
         while len(key) > 0 and child_key in node.children.keys():
@@ -1555,8 +1561,7 @@ class HiRadixCache(RadixCache):
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
-                new_node = self._split_node(node.key, node, prefix_len)
-                node = new_node
+                node = self._split_node(node.key, node, prefix_len)
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
@@ -1571,6 +1576,7 @@ class HiRadixCache(RadixCache):
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
+            self._record_store_event(new_node)
 
         return matched_length
 
