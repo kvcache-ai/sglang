@@ -1165,6 +1165,7 @@ class HiRadixCache(RadixCache):
         last_node = params.last_host_node
         mem_quota = params.mem_quota
         if self.host_memory_mode == "buffer_only":
+            # No persistent host tier to load back from; skip H2D transfer.
             return (
                 torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_node,
