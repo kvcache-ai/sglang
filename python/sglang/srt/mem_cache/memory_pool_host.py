@@ -193,8 +193,10 @@ class HostKVCache(abc.ABC):
                 self.size > device_pool.size
             ), "The host memory should be larger than the device memory with the current protocol"
 
+        # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
+        # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
         available_bytes = host_mem.available - ten_gb
         if requested_bytes > available_bytes:
@@ -210,6 +212,8 @@ class HostKVCache(abc.ABC):
             )
 
         self.kv_buffer = self.init_kv_buffer()
+
+        # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
 
@@ -220,13 +224,6 @@ class HostKVCache(abc.ABC):
     @abc.abstractmethod
     def init_kv_buffer(self):
         raise NotImplementedError()
-
-    def _raise_no_growth(self, need_size: int) -> None:
-        logger.debug(
-            "Host KV cache allocation failed: requested %d tokens, available %d tokens.",
-            need_size,
-            self.available_size(),
-        )
 
     @abc.abstractmethod
     def load_to_device_per_layer(
@@ -285,7 +282,6 @@ class HostKVCache(abc.ABC):
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
         if need_size > self.available_size():
-            self._raise_no_growth(need_size)
             return None
 
         select_index = self.free_slots[:need_size]
