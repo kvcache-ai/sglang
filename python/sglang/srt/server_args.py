@@ -2819,6 +2819,16 @@ class ServerArgs:
                 f"got {self.hicache_host_memory_mode!r}"
             )
 
+        if (
+            self.hicache_host_memory_mode == "buffer_only"
+            and self.hicache_write_policy != "write_through"
+        ):
+            raise ValueError(
+                "buffer_only host memory mode currently only supports "
+                "write_through policy, got hicache_write_policy="
+                f"{self.hicache_write_policy!r}"
+            )
+
         """Normalize hicache-related knobs into a valid runtime configuration.
 
         Resolution order:
