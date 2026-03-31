@@ -554,6 +554,7 @@ class ServerArgs:
     kt_method: Optional[str] = None
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
+    kt_numa_nodes: Optional[List[int]] = None
     kt_num_gpu_experts: Optional[int] = None
     kt_gpu_experts_ratio: Optional[float] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
@@ -4451,6 +4452,14 @@ class ServerArgs:
             type=int,
             default=2,
             help="[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
+        )
+        parser.add_argument(
+            "--kt-numa-nodes",
+            type=int,
+            nargs="+",
+            default=ServerArgs.kt_numa_nodes,
+            help="[ktransformers parameter] Explicit NUMA node ids for each KT threadpool. "
+                 "Length must equal --kt-threadpool-count.",
         )
         parser.add_argument(
             "--kt-num-gpu-experts",

@@ -63,6 +63,7 @@ class KTConfig:
         gpu_experts_mask: Boolean tensor of shape [num_experts] indicating which experts are on GPU
         cpuinfer_threads: Number of CPU inference threads
         threadpool_count: Number of thread pools for CPU computation
+        numa_nodes: Optional explicit NUMA node ids for each KT threadpool
         weight_path: Path to CPU quantized weights
         chunked_prefill_size: Chunk size for prefill computation
         method: CPU computation method (e.g., "int4")
@@ -79,6 +80,7 @@ class KTConfig:
     chunked_prefill_size: int
     max_deferred_experts_per_token: int
     method: str
+    numa_nodes: Optional[List[int]] = None
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
@@ -1666,6 +1668,7 @@ def create_kt_config_from_server_args(
         gpu_experts_mask=gpu_experts_mask,
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
+        numa_nodes=server_args.kt_numa_nodes,
         weight_path=server_args.kt_weight_path,
         chunked_prefill_size=server_args.chunked_prefill_size,
         method=server_args.kt_method,
@@ -2107,6 +2110,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
+                numa_nodes=self.kt_config.numa_nodes,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
                 method=self.kt_config.method,
