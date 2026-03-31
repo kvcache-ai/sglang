@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_disabled_context,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -129,7 +130,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -166,7 +167,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         with self.draft_tp_context(
             self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -662,7 +663,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 batch_output.next_draft_input = (
                     self.draft_worker._draft_extend_for_prefill(
                         model_worker_batch,
@@ -682,7 +683,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
@@ -691,7 +692,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.verify(model_worker_batch)
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
