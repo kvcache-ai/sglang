@@ -1897,6 +1897,7 @@ class Scheduler(
                 and req.last_node is not self.tree_cache.root_node
             ):
                 last_host_node = req.last_node
+
             if (
                 last_host_node.backuped
                 or last_host_node is self.tree_cache.root_node
