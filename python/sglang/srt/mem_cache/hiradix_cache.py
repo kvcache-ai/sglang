@@ -532,6 +532,8 @@ class HiRadixCache(RadixCache):
                     node.release_host()
                     if host_indices is not None:
                         cc.mem_pool_host.free(host_indices)
+                    if self.host_memory_mode == "buffer_only":
+                        node.persisted = True
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -675,6 +677,7 @@ class HiRadixCache(RadixCache):
                 and node.id not in self.ongoing_write_through
                 and node.id not in self.pending_write_node_ids
             ):
+                node.persisted = False
                 self.pending_write_queue.append(node)
                 self.pending_write_node_ids.add(node.id)
             return 0
