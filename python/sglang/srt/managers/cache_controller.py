@@ -456,7 +456,7 @@ class HiCacheController:
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             if self.mem_pool_host.host_memory_mode == "buffer_only":
-                self.prefetch_capacity_limit = self.mem_pool_host.size
+                self.prefetch_capacity_limit = int(0.8 * self.mem_pool_host.size)
             else:
                 self.prefetch_capacity_limit = max(
                     0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
