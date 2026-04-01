@@ -63,57 +63,54 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
         self.host_memory_mode = server_args.hicache_host_memory_mode
 
-        buffer_pages = 0
+        hicache_ratio = server_args.hicache_ratio
         if (
             server_args.hicache_host_memory_mode == "buffer_only"
             and server_args.hicache_size <= 0
+            and hicache_ratio is None
         ):
             cps = server_args.chunked_prefill_size
             if cps is None or cps <= 0:
                 cps = server_args.max_prefill_tokens
-            multiplier = envs.SGLANG_HICACHE_BUFFER_SIZE_MULTIPLIER.get()
-            buffer_pages = multiplier * (cps // self.page_size)
+            buffer_tokens = 4 * cps
+            hicache_ratio = min(1.0, buffer_tokens / self.kv_cache.size)
             logger.info(
-                "Auto-computed buffer_pages=%d "
-                "(%d * prefill_budget(%d) / page_size(%d))",
-                buffer_pages,
-                multiplier,
+                "buffer_only: auto-computed host buffer = %d tokens "
+                "(4 * prefill_budget=%d, effective ratio=%.4f)",
+                buffer_tokens,
                 cps,
-                self.page_size,
+                hicache_ratio,
             )
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
                 host_memory_mode=server_args.hicache_host_memory_mode,
-                buffer_pages=buffer_pages,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
                 host_memory_mode=server_args.hicache_host_memory_mode,
-                buffer_pages=buffer_pages,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
                 host_memory_mode=server_args.hicache_host_memory_mode,
-                buffer_pages=buffer_pages,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")

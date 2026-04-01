@@ -153,7 +153,7 @@ class HostKVCache(abc.ABC):
     def __init__(
         self,
         device_pool: KVCache,
-        host_to_device_ratio: float,
+        host_to_device_ratio: Optional[float],
         host_size: int,
         page_size: int,
         layout: str,
@@ -161,7 +161,6 @@ class HostKVCache(abc.ABC):
         device: str,
         allocator_type: str = "default",
         host_memory_mode: str = "cache",
-        buffer_pages: int = 0,
     ):
         self.device_pool = device_pool
         self.page_size = page_size
@@ -173,21 +172,12 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
-        if self.host_memory_mode == "cache":
-            if host_size > 0:
-                self.size = int(host_size * 1e9 // self.size_per_token)
-            else:
-                self.size = int(device_pool.size * host_to_device_ratio)
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        elif host_to_device_ratio is not None:
+            self.size = int(device_pool.size * host_to_device_ratio)
         else:
-            if buffer_pages > 0:
-                self.size = buffer_pages * self.page_size
-            elif host_size > 0:
-                self.size = int(host_size * 1e9 // self.size_per_token)
-            else:
-                raise ValueError(
-                    "buffer_pages or host_size must be > 0 when "
-                    "host_memory_mode=buffer_only"
-                )
+            raise ValueError("Either --hicache-size or --hicache-ratio must be set")
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
         # Align up the host memory pool size to the page size.
@@ -315,7 +305,6 @@ class MHATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         host_memory_mode: str = "cache",
-        buffer_pages: int = 0,
     ):
         super().__init__(
             device_pool,
@@ -327,7 +316,6 @@ class MHATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
             host_memory_mode=host_memory_mode,
-            buffer_pages=buffer_pages,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -817,7 +805,6 @@ class MLATokenToKVPoolHost(HostKVCache):
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
         host_memory_mode: str = "cache",
-        buffer_pages: int = 0,
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -830,7 +817,6 @@ class MLATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
             host_memory_mode=host_memory_mode,
-            buffer_pages=buffer_pages,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
@@ -1732,7 +1718,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device: str = "cpu",
         allocator_type: str = "default",
         host_memory_mode: str = "cache",
-        buffer_pages: int = 0,
     ):
         # Initialize indexer metadata before HostKVCache.__init__ calls get_size_per_token.
         self.index_head_dim = device_pool.index_head_dim
@@ -1752,7 +1737,6 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             device,
             allocator_type,
             host_memory_mode=host_memory_mode,
-            buffer_pages=buffer_pages,
             override_kv_cache_dim=device_pool.kv_cache_dim,
         )
         self.indexer_page_stride_size = (
