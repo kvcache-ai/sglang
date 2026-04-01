@@ -1625,7 +1625,8 @@ class HiRadixCache(RadixCache):
         else:
             new_node.value = child.value[:split_len].clone()
             child.value = child.value[split_len:].clone()
-        if child.backuped:
+        # In buffer_only mode backuped may be True while host value is None
+        if child.backuped and child.host_value is not None:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
 
