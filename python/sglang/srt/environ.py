@@ -286,6 +286,7 @@ class Envs:
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
     SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
+    SGLANG_HICACHE_BUFFER_SIZE_MULTIPLIER = EnvInt(4)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
@@ -296,7 +297,6 @@ class Envs:
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
-    SGLANG_HICACHE_BUFFER_SIZE_MULTIPLIER = EnvInt(4)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
