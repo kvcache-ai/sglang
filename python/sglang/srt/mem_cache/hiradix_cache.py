@@ -654,6 +654,10 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False):
+        # Backup invariant: parent must be backed up before child.
+        if node.parent != self.root_node and not node.parent.backuped:
+            return 0
+
         if self.host_memory_mode == "buffer_only":
             if (
                 self.enable_storage
@@ -932,6 +936,8 @@ class HiRadixCache(RadixCache):
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
+        assert len(node.children) == 0, f"non-leaf, {node.id=}"
+
         self._record_remove_event(node)
         num_evicted = len(node.value)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
