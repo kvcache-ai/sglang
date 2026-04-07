@@ -162,8 +162,9 @@ class DataParallelController:
         self.env_lock = threading.Lock()
 
         # Launch data parallel workers
-        self.scheduler_procs = []
+        self.scheduler_procs = {}
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.worker_ports = []
         self.status: List[bool] = [True] * server_args.dp_size
 
         if server_args.enable_dp_attention:
@@ -200,6 +201,39 @@ class DataParallelController:
         # Send control messages to first worker of tp group
         for worker in self.workers[:: self.control_message_step]:
             worker.send_pyobj(obj)
+
+    def maybe_recover_dead_schedulers(self) -> None:
+        dead_ranks = []
+        for tp_rank, proc in list(self.scheduler_procs.items()):
+            if proc.exitcode is None:
+                continue
+            dead_ranks.append(tp_rank)
+
+        if dead_ranks:
+            for tp_rank in dead_ranks:
+                _, _, dp_rank = compute_dp_attention_world_info(
+                    self.server_args.enable_dp_attention,
+                    tp_rank,
+                    self.server_args.tp_size,
+                    self.server_args.dp_size,
+                    self.server_args.attn_cp_size,
+                )
+                self.status[dp_rank] = False
+                del self.scheduler_procs[tp_rank]
+
+            self.server_args.elastic_ep_rejoin = True
+            threading.Thread(
+                target=self.launch_tensor_parallel_group_thread,
+                args=(
+                    self.server_args,
+                    self.port_args,
+                    0,
+                    None,
+                    self.worker_ports,
+                    dead_ranks,
+                    threading.Event(),
+                ),
+            ).start()
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
@@ -258,7 +292,15 @@ class DataParallelController:
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group_thread,
-                args=(server_args, tmp_port_args, base_gpu_id, dp_rank, ready_event),
+                args=(
+                    server_args,
+                    tmp_port_args,
+                    base_gpu_id,
+                    dp_rank,
+                    None,
+                    None,
+                    ready_event,
+                ),
             )
             threads.append(thread)
             base_gpu_id += (
@@ -289,9 +331,13 @@ class DataParallelController:
         port_args: PortArgs,
         base_gpu_id: int,
         dp_rank: int,
+        worker_ports: Optional[List[int]],
+        tp_rank_list: Optional[List[int]],
         ready_event: threading.Event,
     ):
-        self.launch_tensor_parallel_group(server_args, port_args, base_gpu_id, dp_rank)
+        self.launch_tensor_parallel_group(
+            server_args, port_args, base_gpu_id, dp_rank, worker_ports, tp_rank_list
+        )
         ready_event.set()
 
         # This thread cannot be closed because otherwise the `kill_itself_when_parent_died`
@@ -422,13 +468,12 @@ class DataParallelController:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
         # Pre-allocate worker ports on node 0 to avoid conflicts
-        worker_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
                 worker_port, worker_socket = get_zmq_socket_on_host(
                     self.context, zmq.PUSH, host=bind_host
                 )
-                worker_ports.append(worker_port)
+                self.worker_ports.append(worker_port)
                 self.workers[dp_rank] = worker_socket
                 logger.debug(
                     "Assigned port %s to worker %s on host %s",
@@ -437,11 +482,11 @@ class DataParallelController:
                     bind_host,
                 )
 
-        broadcasted_ports = self._broadcast_worker_ports(
-            server_args, worker_ports if worker_ports else None
+        self.broadcasted_ports = self._broadcast_worker_ports(
+            server_args, self.worker_ports if self.worker_ports else None
         )
         self.launch_tensor_parallel_group(
-            server_args, port_args, 0, None, broadcasted_ports
+            server_args, port_args, 0, None, self.broadcasted_ports
         )
 
     def launch_tensor_parallel_group(
@@ -451,6 +496,7 @@ class DataParallelController:
         base_gpu_id: int,
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
+        tp_rank_list: Optional[List[int]] = None,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -479,6 +525,8 @@ class DataParallelController:
         moe_dp_rank = 0
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
+                if tp_rank_list and tp_rank not in tp_rank_list:
+                    continue
                 rank_port_args = port_args
 
                 if server_args.enable_dp_attention:
@@ -549,7 +597,7 @@ class DataParallelController:
                         server_args, gpu_id
                     ):
                         proc.start()
-                self.scheduler_procs.append(proc)
+                self.scheduler_procs[tp_rank] = proc
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
@@ -611,6 +659,8 @@ class DataParallelController:
 
     def event_loop(self):
         while True:
+            if self.server_args.elastic_ep_backend is not None:
+                self.maybe_recover_dead_schedulers()
             while True:
                 self.soft_watchdog.feed()
                 try:
@@ -658,7 +708,7 @@ def run_data_parallel_controller_process(
         )
         if server_args.node_rank == 0:
             controller.event_loop()
-        for proc in controller.scheduler_procs:
+        for proc in controller.scheduler_procs.values():
             proc.join()
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"

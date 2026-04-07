@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -99,6 +100,8 @@ class TestPureDP(TestTP):
         Kill one rank and the system should remain operational.
         """
         os.system(f"pkill -f {self.pkill_process_1}")
+        # Sleep a while to ensure that process failure is detected by the system
+        time.sleep(10)
         super().test_gsm8k()
 
     @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
@@ -107,6 +110,8 @@ class TestPureDP(TestTP):
         Kill another rank and the system should remain operational.
         """
         os.system(f"pkill -f {self.pkill_process_2}")
+        # Sleep a while to ensure that process failure is detected by the system
+        time.sleep(10)
         super().test_gsm8k()
 
 
