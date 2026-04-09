@@ -1264,7 +1264,7 @@ class SharedFullContext:
 
         if tp_rank == 0:
             logger.info(
-                "KT fallback: layer %d prepare weight = %.2f ms",
+                "KT layerwise prefill: layer %d prepare weight = %.2f ms",
                 layer_idx,
                 total_time,
             )
@@ -2341,7 +2341,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
                 if self.tp_rank == 0:
                     logger.info(
-                        "KT fallback: layer %d compute = %.2f ms, expert update = %.2f ms",
+                        "KT layerwise prefill: layer %d compute = %.2f ms, expert update = %.2f ms",
                         self.kt_config.layer_idx,
                         compute_time,
                         update_time,
@@ -2349,7 +2349,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             else:
                 if self.tp_rank == 0:
                     logger.info(
-                        "KT fallback: layer %d compute = %.2f ms",
+                        "KT layerwise prefill: layer %d compute = %.2f ms",
                         self.kt_config.layer_idx,
                         compute_time,
                     )
