@@ -38,12 +38,86 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 
+UPDATE_METHODS = ("broadcast", "p2p", "all")
+
+
 @contextmanager
 def timer(msg: str):
     start = time.perf_counter()
     yield
     end = time.perf_counter()
     logger.info(f"{msg} duration: {end - start:.2f} seconds")
+
+
+def _build_http_transport(uds: str | None) -> httpx.BaseTransport | None:
+    if uds is None:
+        return None
+    return httpx.HTTPTransport(uds=uds)
+
+
+def build_torchrun_command(argv: list[str]) -> list[str]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--inference-parallel-size", type=int, default=8)
+    parsed_args, _ = parser.parse_known_args(argv)
+    return [
+        "torchrun",
+        f"--nproc-per-node={parsed_args.inference_parallel_size}",
+        "-m",
+        "sglang.srt.checkpoint_engine.update",
+        *argv,
+    ]
+
+
+def validate_args(args: argparse.Namespace, world_size: int | None = None):
+    if args.inference_parallel_size <= 0:
+        raise ValueError("--inference-parallel-size must be greater than 0")
+    if args.checkpoint_path and args.load_metas_file:
+        raise ValueError(
+            "--checkpoint-path and --load-metas-file cannot be provided together"
+        )
+    if not args.checkpoint_path and not args.load_metas_file:
+        raise ValueError(
+            "One of --checkpoint-path or --load-metas-file must be provided"
+        )
+    if args.load_metas_file and not os.path.isfile(args.load_metas_file):
+        raise ValueError(f"Meta file does not exist: {args.load_metas_file}")
+    if args.checkpoint_path and not os.path.isdir(args.checkpoint_path):
+        raise ValueError(f"Checkpoint path does not exist: {args.checkpoint_path}")
+    if world_size is not None:
+        if world_size <= 0:
+            raise ValueError("WORLD_SIZE must be greater than 0")
+        if world_size % args.inference_parallel_size != 0:
+            raise ValueError(
+                "WORLD_SIZE must be divisible by --inference-parallel-size for checkpoint groups"
+            )
+
+
+def build_update_payload(
+    checkpoint_path: str | None, rank: int, world_size: int
+) -> tuple[list[str], dict[str, torch.Tensor]]:
+    if checkpoint_path is None:
+        return [], {}
+    index_file = os.path.join(checkpoint_path, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        return [], split_tensors(checkpoint_path, rank, world_size)
+    return split_checkpoint_files(checkpoint_path, rank, world_size), {}
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Update weights example")
+    parser.add_argument("--checkpoint-path", type=str, default=None)
+    parser.add_argument("--save-metas-file", type=str, default=None)
+    parser.add_argument("--load-metas-file", type=str, default=None)
+    parser.add_argument("--sleep-time", type=int, default=0)
+    parser.add_argument("--endpoint", type=str, default="http://localhost:19730")
+    parser.add_argument("--inference-parallel-size", type=int, default=8)
+    parser.add_argument("--checkpoint-name", type=str, default="my-checkpoint-iter-0")
+    parser.add_argument("--update-method", choices=UPDATE_METHODS, default="broadcast")
+    parser.add_argument("--uds", type=str, default=None)
+    parser.add_argument("--weight-version", type=str, default=None)
+    args = parser.parse_args(argv)
+    validate_args(args)
+    return args
 
 
 def check_sglang_ready(
@@ -53,9 +127,7 @@ def check_sglang_ready(
     if rank != rank // inference_parallel_size * inference_parallel_size:
         return
     retry_num = 0
-    transport = None
-    if uds is not None:
-        transport = httpx.HTTPTransport(uds=uds)
+    transport = _build_http_transport(uds)
     with httpx.Client(transport=transport) as client:
         while True:
             try:
@@ -76,8 +148,8 @@ def split_checkpoint_files(
 ) -> list[str]:
     checkpoint_files = [
         os.path.join(checkpoint_path, f)
-        for f in filter(
-            lambda x: x.endswith(".safetensors"), os.listdir(checkpoint_path)
+        for f in sorted(
+            filter(lambda x: x.endswith(".safetensors"), os.listdir(checkpoint_path))
         )
     ]
     files_per_rank = (len(checkpoint_files) + world_size - 1) // world_size
@@ -117,7 +189,7 @@ def req_inference(
 
     def req_func(socket_paths: list[tuple[str, str]]):
         if rank == src:
-            with httpx.Client(transport=httpx.HTTPTransport(uds=uds)) as client:
+            with httpx.Client(transport=_build_http_transport(uds)) as client:
                 resp = client.post(
                     f"{endpoint}/update_weights_from_ipc",
                     json={
@@ -198,27 +270,8 @@ def join(
 
 def run_with_torchrun():
     """Run the update script with torchrun automatically."""
-    # Parse inference_parallel_size from command line arguments to determine nproc-per-node
-    inference_parallel_size = 8  # default
-    args = sys.argv[1:]  # Skip the script name
-
-    # Look for --inference-parallel-size in arguments
-    for i, arg in enumerate(args):
-        if arg == "--inference-parallel-size" and i + 1 < len(args):
-            try:
-                inference_parallel_size = int(args[i + 1])
-            except ValueError:
-                pass
-            break
-        elif arg.startswith("--inference-parallel-size="):
-            try:
-                inference_parallel_size = int(arg.split("=", 1)[1])
-            except ValueError:
-                pass
-            break
-
-    # Build torchrun command
-    cmd = ["torchrun", f"--nproc-per-node={inference_parallel_size}", __file__] + args
+    args = sys.argv[1:]
+    cmd = build_torchrun_command(args)
 
     print(f"Running: {' '.join(cmd)}", file=sys.stderr)
 
@@ -245,22 +298,12 @@ def main():
         return
 
     # Running under torchrun, proceed with normal execution
-    parser = argparse.ArgumentParser(description="Update weights example")
-    parser.add_argument("--checkpoint-path", type=str, default=None)
-    parser.add_argument("--save-metas-file", type=str, default=None)
-    parser.add_argument("--load-metas-file", type=str, default=None)
-    parser.add_argument("--sleep-time", type=int, default=0)
-    parser.add_argument("--endpoint", type=str, default="http://localhost:19730")
-    parser.add_argument("--inference-parallel-size", type=int, default=8)
-    parser.add_argument("--checkpoint-name", type=str, default="my-checkpoint-iter-0")
-    parser.add_argument("--update-method", type=str, default="broadcast")
-    parser.add_argument("--uds", type=str, default=None)
-    parser.add_argument("--weight-version", type=str, default=None)
-    args = parser.parse_args()
+    args = parse_args()
 
     # Get rank and world_size from environment (set by torchrun)
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
+    validate_args(args, world_size=world_size)
 
     req_func = req_inference(
         args.endpoint,
@@ -286,18 +329,9 @@ def main():
             args.uds,
         )
     else:
-        if args.checkpoint_path and os.path.exists(
-            os.path.join(args.checkpoint_path, "model.safetensors.index.json")
-        ):
-            named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
-            checkpoint_files = []
-        else:
-            checkpoint_files = (
-                split_checkpoint_files(args.checkpoint_path, rank, world_size)
-                if args.checkpoint_path
-                else []
-            )
-            named_tensors = {}
+        checkpoint_files, named_tensors = build_update_payload(
+            args.checkpoint_path, rank, world_size
+        )
         update_weights(
             ps,
             args.checkpoint_name,

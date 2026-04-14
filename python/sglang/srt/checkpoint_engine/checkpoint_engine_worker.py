@@ -23,14 +23,44 @@ import torch
 import zmq
 
 try:
-    from checkpoint_engine.worker import update_weights_from_ipc
+    from checkpoint_engine.worker import update_weights_from_ipc as ce_update_weights_from_ipc
 except ImportError:
-    raise ImportError(
-        "checkpoint-engine is not installed. "
-        "Please install it with: pip install sglang[checkpoint-engine]"
-    )
+    ce_update_weights_from_ipc = None
 
 logger = logging.getLogger(__name__)
+
+
+def _require_checkpoint_engine() -> Callable:
+    if ce_update_weights_from_ipc is None:
+        raise ImportError(
+            "checkpoint-engine is not installed. "
+            "Please install it with: pip install sglang[checkpoint-engine]"
+        )
+    return ce_update_weights_from_ipc
+
+
+def _normalize_device_uuid(device_uuid: object) -> str:
+    normalized = str(device_uuid).strip()
+    if normalized.lower().startswith("gpu-"):
+        normalized = normalized[4:]
+    return normalized.lower()
+
+
+def _resolve_zmq_handle(zmq_handles: Dict[str, str], device_uuid: str) -> str:
+    if device_uuid in zmq_handles:
+        return zmq_handles[device_uuid]
+
+    normalized_handles = {
+        _normalize_device_uuid(handle_uuid): socket_path
+        for handle_uuid, socket_path in zmq_handles.items()
+    }
+    normalized_device_uuid = _normalize_device_uuid(device_uuid)
+    if normalized_device_uuid in normalized_handles:
+        return normalized_handles[normalized_device_uuid]
+
+    raise ValueError(
+        f"Device UUID {device_uuid} not found in zmq_handles: {list(zmq_handles.keys())}"
+    )
 
 
 class SGLangCheckpointEngineWorkerExtension:
@@ -76,13 +106,10 @@ class SGLangCheckpointEngineWorkerExtension:
             self._zmq_ctx = zmq.Context()
         device_uuid = self.get_device_uuid()
         device_id = self.get_device_id()
-        if device_uuid not in zmq_handles:
-            raise ValueError(
-                f"Device UUID {device_uuid} not found in zmq_handles: {list(zmq_handles.keys())}"
-            )
-        update_weights_from_ipc(
+        zmq_handle = _resolve_zmq_handle(zmq_handles, device_uuid)
+        _require_checkpoint_engine()(
             self._zmq_ctx,
-            zmq_handles[device_uuid],
+            zmq_handle,
             device_id=device_id,
             run=self.get_model_loader(),
             post_hook=self.get_post_hook(),
@@ -104,9 +131,12 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         # Get device UUID for current device
         device_id = torch.cuda.current_device()
         try:
-            return f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
-        except AssertionError as e:
+            raw_uuid = str(torch.cuda.get_device_properties(device_id).uuid)
+        except (AssertionError, AttributeError) as e:
             raise ValueError(f"Failed to get GPU UUID for device {device_id}") from e
+        if raw_uuid.startswith("GPU-"):
+            return raw_uuid
+        return f"GPU-{raw_uuid}"
 
     def get_device_id(self) -> int:
         """Get the device ID."""
