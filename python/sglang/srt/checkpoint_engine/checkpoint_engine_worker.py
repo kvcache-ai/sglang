@@ -30,39 +30,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def _require_checkpoint_engine() -> Callable:
-    if ce_update_weights_from_ipc is None:
-        raise ImportError(
-            "checkpoint-engine is not installed. "
-            "Please install it with: pip install sglang[checkpoint-engine]"
-        )
-    return ce_update_weights_from_ipc
-
-
-def _normalize_device_uuid(device_uuid: object) -> str:
-    normalized = str(device_uuid).strip()
-    if normalized.lower().startswith("gpu-"):
-        normalized = normalized[4:]
-    return normalized.lower()
-
-
-def _resolve_zmq_handle(zmq_handles: Dict[str, str], device_uuid: str) -> str:
-    if device_uuid in zmq_handles:
-        return zmq_handles[device_uuid]
-
-    normalized_handles = {
-        _normalize_device_uuid(handle_uuid): socket_path
-        for handle_uuid, socket_path in zmq_handles.items()
-    }
-    normalized_device_uuid = _normalize_device_uuid(device_uuid)
-    if normalized_device_uuid in normalized_handles:
-        return normalized_handles[normalized_device_uuid]
-
-    raise ValueError(
-        f"Device UUID {device_uuid} not found in zmq_handles: {list(zmq_handles.keys())}"
-    )
-
-
 class SGLangCheckpointEngineWorkerExtension:
     """
     Worker extension for SGLang to support checkpoint-engine IPC weight updates.
@@ -106,8 +73,30 @@ class SGLangCheckpointEngineWorkerExtension:
             self._zmq_ctx = zmq.Context()
         device_uuid = self.get_device_uuid()
         device_id = self.get_device_id()
-        zmq_handle = _resolve_zmq_handle(zmq_handles, device_uuid)
-        _require_checkpoint_engine()(
+        if ce_update_weights_from_ipc is None:
+            raise ImportError(
+                "checkpoint-engine is not installed. "
+                "Please install it with: pip install sglang[checkpoint-engine]"
+            )
+
+        zmq_handle = zmq_handles.get(device_uuid)
+        if zmq_handle is None:
+            normalized_device_uuid = str(device_uuid).strip().lower()
+            if normalized_device_uuid.startswith("gpu-"):
+                normalized_device_uuid = normalized_device_uuid[4:]
+            normalized_handles = {}
+            for handle_uuid, socket_path in zmq_handles.items():
+                normalized_handle_uuid = str(handle_uuid).strip().lower()
+                if normalized_handle_uuid.startswith("gpu-"):
+                    normalized_handle_uuid = normalized_handle_uuid[4:]
+                normalized_handles[normalized_handle_uuid] = socket_path
+            zmq_handle = normalized_handles.get(normalized_device_uuid)
+        if zmq_handle is None:
+            raise ValueError(
+                f"Device UUID {device_uuid} not found in zmq_handles: {list(zmq_handles.keys())}"
+            )
+
+        ce_update_weights_from_ipc(
             self._zmq_ctx,
             zmq_handle,
             device_id=device_id,

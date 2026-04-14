@@ -102,27 +102,8 @@ class TestCheckpointEngineUpdate(CustomTestCase):
             self.assertEqual(rank0, [os.path.join(tmpdir, "a.safetensors")])
             self.assertEqual(rank1, [os.path.join(tmpdir, "b.safetensors")])
 
-    def test_build_update_payload_dispatches_by_index_file(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            index_file = os.path.join(tmpdir, "model.safetensors.index.json")
-            with open(index_file, "w") as fout:
-                fout.write("{}")
-
-            with patch.object(update_module, "split_tensors", return_value={"a": 1}) as split_tensors:
-                checkpoint_files, named_tensors = update_module.build_update_payload(
-                    tmpdir, rank=0, world_size=1
-                )
-
-            self.assertEqual(checkpoint_files, [])
-            self.assertEqual(named_tensors, {"a": 1})
-            split_tensors.assert_called_once_with(tmpdir, 0, 1)
-
 
 class TestCheckpointEngineWorker(CustomTestCase):
-    def test_resolve_zmq_handle_accepts_normalized_uuid(self):
-        zmq_handle = worker_module._resolve_zmq_handle({"abc": "ipc://sock"}, "GPU-ABC")
-        self.assertEqual(zmq_handle, "ipc://sock")
-
     def test_update_weights_from_ipc_uses_resolved_handle(self):
         worker = DummyWorker()
         mock_update = MagicMock()
@@ -135,6 +116,15 @@ class TestCheckpointEngineWorker(CustomTestCase):
         self.assertEqual(mock_update.call_args.kwargs["device_id"], 3)
         self.assertEqual(mock_update.call_args.kwargs["run"], "loader")
         self.assertEqual(mock_update.call_args.kwargs["post_hook"], "hook")
+
+    def test_update_weights_from_ipc_accepts_normalized_uuid(self):
+        worker = DummyWorker()
+        mock_update = MagicMock()
+
+        with patch.object(worker_module, "ce_update_weights_from_ipc", mock_update):
+            worker.update_weights_from_ipc({"abc": "ipc://sock"})
+
+        self.assertEqual(mock_update.call_args.args[1], "ipc://sock")
 
     def test_update_weights_from_ipc_raises_when_dependency_missing(self):
         worker = DummyWorker()

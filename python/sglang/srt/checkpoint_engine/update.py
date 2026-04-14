@@ -92,34 +92,6 @@ def validate_args(args: argparse.Namespace, world_size: int | None = None):
             )
 
 
-def build_update_payload(
-    checkpoint_path: str | None, rank: int, world_size: int
-) -> tuple[list[str], dict[str, torch.Tensor]]:
-    if checkpoint_path is None:
-        return [], {}
-    index_file = os.path.join(checkpoint_path, "model.safetensors.index.json")
-    if os.path.exists(index_file):
-        return [], split_tensors(checkpoint_path, rank, world_size)
-    return split_checkpoint_files(checkpoint_path, rank, world_size), {}
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Update weights example")
-    parser.add_argument("--checkpoint-path", type=str, default=None)
-    parser.add_argument("--save-metas-file", type=str, default=None)
-    parser.add_argument("--load-metas-file", type=str, default=None)
-    parser.add_argument("--sleep-time", type=int, default=0)
-    parser.add_argument("--endpoint", type=str, default="http://localhost:19730")
-    parser.add_argument("--inference-parallel-size", type=int, default=8)
-    parser.add_argument("--checkpoint-name", type=str, default="my-checkpoint-iter-0")
-    parser.add_argument("--update-method", choices=UPDATE_METHODS, default="broadcast")
-    parser.add_argument("--uds", type=str, default=None)
-    parser.add_argument("--weight-version", type=str, default=None)
-    args = parser.parse_args(argv)
-    validate_args(args)
-    return args
-
-
 def check_sglang_ready(
     endpoint: str, inference_parallel_size: int, uds: str | None = None
 ):
@@ -298,7 +270,19 @@ def main():
         return
 
     # Running under torchrun, proceed with normal execution
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Update weights example")
+    parser.add_argument("--checkpoint-path", type=str, default=None)
+    parser.add_argument("--save-metas-file", type=str, default=None)
+    parser.add_argument("--load-metas-file", type=str, default=None)
+    parser.add_argument("--sleep-time", type=int, default=0)
+    parser.add_argument("--endpoint", type=str, default="http://localhost:19730")
+    parser.add_argument("--inference-parallel-size", type=int, default=8)
+    parser.add_argument("--checkpoint-name", type=str, default="my-checkpoint-iter-0")
+    parser.add_argument("--update-method", choices=UPDATE_METHODS, default="broadcast")
+    parser.add_argument("--uds", type=str, default=None)
+    parser.add_argument("--weight-version", type=str, default=None)
+    args = parser.parse_args()
+    validate_args(args)
 
     # Get rank and world_size from environment (set by torchrun)
     rank = int(os.getenv("RANK", 0))
@@ -329,9 +313,18 @@ def main():
             args.uds,
         )
     else:
-        checkpoint_files, named_tensors = build_update_payload(
-            args.checkpoint_path, rank, world_size
-        )
+        if args.checkpoint_path and os.path.exists(
+            os.path.join(args.checkpoint_path, "model.safetensors.index.json")
+        ):
+            named_tensors = split_tensors(args.checkpoint_path, rank, world_size)
+            checkpoint_files = []
+        else:
+            checkpoint_files = (
+                split_checkpoint_files(args.checkpoint_path, rank, world_size)
+                if args.checkpoint_path
+                else []
+            )
+            named_tensors = {}
         update_weights(
             ps,
             args.checkpoint_name,
