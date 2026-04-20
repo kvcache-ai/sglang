@@ -426,6 +426,78 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.decode_attention_backend, "triton")
 
 
+class TestHiCacheBufferOnlyArgs(CustomTestCase):
+    def _make_args(self, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_cache_mode_defaults_hicache_ratio(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_host_memory_mode="cache",
+            hicache_ratio=None,
+        )
+
+        args._handle_hicache()
+
+        self.assertEqual(args.hicache_ratio, 2.0)
+
+    def test_buffer_only_keeps_hicache_ratio_unset_for_runtime_sizing(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_host_memory_mode="buffer_only",
+            hicache_ratio=None,
+            hicache_write_policy="write_through",
+        )
+
+        args._handle_hicache()
+
+        self.assertIsNone(args.hicache_ratio)
+
+    def test_buffer_only_requires_write_through(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_host_memory_mode="buffer_only",
+            hicache_write_policy="write_back",
+        )
+
+        with self.assertRaisesRegex(ValueError, "only supports write_through"):
+            args._handle_hicache()
+
+    def test_invalid_hicache_host_memory_mode_is_rejected(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_host_memory_mode="invalid_mode",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "hicache_host_memory_mode must be either"
+        ):
+            args._handle_hicache()
+
+    def test_prepare_server_args_parses_buffer_only_flags(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-hierarchical-cache",
+                "--hicache-host-memory-mode",
+                "buffer_only",
+                "--hicache-size",
+                "3",
+                "--hicache-write-policy",
+                "write_through",
+            ]
+        )
+
+        self.assertEqual(args.hicache_host_memory_mode, "buffer_only")
+        self.assertEqual(args.hicache_size, 3)
+        self.assertEqual(args.hicache_write_policy, "write_through")
+        self.assertIsNone(args.hicache_ratio)
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def test_prepare_server_args_parses_external_sam_args(self):
         server_args = prepare_server_args(

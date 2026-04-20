@@ -447,7 +447,7 @@ class HiRadixCache(RadixCache):
                     )
 
                 try:
-                    last_host_node.release_host()
+                    self._release_prefetch_anchor(last_host_node)
                 except Exception:
                     logger.exception(
                         "Failed to release host protection for prefetch %s", req_id
@@ -525,7 +525,7 @@ class HiRadixCache(RadixCache):
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
-                    last_host_node.release_host()
+                    self._release_prefetch_anchor(last_host_node)
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
@@ -1323,7 +1323,7 @@ class HiRadixCache(RadixCache):
             self.cache_controller.append_host_mem_release(
                 host_indices[min_completed_tokens:completed_tokens]
             )
-        last_host_node.release_host()
+        self._release_prefetch_anchor(last_host_node)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
@@ -1344,6 +1344,16 @@ class HiRadixCache(RadixCache):
         if operation.host_indices is None:
             return
         operation.mark_terminate()
+
+    def _protect_prefetch_anchor(self, node: TreeNode) -> None:
+        node.protect_host()
+        if self.host_memory_mode == "buffer_only":
+            self.inc_lock_ref(node)
+
+    def _release_prefetch_anchor(self, node: TreeNode) -> None:
+        if self.host_memory_mode == "buffer_only":
+            self.dec_lock_ref(node)
+        node.release_host()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         """
@@ -1421,13 +1431,13 @@ class HiRadixCache(RadixCache):
         ):
             return
 
-        last_host_node.protect_host()
+        self._protect_prefetch_anchor(last_host_node)
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            last_host_node.release_host()
+            self._release_prefetch_anchor(last_host_node)
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
@@ -1683,7 +1693,7 @@ class HiRadixCache(RadixCache):
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         if self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
-        last_host_node.release_host()
+        self._release_prefetch_anchor(last_host_node)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
