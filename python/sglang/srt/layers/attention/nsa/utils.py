@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )

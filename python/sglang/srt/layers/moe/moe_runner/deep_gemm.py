@@ -49,8 +49,11 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if not (_is_npu or _is_hip) and _is_cuda:
-    from sgl_kernel import silu_and_mul
+# Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
+if not (_is_npu or _is_hip):
+    from sgl_kernel import silu_and_mul as _legacy_silu_and_mul
+else:
+    _legacy_silu_and_mul = None
 
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")

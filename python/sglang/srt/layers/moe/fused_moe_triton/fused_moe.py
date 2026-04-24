@@ -519,29 +519,67 @@ def fused_experts_impl(
                 intermediate_cache2 = _swiglu_silu_clamp_mul(
                     intermediate_cache1.view(-1, N), gemm1_limit
                 )
-            elif _is_cuda or _is_hip or _is_xpu:
-                if not filter_expert:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-                else:
-                    act_and_mul_triton(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        config,
-                        topk_ids,
-                        expert_ids,
-                        down_moe_use_tma,
-                        activation,
-                    )
             else:
-                if _has_vllm_ops:
+                is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+                assert is_2604b == (swiglu_limit is not None), (
+                    f"swiglu_limit must be non-None iff submode=2604B "
+                    f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, swiglu_limit={swiglu_limit!r})"
+                )
+
+                swiglu_limit_for_triton: Optional[float] = None
+                swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
+                if is_2604b:
+                    assert swiglu_limit == 10
+                    assert intermediate_cache1.shape == (total_tokens, N)
+                    assert (
+                        _is_cuda or _is_hip
+                    ), "DSV4 2604 submode 2604B only supports CUDA/HIP downstream"
+
+                    if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                        if filter_expert:
+                            swiglu_limit_for_triton = swiglu_limit
+                        else:
+                            assert (
+                                _is_cuda
+                            ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                            swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+                    else:
+                        half = N // 2
+                        intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                        intermediate_cache1[:, half:].clamp_(
+                            min=-swiglu_limit, max=swiglu_limit
+                        )
+                        deepseek_v4_moe_code_path_checker.observed += 1
+
+                if _is_cuda or _is_hip:
+                    if not filter_expert:
+                        if swiglu_limit_for_silu_and_mul_clamp is not None:
+                            from sglang.jit_kernel.deepseek_v4 import silu_and_mul_clamp
+
+                            silu_and_mul_clamp(
+                                intermediate_cache1.view(-1, N),
+                                intermediate_cache2,
+                                swiglu_limit_for_silu_and_mul_clamp,
+                            )
+                        else:
+                            silu_and_mul(
+                                intermediate_cache1.view(-1, N), intermediate_cache2
+                            )
+                    else:
+                        act_and_mul_triton(
+                            intermediate_cache1.view(-1, N),
+                            intermediate_cache2,
+                            config,
+                            topk_ids,
+                            expert_ids,
+                            down_moe_use_tma,
+                            activation,
+                            swiglu_limit=swiglu_limit_for_triton,
+                        )
+                else:
                     vllm_ops.silu_and_mul(
                         intermediate_cache2, intermediate_cache1.view(-1, N)
                     )
-                else:
-                    # Fallback: native PyTorch silu_and_mul
-                    x = intermediate_cache1.view(-1, N)
-                    d = x.shape[-1] // 2
-                    intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"

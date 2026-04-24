@@ -2,7 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_cuda
+
+fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
@@ -363,7 +366,7 @@ def mla_quantize_and_rope_for_fp8(
                 - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
                 - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
         """
-    attn_dtype = torch.float8_e4m3fn
+    attn_dtype = fp8_dtype
     q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
 
     # Allocate output tensors with FP8 dtype

@@ -399,7 +399,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_shared_mooncake_transfer_engine()
 
         # Get memory before model loading
-        min_per_gpu_memory = self.init_torch_distributed()
+        self.total_gpu_memory = self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -420,7 +420,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # Initialize the model runner
-        self.initialize(min_per_gpu_memory)
+        self.initialize()
         self.check_quantized_moe_compatibility()
 
         if self.is_multimodal:

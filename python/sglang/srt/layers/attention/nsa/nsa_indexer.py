@@ -450,7 +450,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
+                seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
