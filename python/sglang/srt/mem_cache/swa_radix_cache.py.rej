@@ -1,0 +1,40 @@
+diff a/python/sglang/srt/mem_cache/swa_radix_cache.py b/python/sglang/srt/mem_cache/swa_radix_cache.py	(rejected hunks)
+@@ -897,6 +902,38 @@ def _match_prefix_helper(
+ 
+         return value[:best_value_len], best_last_node
+ 
++    def _compact_single_child_chain(self, node: TreeNode) -> None:
++        while len(node.children) == 1:
++            child = next(iter(node.children.values()))
++            if len(child.children) == 0:
++                break
++            sum_gc_full_lock_ref = sum(
++                gc.full_lock_ref for gc in child.children.values()
++            )
++            if child.full_lock_ref > sum_gc_full_lock_ref:
++                break
++            if (
++                child.swa_tombstone != node.swa_tombstone
++                or child.full_lock_ref != node.full_lock_ref
++                or child.swa_lock_ref != node.swa_lock_ref
++            ):
++                break
++
++            node.key = RadixKey(
++                node.key.token_ids + child.key.token_ids, node.key.extra_key
++            )
++            node.value = torch.cat([node.value, child.value])
++            node.children = child.children
++            for grandchild in node.children.values():
++                grandchild.parent = node
++
++            if child.swa_uuid is not None:
++                node.swa_uuid = child.swa_uuid
++
++            self.full_lru_list.remove_node(child)
++            if not child.swa_tombstone:
++                self.swa_lru_list.remove_node(child)
++
+     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
+         # new_node -> child
+         new_node = TreeNode()

@@ -407,9 +407,10 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
 
 
 def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-    return isinstance(target_kv_pool, MLATokenToKVPool)
+    return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

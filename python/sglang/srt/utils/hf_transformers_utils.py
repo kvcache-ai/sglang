@@ -20,11 +20,12 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
@@ -78,7 +79,6 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
-from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     AfmoeConfig,
@@ -178,8 +178,10 @@ def get_hf_text_config(config: PretrainedConfig):
 
 
 # Temporary hack for DeepSeek-V3.2 model
-def _load_deepseek_v32_model(
+def _load_deepseek_temp_model(
     model_path: str,
+    model_type: Literal["deepseek_v32", "deepseek_ref"],
+    architecture: Literal["DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM"],
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     **kwargs,
@@ -187,20 +189,60 @@ def _load_deepseek_v32_model(
     # first get the local path
     local_path = download_from_hf(model_path)
     # then load the config file in json
-    config_file = os.path.join(local_path, "config.json")
+    backup_mode = envs.SGLANG_APPLY_CONFIG_BACKUP.get()
+    if backup_mode == "auto":
+        real_config_file = os.path.join(local_path, "config.json")
+        if not os.path.exists(real_config_file):
+            raise RuntimeError(
+                f"SGLANG_APPLY_CONFIG_BACKUP=auto requires the checkpoint's "
+                f"config.json at {real_config_file} to read num_hidden_layers."
+            )
+        with open(real_config_file, "r") as f:
+            num_hidden_layers = json.load(f).get("num_hidden_layers")
+        if not isinstance(num_hidden_layers, int):
+            raise RuntimeError(
+                f"SGLANG_APPLY_CONFIG_BACKUP=auto could not read a numeric "
+                f"num_hidden_layers from {real_config_file} (got {num_hidden_layers!r})."
+            )
+        backup_mode = "small" if num_hidden_layers <= 50 else "large"
+        logger.warning(
+            f"SGLANG_APPLY_CONFIG_BACKUP=auto: checkpoint has "
+            f"num_hidden_layers={num_hidden_layers}, dispatching to {backup_mode!r}."
+        )
+    if backup_mode != "none":
+        backup_file = {
+            "small": "config_backup_small.json",
+            "large": "config_backup_large.json",
+        }.get(backup_mode)
+        if backup_file is None:
+            raise ValueError(
+                f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode!r} is not recognized; "
+                f"use 'none' (off), 'small', 'large', or 'auto'."
+            )
+        config_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "configs",
+            backup_file,
+        )
+        logger.warning(
+            f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode}: using packaged {config_file} "
+            f"instead of the checkpoint's config.json at {local_path}."
+        )
+    else:
+        config_file = os.path.join(local_path, "config.json")
     if not os.path.exists(config_file):
-        raise RuntimeError(f"Can't find config file in {local_path}.")
+        raise RuntimeError(f"Can't find config file at {config_file}.")
 
     with open(config_file, "r") as f:
         config_json = json.load(f)
 
-    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
+    config_json["architectures"] = [architecture]
     config_json["model_type"] = "deepseek_v3"
 
     tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 
-    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
+    unique_path = os.path.join(tmp_path, f"{model_type}_{os.getpid()}")
     with open(unique_path, "w") as f:
         json.dump(config_json, f)
 
@@ -564,7 +606,7 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
-    tokenizer = patch_tokenizer(tokenizer)
+
     return tokenizer
 
 

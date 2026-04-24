@@ -168,6 +168,15 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            assert self.pp_size == 1, (
+                "V4 PD disaggregation requires PP=1 "
+                "(get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized flat list)"
+            )
+            assert (
+                self.decode_tp_size == self.scheduler.tp_size
+            ), "V4 PD disaggregation requires same TP size on prefill and decode"
+
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
                 self.token_to_kv_pool.get_state_buf_infos()
@@ -176,7 +185,7 @@ class PrefillBootstrapQueue:
             kv_args.state_data_lens = state_data_lens
             kv_args.state_item_lens = state_item_lens
 
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
+            if isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)):
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
@@ -705,8 +714,10 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
-                # SWA hybrid model: send last window KV indices
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(),
+                (SWAKVPool, DeepSeekV4TokenToKVPool),
+            ):
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)

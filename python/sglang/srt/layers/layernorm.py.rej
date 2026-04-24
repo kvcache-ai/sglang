@@ -1,0 +1,9 @@
+diff a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py	(rejected hunks)
+@@ -24,6 +24,7 @@
+     is_batch_invariant_mode_enabled,
+     rms_norm_batch_invariant,
+ )
++from sglang.srt.environ import envs
+ from sglang.srt.layers.utils import MultiPlatformOp
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (

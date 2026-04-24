@@ -127,6 +127,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "compressed",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -544,6 +545,7 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
+    enable_hisparse: bool = False
     hierarchical_sparse_attention_extra_config: Optional[str] = None
 
     # LMCache
@@ -640,6 +642,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_indexer_topk: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -1236,8 +1239,8 @@ class ServerArgs:
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                            self.tp_size <= 8
+                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
 
                         logger.warning(
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
@@ -1251,9 +1254,10 @@ class ServerArgs:
                             )
 
                     if is_hip():
-                        self.page_size = 1
+                        self.page_size = 64
                         logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
+                            "Setting page size to 64 for DeepSeek DSA on torch implementation.\n"
+                            "Need to be changed based on ROCm implementation.\n"
                         )
                     else:
                         # For CUDA GPU
@@ -1338,6 +1342,29 @@ class ServerArgs:
                         logger.info(
                             "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
+
+        elif model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            if self.enable_nsa_prefill_context_parallel:
+                if self.nsa_prefill_cp_mode == "round-robin-split":
+                    self.moe_dense_tp_size = 1
+                    assert (
+                        self.dp_size == 1
+                    ), "For round-robin split mode, dp attention is not supported."
+                    assert (
+                        self.tp_size <= 8
+                    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                    logger.warning(
+                        f"Enable Context Parallel for DeepSeekV4, "
+                        f"dp_size={self.dp_size}, moe_dense_tp_size={self.moe_dense_tp_size}, "
+                        f"ep_size={self.ep_size}, tp_size={self.tp_size}"
+                    )
+                else:
+                    raise ValueError(
+                        f"DeepSeekV4 only supports round-robin-split CP mode, "
+                        f"got {self.nsa_prefill_cp_mode}"
+                    )
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
@@ -4412,6 +4439,11 @@ class ServerArgs:
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
 
+        parser.add_argument(
+            "--enable-hisparse",
+            action="store_true",
+            help="Enable hierarchical sparse attention",
+        )
         # Hierarchical sparse attention
         parser.add_argument(
             "--hierarchical-sparse-attention-extra-config",
@@ -4871,6 +4903,11 @@ class ServerArgs:
             "--enable-return-routed-experts",
             action="store_true",
             help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
+            "--enable-return-indexer-topk",
+            action="store_true",
+            help="Enable returning indexer topk indices of layers with indexer with responses.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",

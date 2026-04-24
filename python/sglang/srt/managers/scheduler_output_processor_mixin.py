@@ -7,6 +7,9 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.indexer_topk_capturer import (
+    get_global_indexer_capturer,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
@@ -95,6 +98,13 @@ class SchedulerOutputProcessorMixin:
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
         req.routed_experts = get_global_experts_capturer().get_routed_experts(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
+    def maybe_collect_indexer_topk(self: Scheduler, req: Req):
+        req.indexer_topk = get_global_indexer_capturer().get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
@@ -904,6 +914,7 @@ class SchedulerOutputProcessorMixin:
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
+        indexer_topk = None
         routed_experts = None
         customized_info = {}
 
@@ -1096,7 +1107,10 @@ class SchedulerOutputProcessorMixin:
                     if routed_experts is None:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
-
+                if req.return_indexer_topk:
+                    if indexer_topk is None:
+                        indexer_topk = []
+                    indexer_topk.append(req.indexer_topk)
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
@@ -1151,6 +1165,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    indexer_topk=indexer_topk,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

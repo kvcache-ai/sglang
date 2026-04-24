@@ -1,0 +1,158 @@
+diff a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py	(rejected hunks)
+@@ -206,57 +239,130 @@ def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
+     def set_num_tokens_hybrid_swa(self: ModelRunner):
+         page_size = self.server_args.page_size
+ 
+-        assert self.sliding_window_size is not None and self.sliding_window_size > 0
+         full_layers_num = len(self.model_config.full_attention_layer_ids)
+         swa_layers_num = len(self.model_config.swa_attention_layer_ids)
+-
+         assert swa_layers_num > 0, "Hybrid SWA model must have at least one SWA layer"
+ 
+-        def align_page_size(x: int) -> int:
++        def align_to_page(x: int) -> int:
+             return (x // page_size) * page_size
+ 
+         if full_layers_num == 0:
+-            # all layers are SWA
+-            self.swa_max_total_num_tokens = align_page_size(self.max_total_num_tokens)
++            self.swa_max_total_num_tokens = align_to_page(self.max_total_num_tokens)
+             self.full_max_total_num_tokens = 0
+             self.max_total_num_tokens = self.swa_max_total_num_tokens
+             logger.info(
+-                f"Use sliding window memory pool (all SWA). swa_layer_tokens={self.swa_max_total_num_tokens}"
++                f"Use sliding window memory pool (all SWA). "
++                f"swa_layer_tokens={self.swa_max_total_num_tokens}"
+             )
+             return
+ 
+-        # Algorithm:
+-        # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
+-        # - Find total # of tokens available across layers.
+-        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
++
+         total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
+-        swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
++        ratio = self.server_args.swa_full_tokens_ratio
++        denominator = full_layers_num + ratio * swa_layers_num
++        assert denominator > 0, (
++            f"Invalid denominator={denominator}: "
++            f"ratio={ratio}, swa_layers={swa_layers_num}, full_layers={full_layers_num}"
++        )
+ 
+-        # Solve the equations:
+-        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
+-        # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
+-        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+-        assert (
+-            denominator > 0
+-        ), f"Invalid denominator={denominator} for swa_full_tokens_ratio={swa_full_tokens_ratio} and swa_layers_num={swa_layers_num} and full_layers_num={full_layers_num}"
+         self.full_max_total_num_tokens = int(total_tokens / denominator)
+-        self.swa_max_total_num_tokens = int(
+-            self.full_max_total_num_tokens * swa_full_tokens_ratio
++        self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * ratio)
++
++        self.full_max_total_num_tokens = align_to_page(self.full_max_total_num_tokens)
++        self.swa_max_total_num_tokens = align_to_page(self.swa_max_total_num_tokens)
++
++        self.max_total_num_tokens = self.full_max_total_num_tokens
++
++        logger.info(
++            f"Use sliding window memory pool. "
++            f"full_layer_tokens={self.full_max_total_num_tokens}, "
++            f"swa_layer_tokens={self.swa_max_total_num_tokens}"
+         )
+ 
+-        self.full_max_total_num_tokens = align_page_size(self.full_max_total_num_tokens)
+-        self.swa_max_total_num_tokens = align_page_size(self.swa_max_total_num_tokens)
++    def set_num_tokens_hybrid_swa_compress(self: ModelRunner):
++        from sglang.srt.model_executor.memory_profiler import DSv4MemoryCalculator
++
++        self.state_dtype = torch.float32
++        logger.info(f"DSv4 compressed attention: kv_cache_dtype={self.kv_cache_dtype}")
++        logger.info(f"DSv4 compressed attention: state_dtype={self.state_dtype}")
++
++        page_size = self.server_args.page_size
++        assert (
++            page_size % 128 == 0
++        ), "page_size must be multiple of 128 for compressed attention"
++
++        if not self.spec_algorithm.is_none() and self.is_draft_worker:
++            config = getattr(self.server_args, "_draft_pool_config", None)
++            assert (
++                config is not None
++            ), "Draft worker requires target's pool config but _draft_pool_config is not set."
++            self.full_max_total_num_tokens = config["full_max_total_num_tokens"]
++            self.swa_max_total_num_tokens = config["swa_max_total_num_tokens"]
++            self.c4_max_total_num_tokens = 0
++            self.c128_max_total_num_tokens = 0
++            self.c4_state_pool_size = 0
++            self.c128_state_pool_size = 0
++
++            logger.info(
++                f"DSv4 pool sizes (DRAFT): using TARGET's pool sizes - "
++                f"full={self.full_max_total_num_tokens}, "
++                f"swa={self.swa_max_total_num_tokens}"
++            )
++            return
+ 
++        c4_shrink = (
++            envs.SGLANG_OPT_HISPARSE_C4_SHRINK.get() if self.enable_hisparse else 1
++        )
++        if c4_shrink > 1:
++            logger.info(
++                f"HiSparse c4 pool shrink factor = {c4_shrink} "
++                f"(set via SGLANG_OPT_HISPARSE_C4_SHRINK)"
++            )
++        calculator = DSv4MemoryCalculator(
++            model_config=self.model_config,
++            page_size=page_size,
++            swa_ratio=self.server_args.swa_full_tokens_ratio,
++            is_speculative=self.server_args.speculative_algorithm is not None,
++            c4_shrink_factor=c4_shrink,
++        )
++
++        pool_sizes = calculator.get_pool_sizes_by_profiling(self)
++        if (
++            self.server_args.max_total_tokens is not None
++            and pool_sizes.full_max_total_num_tokens > self.max_total_num_tokens
++        ):
++            pool_sizes = calculator.get_pool_sizes_by_configuration(
++                max_total_tokens=self.max_total_num_tokens
++            )
++
++        self.full_max_total_num_tokens = pool_sizes.full_max_total_num_tokens
++        self.swa_max_total_num_tokens = pool_sizes.swa_max_total_num_tokens
++        self.c4_max_total_num_tokens = pool_sizes.c4_max_total_num_tokens
++        self.c128_max_total_num_tokens = pool_sizes.c128_max_total_num_tokens
++        self.c4_state_pool_size = pool_sizes.c4_state_pool_size
++        self.c128_state_pool_size = pool_sizes.c128_state_pool_size
+         self.max_total_num_tokens = self.full_max_total_num_tokens
+ 
++        if not self.spec_algorithm.is_none() and not self.is_draft_worker:
++            self.server_args._draft_pool_config = {
++                "full_max_total_num_tokens": self.full_max_total_num_tokens,
++                "swa_max_total_num_tokens": self.swa_max_total_num_tokens,
++            }
++
+         logger.info(
+-            f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
++            f"DSv4 pool sizes: "
++            f"full={self.full_max_total_num_tokens}, "
++            f"swa={self.swa_max_total_num_tokens}, "
++            f"c4={self.c4_max_total_num_tokens}, "
++            f"c128={self.c128_max_total_num_tokens}, "
++            f"c4_state={self.c4_state_pool_size}, "
++            f"c128_state={self.c128_state_pool_size}"
+         )
+ 
+-    def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
++    def init_memory_pool(self: ModelRunner):
+         max_num_reqs = self.server_args.max_running_requests
+-        max_total_tokens = self.server_args.max_total_tokens
+-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
++        max_total_tokens_configured = self.server_args.max_total_tokens
++        self.max_total_num_tokens = self.profile_max_num_token()
+ 
+         if max_num_reqs is None:
+             max_num_reqs = min(

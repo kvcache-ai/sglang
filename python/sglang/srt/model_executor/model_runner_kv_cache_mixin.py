@@ -5,13 +5,23 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    is_deepseek_compressed,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+    DeepSeekV4IndexerPool,
+    DeepSeekV4TokenToKVPool,
+)
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
@@ -46,9 +56,32 @@ _is_npu = is_npu()
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
-        if self.use_mla_backend:
+        if is_deepseek_compressed(self.model_config.hf_config):
+            assert kv_size == 1, kv_size  # uint8
+
             cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                (
+                    self.model_config.qk_nope_head_dim
+                    + self.model_config.qk_rope_head_dim * 2
+                )
+                * num_layers
+                * kv_size
+            )
+            index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+            indexer_size_per_token = (
+                index_head_dim
+                + index_head_dim // DeepSeekV4IndexerPool.quant_block_size * 4
+            )
+            element_size = torch._utils._element_size(
+                DeepSeekV4IndexerPool.index_k_with_scale_buffer_dtype
+            )
+            cell_size += indexer_size_per_token * num_layers * element_size
+        elif self.use_mla_backend:
+            cell_size = (
+                (
+                    self.model_config.qk_nope_head_dim
+                    + self.model_config.qk_rope_head_dim
+                )
                 * num_layers
                 * kv_size
             )
@@ -113,7 +146,7 @@ class ModelRunnerKVCacheMixin:
                 )
         return cell_size
 
-    def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
+    def profile_max_num_token(self: ModelRunner):
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -140,7 +173,7 @@ class ModelRunnerKVCacheMixin:
 
         cell_size = self.get_cell_size_per_token(num_layers)
 
-        rest_memory = available_gpu_memory - total_gpu_memory * (
+        rest_memory = available_gpu_memory - self.total_gpu_memory * (
             1 - self.mem_fraction_static
         )
         if self.mambaish_config is not None:
@@ -375,14 +408,16 @@ class ModelRunnerKVCacheMixin:
                     max_num_reqs, self.server_args.max_running_requests // self.dp_size
                 )
 
-        if max_total_tokens is not None:
-            if max_total_tokens > self.max_total_num_tokens:
+        if max_total_tokens_configured is not None:
+            if max_total_tokens_configured > self.max_total_num_tokens:
                 logging.warning(
-                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                    f"max_total_tokens={max_total_tokens_configured} is larger than the profiled value "
                     f"{self.max_total_num_tokens}. "
                     f"Use the profiled value instead."
                 )
-            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
+            self.max_total_num_tokens = min(
+                self.max_total_num_tokens, max_total_tokens_configured
+            )
 
         self.max_total_num_tokens = (
             self.max_total_num_tokens
@@ -405,7 +440,11 @@ class ModelRunnerKVCacheMixin:
 
         # create token size for hybrid cache
         if self.is_hybrid_swa:
-            self.set_num_tokens_hybrid_swa()
+            assert self.sliding_window_size is not None and self.sliding_window_size > 0
+            if self.model_config.is_swa_with_compressed_attention:
+                self.set_num_tokens_hybrid_swa_compress()
+            else:
+                self.set_num_tokens_hybrid_swa()
 
         if not self.spec_algorithm.is_none() and not self.is_draft_worker:
             # Draft worker should use SWA adjusted max_total_num_tokens for cache size, otherwise it may cause oob in kv cache store
@@ -483,7 +522,46 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend":
+        is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
+        if is_v4_model:
+
+            swa_page_size = self.page_size
+            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+
+            if self.is_draft_worker:
+                from sglang.srt.models.deepseek_v4_nextn import (
+                    COMPRESS_RATIO_NEXTN_LAYER,
+                )
+
+                compression_ratios = [
+                    COMPRESS_RATIO_NEXTN_LAYER
+                ] * self.num_effective_layers
+            else:
+                compression_ratios = self.model_config.compress_ratios
+            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=self.server_args.max_running_requests,
+                swa_size=self.swa_max_total_num_tokens,
+                c4_size=self.c4_max_total_num_tokens,
+                c128_size=self.c128_max_total_num_tokens,
+                c4_state_pool_size=self.c4_state_pool_size,
+                c128_state_pool_size=self.c128_state_pool_size,
+                page_size=self.page_size,
+                swa_page_size=swa_page_size,
+                dtype=self.kv_cache_dtype,
+                state_dtype=self.state_dtype,
+                qk_nope_head_dim=self.model_config.qk_nope_head_dim,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                indexer_head_dim=self.model_config.index_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                compression_ratios=compression_ratios,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                enable_hisparse=self.enable_hisparse,
+            )
+
+        elif self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
@@ -729,6 +807,10 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
+                if self.enable_hisparse:
+                    self.token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
+                        self.token_to_kv_pool_allocator
+                    )
 
         else:
             assert self.is_draft_worker

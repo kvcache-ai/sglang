@@ -316,6 +316,8 @@ class SetKAndS:
 
     @classmethod
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
+        loc = loc.to(torch.int64)
+
         _set_k_and_s_triton(
             buf=buf,
             loc=loc,
@@ -354,14 +356,14 @@ def _set_k_and_s_triton(
             f"index_k_scale must be 1D or 2D, got shape {index_k_scale.shape}"
         )
     if _is_hip:
-        assert buf_numel_per_page == 1 * (128 + 4)
+        pass
     else:
         assert buf_numel_per_page == 64 * (128 + 4)
     assert num_tokens_to_write == num_tokens_to_write_ == num_tokens_to_write__
     assert index_head_dim == 128
     assert scale_dim == 1
     if _is_hip:
-        assert page_size == 1
+        pass
     else:
         assert page_size == 64
 

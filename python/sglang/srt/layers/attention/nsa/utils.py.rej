@@ -1,0 +1,9 @@
+diff a/python/sglang/srt/layers/attention/nsa/utils.py b/python/sglang/srt/layers/attention/nsa/utils.py	(rejected hunks)
+@@ -8,6 +8,7 @@
+ import triton
+ import triton.language as tl
+ 
++from sglang.srt.environ import envs
+ from sglang.srt.layers.dp_attention import (
+     attn_tp_all_gather_into_tensor,
+     get_attention_tp_group,

@@ -1,0 +1,51 @@
+diff a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py	(rejected hunks)
+@@ -90,6 +90,7 @@
+     from typing import Any, Dict
+ 
+     from sglang.srt.configs.model_config import ModelConfig
++    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+     from sglang.srt.speculative.eagle_info import EagleDraftInput
+     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+ 
+@@ -779,6 +786,8 @@ def __init__(
+         self.dllm_block_offset = 0
+         self.dllm_config = dllm_config
+ 
++        self.hisparse_staging = False
++
+     @property
+     def seqlen(self) -> int:
+         """Get the current sequence length of the request."""
+@@ -1096,6 +1106,9 @@ def reset_for_retract(self):
+         self.kv_committed_len = 0
+         self.kv_committed_freed = False
+         self.kv_overallocated_freed = False
++        self.swa_evicted_seqlen = 0
++        self.extend_batch_idx = 0
++        self.decode_batch_idx = 0
+ 
+     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+         token_indices = req_to_token_pool.req_to_token[
+@@ -1345,6 +1360,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     # Metrics
+     dp_cooperation_info: Optional[DPCooperationInfo] = None
+ 
++    hisparse_coordinator: Optional[HiSparseCoordinator] = None
++
+     @classmethod
+     def init_new(
+         cls,
+@@ -1380,11 +1397,13 @@ def init_new(
+             spec_algorithm=spec_algorithm,
+             return_hidden_states=any(req.return_hidden_states for req in reqs),
+             return_routed_experts=any(req.return_routed_experts for req in reqs),
++            return_indexer_topk=any(req.return_indexer_topk for req in reqs),
+             is_prefill_only=all(req.is_prefill_only for req in reqs),
+             chunked_req=chunked_req,
+             dllm_staging_reqs=dllm_staging_reqs,
+             dllm_config=dllm_config,
+         )
++        return batch
+ 
+     def batch_size(self):
+         return len(self.reqs)

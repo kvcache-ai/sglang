@@ -1,0 +1,10 @@
+diff a/python/sglang/srt/layers/attention/nsa/nsa_indexer.py b/python/sglang/srt/layers/attention/nsa/nsa_indexer.py	(rejected hunks)
+@@ -420,7 +424,7 @@ def _get_topk_paged(
+                 q_fp8,
+                 kv_cache_fp8,
+                 weights,
+-                seqlens_32,
++                seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
+                 block_tables,
+                 schedule_metadata,
+                 max_seq_len,

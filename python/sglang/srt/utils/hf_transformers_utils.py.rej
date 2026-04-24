@@ -1,0 +1,47 @@
+diff a/python/sglang/srt/utils/hf_transformers_utils.py b/python/sglang/srt/utils/hf_transformers_utils.py	(rejected hunks)
+@@ -271,17 +313,41 @@ def get_config(
+         config = _load_mistral_large_3_for_causal_LM(
+             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+         )
++    elif envs.SGLANG_APPLY_CONFIG_BACKUP.get() != "none":
++        config = _load_deepseek_temp_model(
++            model,
++            model_type="deepseek_ref",
++            architecture="DeepseekV4ForCausalLM",
++            trust_remote_code=trust_remote_code,
++            revision=revision,
++            **kwargs,
++        )
+     else:
+         try:
+             config = AutoConfig.from_pretrained(
+                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+             )
+         except ValueError as e:
+-            if not "deepseek_v32" in str(e):
++            if "deepseek_ref" in str(e):
++                config = _load_deepseek_temp_model(
++                    model,
++                    model_type="deepseek_ref",
++                    architecture="DeepseekV4ForCausalLM",
++                    trust_remote_code=trust_remote_code,
++                    revision=revision,
++                    **kwargs,
++                )
++            elif "deepseek_v32" in str(e):
++                config = _load_deepseek_temp_model(
++                    model,
++                    model_type="deepseek_v32",
++                    architecture="DeepseekV3ForCausalLM",
++                    trust_remote_code=trust_remote_code,
++                    revision=revision,
++                    **kwargs,
++                )
++            else:
+                 raise e
+-            config = _load_deepseek_v32_model(
+-                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+-            )
+ 
+     if (
+         config.architectures is not None

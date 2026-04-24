@@ -37,7 +37,7 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
         )
-        # Mock hf_config for _use_dpsk_v32_encoding check
+        # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
         self.model_config.hf_config = mock_hf_config
@@ -692,18 +692,29 @@ class ServingChatTestCase(unittest.TestCase):
             tokenizer_manager.tokenizer.chat_template = None
 
             serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
-            self.assertTrue(serving_chat.use_dpsk_v32_encoding)
+            self.assertEqual(serving_chat.chat_encoding_spec, "dsv32")
 
             # Case 2: Chat template exists -> should NOT use dpsk encoding
             tokenizer_manager.tokenizer.chat_template = "some template"
             serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
-            self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+            self.assertIsNone(serving_chat.chat_encoding_spec)
 
             # Case 3: Not DeepSeek V3.2 architecture -> should NOT use dpsk encoding
             tokenizer_manager.tokenizer.chat_template = None
             mock_hf_config.architectures = ["LlamaForCausalLM"]
             serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
-            self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+            self.assertIsNone(serving_chat.chat_encoding_spec)
+
+            # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
+            # (release ships a stale V3 jinja we deliberately override).
+            mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+            tokenizer_manager.tokenizer.chat_template = "stale v3 jinja"
+            serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
+            self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+
+            tokenizer_manager.tokenizer.chat_template = None
+            serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
+            self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
 
 
 if __name__ == "__main__":

@@ -84,6 +84,15 @@ def create_nsa_backend(runner):
     return NativeSparseAttnBackend(runner)
 
 
+@register_attention_backend("compressed")
+def create_compressed_backend(runner):
+    from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
+        DeepseekV4BackendRadix,
+    )
+
+    return DeepseekV4BackendRadix(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (

@@ -8,10 +8,13 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
     get_attention_dp_rank,
+    get_attention_tp_size,
     get_dp_local_info,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -181,6 +184,17 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             device=device,
         )
 
+        if get_moe_a2a_backend().is_deepep():
+            attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
+            self.gather_buffer = torch.empty(
+                (
+                    self.device_cache.buffer.shape[0] * attn_tp_size,
+                    self.device_cache.buffer.shape[2],
+                ),
+                dtype=torch.int32,
+                device=device,
+            )
+
     def _sync_fwd_experts_buffer_DtoH(
         self,
         forward_batch: ForwardBatch,
@@ -206,6 +220,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         ].cpu()
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
+        if get_moe_a2a_backend().is_deepep():
+            local_topk_ids = topk_ids
+            topk_ids = self.gather_buffer[
+                : local_topk_ids.size(0) * get_attention_tp_size()
+            ]
+            attn_tp_all_gather_into_tensor(topk_ids, local_topk_ids)
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
 
     def get_routed_experts(
@@ -281,7 +301,6 @@ def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
 def extract_routed_experts_from_meta_info(data):
     # To solve the performance issue, we return the experts_ids in base64
     # We left this function for user to change it back to normal int32
-    # See detokenizer_manager::_extract_routed_experts
     routed_experts_base64 = data["meta_info"].get("routed_experts", None)
     routed_experts = np.frombuffer(
         pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32

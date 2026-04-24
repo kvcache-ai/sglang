@@ -92,7 +92,7 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     def _convert(arg: CPP_TEMPLATE_TYPE) -> str:
         if isinstance(arg, bool):
             return "true" if arg else "false"
-        if isinstance(arg, (int, float)):
+        if isinstance(arg, (int, str, float)):
             return str(arg)
         if isinstance(arg, torch.dtype):
             return CPP_DTYPE_MAP[arg]

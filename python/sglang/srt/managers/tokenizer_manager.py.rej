@@ -1,0 +1,9 @@
+diff a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py	(rejected hunks)
+@@ -937,6 +937,7 @@ def _create_tokenized_object(
+                 require_reasoning=obj.require_reasoning,
+                 return_hidden_states=obj.return_hidden_states,
+                 return_routed_experts=obj.return_routed_experts,
++                return_indexer_topk=obj.return_indexer_topk,
+                 data_parallel_rank=obj.data_parallel_rank,
+                 priority=obj.priority,
+                 extra_key=obj.extra_key,

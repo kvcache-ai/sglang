@@ -35,10 +35,12 @@ try:
 except ImportError:
     pass
 
+from sglang.jit_kernel.deepseek_v4 import mask_topk_ids
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
@@ -281,9 +283,12 @@ class TopK(MultiPlatformOp):
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
-        elif (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_mxfp4()
+        elif get_moe_runner_backend().is_flashinfer_trtllm() or (
+            get_moe_runner_backend().is_flashinfer_mxfp4()
+            and not (
+                envs.SGLANG_DSV4_MODE.get() == "2604"
+                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            )
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:
@@ -691,11 +696,24 @@ def is_power_of_two(n):
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
-):
+) -> None:
     if num_token_non_padded is None:
         return
-    indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-    topk_ids[indices >= num_token_non_padded, :] = -1
+    if envs.SGLANG_OPT_USE_FAST_MASK_EP.get():
+        mask_topk_ids(topk_ids, num_token_non_padded)
+    else:
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
+        topk_ids[indices >= num_token_non_padded, :] = -1
+
+
+def _maybe_override_topk_ids_random(
+    topk_ids: torch.Tensor, num_experts: int
+) -> torch.Tensor:
+    if not envs.SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM.get() or topk_ids.numel() == 0:
+        return topk_ids
+    n_tokens, k = topk_ids.shape
+    scores = torch.rand(n_tokens, num_experts, device=topk_ids.device)
+    return scores.topk(k, dim=-1).indices.to(topk_ids.dtype)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -812,6 +830,7 @@ def biased_grouped_topk_gpu(
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
+            assert False, "dpsk should not use kimi"
             return kimi_k2_moe_fused_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,
