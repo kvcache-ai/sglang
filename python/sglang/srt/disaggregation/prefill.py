@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch

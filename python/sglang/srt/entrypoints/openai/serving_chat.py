@@ -390,14 +390,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        if self.use_dpsk_v32_encoding:
-            thinking_mode = (
-                "thinking"
-                if (request.chat_template_kwargs or {}).get("thinking")
-                else "chat"
+        if self.chat_encoding_spec is not None:
+            # Per-request wins; env is fallback so existing
+            # `export SGLANG_ENABLE_THINKING=1` workflow keeps working here.
+            thinking_requested = (request.chat_template_kwargs or {}).get(
+                "thinking", envs.SGLANG_ENABLE_THINKING.get()
             )
-            messages = request.messages
-            messages = [msg.model_dump() for msg in messages]
+            thinking_mode = "thinking" if thinking_requested else "chat"
+            messages = [msg.model_dump() for msg in request.messages]
 
             for msg in messages:
                 if msg.get("content") is None:

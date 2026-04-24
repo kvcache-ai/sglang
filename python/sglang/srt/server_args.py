@@ -1200,6 +1200,48 @@ class ServerArgs:
             self.dtype = "bfloat16"
 
         if model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            self.attention_backend = "compressed"
+            self.page_size = 256
+            logger.info(
+                f"Use compressed attention backend for {model_arch}, setting page_size to 256."
+            )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 256
+                logger.warning(
+                    f"Setting max_running_requests to {self.max_running_requests} for {model_arch}."
+                )
+
+            if self.kv_cache_dtype == "auto":
+                self.kv_cache_dtype = "fp8_e4m3"
+                logger.warning(
+                    f"Setting KV cache dtype to {self.kv_cache_dtype} for {model_arch}."
+                )
+            assert self.kv_cache_dtype in [
+                "fp8_e4m3"
+            ], f"{self.kv_cache_dtype} is not supported for {model_arch}"
+
+            if self.speculative_algorithm is not None:
+                assert (
+                    self.speculative_algorithm == "EAGLE"
+                ), f"Only EAGLE speculative algorithm is supported for {model_arch}"
+                assert (
+                    self.speculative_eagle_topk == 1
+                ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
+
+            if self.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+                self.swa_full_tokens_ratio = 0.1
+                logger.info(
+                    f"Setting swa_full_tokens_ratio to {self.swa_full_tokens_ratio} for {model_arch}."
+                )
+
+        if model_arch in [
             "DeepseekV3ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
@@ -2466,6 +2508,7 @@ class ServerArgs:
             if model_arch in [
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
+                "DeepseekV4ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
