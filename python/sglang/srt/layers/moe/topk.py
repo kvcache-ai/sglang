@@ -1019,15 +1019,38 @@ def select_experts(
         )
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        # Qwen3MOE uses fused_topk
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
-            renormalize=renormalize,
-            correction_bias=correction_bias,
-            scoring_func=scoring_func,
-        )
+        if scoring_func == "sqrtsoftplus":
+            if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+                from sglang.srt.layers.moe.deepseek_v4_topk import (
+                    biased_topk_jit_kernel_impl as biased_topk_impl,
+                )
+            else:
+                from sglang.srt.layers.moe.deepseek_v4_topk import biased_topk_impl
+
+            topk_weights, topk_ids = biased_topk_impl(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                correction_bias=correction_bias,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                scoring_func=scoring_func,
+                num_fused_shared_experts=num_fused_shared_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        else:
+            topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                correction_bias=correction_bias,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                scoring_func=scoring_func,
+            )
     else:
         assert (
             num_token_non_padded is None
@@ -1051,6 +1074,9 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
+    topk_ids = _maybe_override_topk_ids_random(
+        topk_ids, num_experts=router_logits.shape[-1]
+    )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

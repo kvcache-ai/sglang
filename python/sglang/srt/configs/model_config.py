@@ -346,6 +346,13 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
             "Glm4MoeLiteForCausalLM",
@@ -583,6 +590,32 @@ class ModelConfig:
                     scaling_factor = rope_scaling["factor"]
                     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                     self.scaling = self.scaling * mscale * mscale
+        elif (
+            "DeepseekV4ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+                self.window_size = self.hf_config.sliding_window
+            else:
+                self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+                self.window_size = self.hf_config.window_size
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.v_head_dim = self.head_dim
+            self.index_head_dim = self.hf_config.index_head_dim
+            self.compress_ratios = self.hf_config.compress_ratios
+            self.attention_arch = AttentionArch.MHA
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
+
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA

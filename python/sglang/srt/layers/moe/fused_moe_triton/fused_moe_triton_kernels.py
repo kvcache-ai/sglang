@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
