@@ -49,7 +49,6 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
-    DeepSeekV4Config,
     DeepseekVL2Config,
     DotsOCRConfig,
     DotsVLMConfig,
@@ -76,6 +75,7 @@ from sglang.srt.configs import (
 )
 
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR

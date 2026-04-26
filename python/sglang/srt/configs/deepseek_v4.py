@@ -1,9 +1,7 @@
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from transformers import PretrainedConfig
-
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
 @dataclass
@@ -42,7 +40,7 @@ class DeepSeekV4Config(PretrainedConfig):
     qk_nope_head_dim: int = 448
     qk_rope_head_dim: int = 64
 
-    quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig)
+    quantization_config: Dict[str, Any] = field(default_factory=dict)
 
     rms_norm_eps: float = 1e-6
 
