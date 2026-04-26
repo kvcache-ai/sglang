@@ -8,6 +8,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 @dataclass
 class DeepSeekV4Config(PretrainedConfig):
+    model_type = "deepseek_v4"
+
     architectures: List[str]
     attention_bias: bool = False
     attention_dropout: float = 0.0
@@ -24,7 +26,6 @@ class DeepSeekV4Config(PretrainedConfig):
     intermediate_size: int = 2048
     kv_lora_rank: int = 512
     max_position_embeddings: int = 65536
-    model_type: str = "deepseek_ref"
     moe_intermediate_size: int = 2048
     moe_layer_freq: int = 1
     n_group: int = 8
