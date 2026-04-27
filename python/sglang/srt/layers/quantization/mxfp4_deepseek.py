@@ -239,32 +239,23 @@ class DeepSeekMxfp4MoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        w13_w, w13_s = reorder_w1w3_to_w3w1(
-            layer.w13_weight.data, layer.w13_weight_scale_inv.data
-        )
-        layer.w13_weight = Parameter(w13_w, requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
-
-        log_info_on_rank0(
-            logger,
-            f"Shuffling FP4 expert weights for TRT-LLM MxFP4 kernel "
-            f"(layer: {self.prefix})...",
-        )
-
-        w13 = layer.w13_weight.data
-        w2 = layer.w2_weight.data
-        w13_scale = layer.w13_weight_scale_inv.data
-        w2_scale = layer.w2_weight_scale_inv.data
-        num_experts = w13.shape[0]
-
-        if w13_scale.dtype == torch.float32:
-            w13_scale = w13_scale.to(torch.float8_e8m0fnu)
-            w2_scale = w2_scale.to(torch.float8_e8m0fnu)
-
+        # The Marlin path expects natural [w1, w3] = [gate, up] order so that
+        # silu_and_mul can compute silu(first_half) * second_half = silu(gate)
+        # * up. Branch BEFORE reorder_w1w3_to_w3w1, which is a TRT-LLM-only
+        # rearrangement.
         if _use_v4_marlin_fallback():
             from sglang.srt.layers.quantization.v4_marlin_moe import (
                 convert_v4_weights_to_marlin,
             )
+
+            w13 = layer.w13_weight.data
+            w2 = layer.w2_weight.data
+            w13_scale = layer.w13_weight_scale_inv.data
+            w2_scale = layer.w2_weight_scale_inv.data
+
+            if w13_scale.dtype == torch.float32:
+                w13_scale = w13_scale.to(torch.float8_e8m0fnu)
+                w2_scale = w2_scale.to(torch.float8_e8m0fnu)
 
             hidden_size = w13.shape[2] * 2
             intermediate_size = w2.shape[2] * 2
@@ -298,6 +289,28 @@ class DeepSeekMxfp4MoEMethod:
             layer._v4_marlin_intermediate_size = intermediate_size
             layer._v4_marlin_path = True
             return
+
+        w13_w, w13_s = reorder_w1w3_to_w3w1(
+            layer.w13_weight.data, layer.w13_weight_scale_inv.data
+        )
+        layer.w13_weight = Parameter(w13_w, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
+
+        log_info_on_rank0(
+            logger,
+            f"Shuffling FP4 expert weights for TRT-LLM MxFP4 kernel "
+            f"(layer: {self.prefix})...",
+        )
+
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        w13_scale = layer.w13_weight_scale_inv.data
+        w2_scale = layer.w2_weight_scale_inv.data
+        num_experts = w13.shape[0]
+
+        if w13_scale.dtype == torch.float32:
+            w13_scale = w13_scale.to(torch.float8_e8m0fnu)
+            w2_scale = w2_scale.to(torch.float8_e8m0fnu)
 
         epilogue_tile_m = 128
         g1_w, g1_s, g2_w, g2_s = [], [], [], []
