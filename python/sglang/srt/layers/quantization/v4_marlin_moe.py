@@ -142,23 +142,20 @@ def convert_v4_weights_to_marlin(
     w2_marlin = gptq_marlin_moe_repack(w2_gptq, perm_w2, K_w2, N_w2, V4_NUM_BITS)
 
     # --- scales ---
-    # V4 stores scale as [E, N, K // group_size]. Marlin wants K-major for
-    # the per-expert reshape inside marlin_moe_permute_scales: pass it
-    # transposed so the resulting view is [E, K // group_size, N].
+    # V4 stores scale as [E, N, K // group_size]. Marlin wants the per-expert
+    # layout to be K-major: [E, K // group_size, N].
     w13_scale_t = w13_scale.transpose(1, 2).contiguous()  # [E, K_w13/32, N_w13]
     w2_scale_t = w2_scale.transpose(1, 2).contiguous()    # [E, K_w2/32, N_w2]
-    # marlin_moe_permute_scales operates on float dtype; ue8m0 is just a uint8
-    # bit-pattern and the permutation is layout-only, so reinterpret as uint8
-    # for the gather, then re-view as Float8_e8m0fnu on the output. The kernel
-    # consumes it as Float8_e8m0fnu directly (ops.cu:1129-1130).
-    w13_scale_u8 = w13_scale_t.view(torch.uint8)
-    w2_scale_u8 = w2_scale_t.view(torch.uint8)
-    w13_scale_marlin = marlin_moe_permute_scales(
-        w13_scale_u8, K_w13, N_w13, V4_FP4_GROUP_SIZE
-    ).view(torch.float8_e8m0fnu)
-    w2_scale_marlin = marlin_moe_permute_scales(
-        w2_scale_u8, K_w2, N_w2, V4_FP4_GROUP_SIZE
-    ).view(torch.float8_e8m0fnu)
+    # NOTE on the missing marlin_moe_permute_scales:
+    # That helper is the GPTQ-INT4 register-tile shuffle (an 8x8 transpose-
+    # like permutation that re-orders 64-element scale chunks to match the
+    # int4 dequant register layout). It's the wrong shuffle for the FP4 e2m1
+    # + ue8m0 path - sgl-kernel's `dequant_fp8_scales<bf16, kFE8M0fnu>`
+    # consumes scales as raw bytes packed 4-per-int32, which is exactly the
+    # natural [K/group_size, N] layout we already have. Permuting it
+    # produced gibberish (gemm output ~2^120 magnitudes) before this fix.
+    w13_scale_marlin = w13_scale_t  # already in [E, K/32, N] ue8m0
+    w2_scale_marlin = w2_scale_t
 
     return w13_marlin, w13_scale_marlin, w2_marlin, w2_scale_marlin
 
