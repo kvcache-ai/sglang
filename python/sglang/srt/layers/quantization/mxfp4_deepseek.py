@@ -447,6 +447,18 @@ class DeepSeekMxfp4MoEMethod:
                 intermediate_size=layer._v4_marlin_intermediate_size,
                 routed_scaling_factor=rsf if rsf is not None else 1.0,
             )
+            # 2604B sub-mode adds a runtime path-checker assertion in the
+            # model (deepseek_v4.py:1169). The trtllm path bumps the counter
+            # inside its body; mirror that bump here so the assertion still
+            # passes when MoE went through the Marlin fallback.
+            # NOTE: the trtllm path also applies a `swiglu_limit` clamp via
+            # _gemm1_clamp_limit_tensor; the Marlin path currently does plain
+            # silu_and_mul without that clamp, so 2604B numerics will be
+            # slightly off vs the reference until that clamp is added.
+            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
+                self._gemm1_clamp_limit_tensor is not None
+            ):
+                deepseek_v4_moe_code_path_checker.observed += 1
             return StandardCombineInput(hidden_states=output)
 
         packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
