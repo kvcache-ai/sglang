@@ -20,10 +20,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import functools
+
 import torch
-from sgl_kernel import moe_wna16_marlin_gemm
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.activation import silu_and_mul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import moe_sum_reduce
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
@@ -178,9 +180,15 @@ def apply_v4_marlin_moe(
     if E == 0 or M == 0:
         return torch.zeros_like(hidden_states)
 
-    config = try_get_optimal_moe_config(
-        w13.shape, w2.shape, topk, None, M, is_marlin=True
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w13.shape,
+        w2.shape,
+        topk,
+        None,
+        is_marlin=True,
     )
+    config = get_config_func(M)
     block_size_m = config["BLOCK_SIZE_M"]
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, block_size_m, E
@@ -195,37 +203,22 @@ def apply_v4_marlin_moe(
         max_workspace_size, dtype=torch.int, device=hidden_states.device
     )
 
-    # Empty placeholders for unused Marlin features.
-    empty_zeros = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
-    empty_g_idx = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
-    empty_perm = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
-
-    intermediate1 = torch.empty(
-        (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-    intermediate2 = torch.empty(
-        (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-    intermediate3 = torch.empty(
-        (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-
     use_atomic_add = (
         hidden_states.dtype == torch.half
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     )
     fp4_type = scalar_types.float4_e2m1f
 
-    moe_wna16_marlin_gemm(
+    intermediate1 = moe_wna16_marlin_gemm(
         hidden_states,
-        intermediate1,
+        None,           # c_or_none -> kernel allocates [M*topk, 2*N]
         w13,
-        None,                       # b_bias_or_none
+        None,           # b_bias_or_none
         w13_scale,
-        None,                       # global_scale_or_none
-        empty_zeros,
-        empty_g_idx,
-        empty_perm,
+        None,           # global_scale_or_none
+        None,           # b_zeros_or_none
+        None,           # g_idx_or_none
+        None,           # perm_or_none
         workspace,
         sorted_token_ids,
         expert_ids,
@@ -245,18 +238,21 @@ def apply_v4_marlin_moe(
         is_zp_float=False,
     )
 
+    intermediate2 = torch.empty(
+        (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
+    )
     silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
 
-    moe_wna16_marlin_gemm(
+    intermediate3 = moe_wna16_marlin_gemm(
         intermediate2,
-        intermediate3,
+        None,
         w2,
         None,
         w2_scale,
         None,
-        empty_zeros,
-        empty_g_idx,
-        empty_perm,
+        None,
+        None,
+        None,
         workspace,
         sorted_token_ids,
         expert_ids,
@@ -274,8 +270,8 @@ def apply_v4_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
-    )
+    ).view(-1, topk, K)
 
     output = torch.empty_like(hidden_states)
-    moe_sum_reduce(intermediate3.view(-1, topk, K), output, routed_scaling_factor)
+    moe_sum_reduce(intermediate3, output, routed_scaling_factor)
     return output
