@@ -21,6 +21,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import functools
+import os
 
 import torch
 from sgl_kernel.scalar_type import scalar_types
@@ -30,6 +31,31 @@ from sglang.srt.layers.activation import silu_and_mul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import moe_sum_reduce
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+
+# Once-per-rank diagnostic prints. SGLANG_V4_MARLIN_DEBUG=1 turns on a
+# numerical sanity log on the first call for each sub-step.
+_DEBUG = os.environ.get("SGLANG_V4_MARLIN_DEBUG") == "1"
+# SGLANG_V4_MARLIN_BYPASS=1 makes apply_v4_marlin_moe return zeros so we can
+# isolate whether numerical garbage downstream comes from this MoE path or
+# from somewhere else.
+_BYPASS = os.environ.get("SGLANG_V4_MARLIN_BYPASS") == "1"
+_diag_done = {"convert": False, "gemm1": False, "silu": False, "gemm2": False}
+
+
+def _diag(name, t):
+    if not _DEBUG or _diag_done.get(name):
+        return
+    _diag_done[name] = True
+    flat = t.detach().to(torch.float32).flatten()
+    sample = flat[: min(8, flat.numel())].tolist()
+    print(
+        f"[v4-marlin-diag] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+        f"any_nan={torch.isnan(flat).any().item()} "
+        f"any_inf={torch.isinf(flat).any().item()} "
+        f"min={flat.min().item():.4g} max={flat.max().item():.4g} "
+        f"absmean={flat.abs().mean().item():.4g} sample={sample}",
+        flush=True,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -180,6 +206,13 @@ def apply_v4_marlin_moe(
     if E == 0 or M == 0:
         return torch.zeros_like(hidden_states)
 
+    if _BYPASS:
+        return torch.zeros_like(hidden_states)
+
+    _diag("input_hs", hidden_states)
+    _diag("input_w13_scale", w13_scale)
+    _diag("input_w2_scale", w2_scale)
+
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w13.shape,
@@ -238,10 +271,12 @@ def apply_v4_marlin_moe(
         is_zp_float=False,
     )
 
+    _diag("gemm1_out", intermediate1)
     intermediate2 = torch.empty(
         (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
     )
     silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
+    _diag("silu_out", intermediate2)
 
     intermediate3 = moe_wna16_marlin_gemm(
         intermediate2,
@@ -272,6 +307,8 @@ def apply_v4_marlin_moe(
         is_zp_float=False,
     ).view(-1, topk, K)
 
+    _diag("gemm2_out", intermediate3)
     output = torch.empty_like(hidden_states)
     moe_sum_reduce(intermediate3, output, routed_scaling_factor)
+    _diag("moe_final", output)
     return output
