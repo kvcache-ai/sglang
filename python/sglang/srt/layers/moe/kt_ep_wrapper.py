@@ -2398,6 +2398,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Skip the GPU GEMM entirely and start from zeros; the CPU path then
         # provides 100% of the routed-expert contribution.
         # Origin: kt-sglang 耦合 (sglang/kt_ep_wrapper.py).
+        if not getattr(self, "_diag_logged", False):
+            self._diag_logged = True
+            try:
+                _mask_sum = int(self.gpu_experts_mask.sum().item())
+            except Exception as e:  # pragma: no cover
+                _mask_sum = f"err:{e}"
+            print(
+                f"[kt-ep-diag] layer={getattr(self.kt_config, 'layer_idx', '?')} "
+                f"num_gpu_experts={self.num_gpu_experts} mask_sum={_mask_sum} "
+                f"mask_shape={tuple(self.gpu_experts_mask.shape)} "
+                f"gpu_method={type(self.gpu_method).__name__}",
+                flush=True,
+            )
         if self.num_gpu_experts == 0:
             gpu_combine_input = None
             output = torch.zeros_like(x)
