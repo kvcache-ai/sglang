@@ -2411,16 +2411,26 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 f"gpu_method={type(self.gpu_method).__name__}",
                 flush=True,
             )
-        # Also honour SGLANG_KT_BYPASS_GPU_MOE=1 — the kt mask generator
-        # surprisingly returns all-True (num_gpu_experts == num_total_experts)
-        # for every layer when --kt-num-gpu-experts=0 was passed, which
-        # defeats the num_gpu_experts==0 short-circuit. The env var lets the
-        # operator force the same bypass per process.
-        import os as _os
-        _force_bypass = _os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1"
-        if self.num_gpu_experts == 0 or _force_bypass:
+        # SGLANG_KT_BYPASS_GPU_MOE=1 also short-circuits to zeros, because
+        # the kt mask generator returns an all-True (num_gpu_experts ==
+        # num_total_experts) per-layer mask in some configurations (e.g. V4
+        # Flash + --kt-num-gpu-experts=0), which defeats the
+        # num_gpu_experts==0 short-circuit. The env var lets the operator
+        # force the bypass without untangling the mask generator.
+        if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
             gpu_combine_input = None
             output = torch.zeros_like(x)
+            # 2604B sub-mode adds a runtime path-checker assertion in the
+            # model (deepseek_v4.py:1169 expects observed == 1 after every
+            # MoE forward). The trtllm path bumps it inside its body; the
+            # bypass path mirrors that here so the assertion still passes
+            # when GPU MoE is short-circuited in favour of CPU experts.
+            from sglang.srt.environ import envs as _envs
+            if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+                from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                    deepseek_v4_moe_code_path_checker,
+                )
+                deepseek_v4_moe_code_path_checker.observed += 1
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
