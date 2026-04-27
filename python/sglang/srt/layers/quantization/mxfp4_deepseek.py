@@ -48,6 +48,20 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 )
 
 
+def _use_v4_marlin_fallback() -> bool:
+    """The flashinfer TRT-LLM mxfp4 MoE kernel only ships a sm100f binary;
+    on consumer Blackwell (SM_120, e.g. RTX 5090) it raises a runtime error.
+    Detect that arch once and route MXFP4 MoE through sgl-kernel's
+    `moe_wna16_marlin_gemm` (FP4 e2m1 + group_size=32 + ue8m0 scales is
+    natively supported there, see
+    sgl-kernel/csrc/moe/marlin_moe_wna16/ops.cu:1126-1132).
+    Origin: sglang 本身.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] == 12
+
+
 class PackTopkIds:
 
     @classmethod
@@ -247,6 +261,44 @@ class DeepSeekMxfp4MoEMethod:
             w13_scale = w13_scale.to(torch.float8_e8m0fnu)
             w2_scale = w2_scale.to(torch.float8_e8m0fnu)
 
+        if _use_v4_marlin_fallback():
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                convert_v4_weights_to_marlin,
+            )
+
+            hidden_size = w13.shape[2] * 2
+            intermediate_size = w2.shape[2] * 2
+            log_info_on_rank0(
+                logger,
+                f"[v4-marlin] Converting V4 MXFP4 weights to Marlin layout "
+                f"(layer: {self.prefix}, hidden_size={hidden_size}, "
+                f"intermediate_size={intermediate_size})...",
+            )
+            (
+                w13_marlin,
+                w13_scale_marlin,
+                w2_marlin,
+                w2_scale_marlin,
+            ) = convert_v4_weights_to_marlin(
+                w13,
+                w13_scale,
+                w2,
+                w2_scale,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            layer.w13_weight = Parameter(w13_marlin, requires_grad=False)
+            layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
+            layer.w13_weight_scale_inv = Parameter(
+                w13_scale_marlin, requires_grad=False
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                w2_scale_marlin, requires_grad=False
+            )
+            layer._v4_marlin_intermediate_size = intermediate_size
+            layer._v4_marlin_path = True
+            return
+
         epilogue_tile_m = 128
         g1_w, g1_s, g2_w, g2_s = [], [], [], []
         if _USE_OFFICIAL_SHUFFLE:
@@ -377,6 +429,26 @@ class DeepSeekMxfp4MoEMethod:
                 topk_ids + local_expert_offset,
                 topk_ids,
             )
+
+        if getattr(layer, "_v4_marlin_path", False):
+            from sglang.srt.layers.quantization.v4_marlin_moe import (
+                apply_v4_marlin_moe,
+            )
+
+            rsf = layer.moe_runner_config.routed_scaling_factor
+            output = apply_v4_marlin_moe(
+                hidden_states=hidden_states,
+                w13=w13,
+                w2=w2,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                intermediate_size=layer._v4_marlin_intermediate_size,
+                routed_scaling_factor=rsf if rsf is not None else 1.0,
+            )
+            return StandardCombineInput(hidden_states=output)
+
         packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
 
         precision = self.flashinfer_mxfp4_moe_precision
