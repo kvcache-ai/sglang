@@ -372,12 +372,20 @@ class C4IndexerBackend:
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        # The tilelang and torch reference impls expect a 1-D `seq_lens`
+        # (assert ``shape == (batch_size,)``); only the deep_gemm path takes
+        # the 2-D ``(batch, 1)`` form. Pick the right shape per backend so
+        # SM_120 (which has to use the tilelang fallback) doesn't trip the
+        # assertion the deep_gemm-shaped tensor would.
+        seq_lens_2d = True
         if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
+            seq_lens_2d = False
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
+            seq_lens_2d = False
         else:
             if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
@@ -387,8 +395,12 @@ class C4IndexerBackend:
                 from deep_gemm import fp8_paged_mqa_logits as fn
 
         _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
-            _c4sl = _c4sl.unsqueeze(-1)
+        if seq_lens_2d:
+            if _c4sl.dim() == 1:
+                _c4sl = _c4sl.unsqueeze(-1)
+        else:
+            if _c4sl.dim() == 2 and _c4sl.shape[-1] == 1:
+                _c4sl = _c4sl.squeeze(-1)
         logits = fn(
             q_fp8,
             c4_indexer_kv_cache,
