@@ -142,20 +142,42 @@ def convert_v4_weights_to_marlin(
     w2_marlin = gptq_marlin_moe_repack(w2_gptq, perm_w2, K_w2, N_w2, V4_NUM_BITS)
 
     # --- scales ---
-    # V4 stores scale as [E, N, K // group_size]. Marlin wants the per-expert
-    # layout to be K-major: [E, K // group_size, N].
+    # FP4 e2m1 + ue8m0 scales need TWO permutations to match Marlin's
+    # internal register-tile layout, per vLLM's prepare_moe_mxfp4_layer_for_marlin
+    # (vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py:592-614):
+    #
+    #   1. Standard marlin_permute_scales (8x8 GPTQ register-tile shuffle).
+    #   2. mxfp4_marlin_process_scales: per-row reorder
+    #         `view(-1, 4)[:, [0, 2, 1, 3]]`
+    #      to interleave the 4 scales each warp lane reads against its 4 fp4
+    #      values per dot-product step.
+    #
+    # vLLM converts to bf16 around the permute and back to ue8m0; we operate
+    # directly on the uint8 byte representation (the permutations are layout-
+    # only and bytes are 1B = trivially gather-friendly).
     w13_scale_t = w13_scale.transpose(1, 2).contiguous()  # [E, K_w13/32, N_w13]
     w2_scale_t = w2_scale.transpose(1, 2).contiguous()    # [E, K_w2/32, N_w2]
-    # NOTE on the missing marlin_moe_permute_scales:
-    # That helper is the GPTQ-INT4 register-tile shuffle (an 8x8 transpose-
-    # like permutation that re-orders 64-element scale chunks to match the
-    # int4 dequant register layout). It's the wrong shuffle for the FP4 e2m1
-    # + ue8m0 path - sgl-kernel's `dequant_fp8_scales<bf16, kFE8M0fnu>`
-    # consumes scales as raw bytes packed 4-per-int32, which is exactly the
-    # natural [K/group_size, N] layout we already have. Permuting it
-    # produced gibberish (gemm output ~2^120 magnitudes) before this fix.
-    w13_scale_marlin = w13_scale_t  # already in [E, K/32, N] ue8m0
-    w2_scale_marlin = w2_scale_t
+    w13_scale_u8 = w13_scale_t.view(torch.uint8)
+    w2_scale_u8 = w2_scale_t.view(torch.uint8)
+    w13_scale_perm = marlin_moe_permute_scales(
+        w13_scale_u8, K_w13, N_w13, V4_FP4_GROUP_SIZE
+    )
+    w2_scale_perm = marlin_moe_permute_scales(
+        w2_scale_u8, K_w2, N_w2, V4_FP4_GROUP_SIZE
+    )
+
+    def _mxfp4_interleave(s_u8: torch.Tensor) -> torch.Tensor:
+        # `s_u8` shape after marlin_moe_permute_scales: [E, K/group, N]
+        # vLLM's mxfp4_marlin_process_scales applies the reorder to a 2-D
+        # per-expert tensor; do the same per expert here.
+        out = []
+        for i in range(s_u8.shape[0]):
+            r = s_u8[i].reshape(-1, 4)[:, [0, 2, 1, 3]].reshape(s_u8[i].shape)
+            out.append(r.contiguous())
+        return torch.stack(out, dim=0)
+
+    w13_scale_marlin = _mxfp4_interleave(w13_scale_perm).view(torch.float8_e8m0fnu)
+    w2_scale_marlin = _mxfp4_interleave(w2_scale_perm).view(torch.float8_e8m0fnu)
 
     return w13_marlin, w13_scale_marlin, w2_marlin, w2_scale_marlin
 
