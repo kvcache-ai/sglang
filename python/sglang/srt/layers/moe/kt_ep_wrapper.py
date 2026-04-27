@@ -2411,7 +2411,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 f"gpu_method={type(self.gpu_method).__name__}",
                 flush=True,
             )
-        if self.num_gpu_experts == 0:
+        # Also honour SGLANG_KT_BYPASS_GPU_MOE=1 — the kt mask generator
+        # surprisingly returns all-True (num_gpu_experts == num_total_experts)
+        # for every layer when --kt-num-gpu-experts=0 was passed, which
+        # defeats the num_gpu_experts==0 short-circuit. The env var lets the
+        # operator force the same bypass per process.
+        import os as _os
+        _force_bypass = _os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1"
+        if self.num_gpu_experts == 0 or _force_bypass:
             gpu_combine_input = None
             output = torch.zeros_like(x)
         else:
