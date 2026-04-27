@@ -2390,10 +2390,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Step 3: Execute GPU expert computation on main stream
         # No wait needed - staging buffer decouples CPU and GPU data access
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+        # When num_gpu_experts == 0 the gpu_method's weights have shapes that
+        # are incompatible with its own apply() (e.g. on SM_120 with V4 Flash
+        # where the only routed-expert quant method available, the FP8 fused
+        # MoE Triton path, asserts hidden_states.shape[1] == w1.shape[2] -
+        # padded_size, which fails because w1 is the empty 0-expert slice).
+        # Skip the GPU GEMM entirely and start from zeros; the CPU path then
+        # provides 100% of the routed-expert contribution.
+        # Origin: kt-sglang 耦合 (sglang/kt_ep_wrapper.py).
+        if self.num_gpu_experts == 0:
+            gpu_combine_input = None
+            output = torch.zeros_like(x)
+        else:
+            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            output = gpu_combine_input.hidden_states
 
         # Step 4: Sync CPU results on cpu_stream, then synchronize streams
-        output = gpu_combine_input.hidden_states
         if self.tp_rank == 0 and self._cpu_stream is not None:
             with torch.cuda.stream(self._cpu_stream):
                 # Use staging_buffer for sync to get correct buffer reference
