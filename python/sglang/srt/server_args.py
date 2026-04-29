@@ -5415,44 +5415,85 @@ class ServerArgs:
         if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
             return
 
-        if self.get_model_config().is_multimodal:
-            import torch
+        if not self.get_model_config().is_multimodal:
+            return
 
-            if torch_release[:3] == (2, 9, 1):
-                cudnn_version = None
-                try:
-                    cudnn_version = torch.backends.cudnn.version()
-                except Exception:
-                    cudnn_version = None
-                if cudnn_version is not None:
-                    version_float = float(str(cudnn_version)[:3]) / 100
-                    if version_float < 9.15:
-                        RED = "\033[91m"
-                        BOLD = "\033[1m"
-                        RESET = "\033[0m"
-                        msg = (
-                            f"{RED}{BOLD}"
-                            "CRITICAL WARNING: PyTorch 2.9.1 & CuDNN Compatibility Issue Detected\n"
-                            "--------------------------------------------------------------------------------\n"
-                            f"Current Environment: PyTorch {torch.__version__} | CuDNN {version_float:.2f}\n\n"
-                            "Issue:     There is a KNOWN BUG in PyTorch 2.9.1's `nn.Conv3d` implementation\n"
-                            "           when used with CuDNN versions older than 9.15. This can cause\n"
-                            "           SEVERE PERFORMANCE DEGRADATION and EXCESSIVE MEMORY USAGE.\n\n"
-                            "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
-                            "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
-                            "Run the following command immediately to fix:\n"
-                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
-                            "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
-                            "--------------------------------------------------------------------------------\n"
-                            f"{RESET}"
-                        )
-                        raise RuntimeError(msg)
-                else:
-                    RED = "\033[91m"
-                    RESET = "\033[0m"
-                    logger.warning(
-                        f"{RED}WARNING: Could not determine CuDNN version for torch==2.9.1. Please ensure CuDNN >= 9.15 to avoid nn.Conv3d bugs.{RESET}"
-                    )
+        import torch
+
+        if torch_release[:3] != (2, 9, 1):
+            return
+
+        def _format_cudnn_version(version):
+            if version is None:
+                return "unknown"
+            try:
+                version_int = int(version)
+            except (TypeError, ValueError):
+                return str(version)
+            if version_int >= 10000:
+                major = version_int // 10000
+                minor = (version_int % 10000) // 100
+                patch = version_int % 100
+            else:
+                major = version_int // 1000
+                minor = (version_int % 1000) // 100
+                patch = version_int % 100
+            return f"{major}.{minor}.{patch}"
+
+        try:
+            cudnn_version = torch.backends.cudnn.version()
+        except Exception:
+            cudnn_version = None
+
+        if cudnn_version is None:
+            RED = "\033[91m"
+            RESET = "\033[0m"
+            logger.warning(
+                "%sWARNING: Could not determine CuDNN version for torch==2.9.1. "
+                "Please ensure CuDNN >= 9.15 to avoid the known nn.Conv3d "
+                "performance and memory issue.%s",
+                RED,
+                RESET,
+            )
+            return
+
+        if int(cudnn_version) >= 91500:
+            return
+
+        cuda_version = getattr(torch.version, "cuda", None)
+        cuda_major = str(cuda_version).split(".", 1)[0] if cuda_version else ""
+        if cuda_major == "13":
+            cudnn_package = "nvidia-cudnn-cu13"
+        elif cuda_major == "12":
+            cudnn_package = "nvidia-cudnn-cu12"
+        else:
+            cudnn_package = "nvidia-cudnn-cu12_or_nvidia-cudnn-cu13"
+
+        if cudnn_package == "nvidia-cudnn-cu12_or_nvidia-cudnn-cu13":
+            install_cmd = (
+                "pip install --force-reinstall --no-deps "
+                "nvidia-cudnn-cu12==9.16.0.29  # or nvidia-cudnn-cu13 for CUDA 13"
+            )
+        else:
+            install_cmd = (
+                "pip install --force-reinstall --no-deps "
+                f"{cudnn_package}==9.16.0.29"
+            )
+
+        RED = "\033[91m"
+        RESET = "\033[0m"
+        logger.warning(
+            "%sWARNING: PyTorch 2.9.1 with CuDNN %s detected for a multimodal model. "
+            "PyTorch issue https://github.com/pytorch/pytorch/issues/168167 reports "
+            "an nn.Conv3d performance and memory regression with CuDNN older than 9.15. "
+            "SGLang will continue startup, but the recommended post-install override is:\n"
+            "    %s\n"
+            "Set SGLANG_DISABLE_CUDNN_CHECK=1 to suppress this warning.%s",
+            RED,
+            _format_cudnn_version(cudnn_version),
+            install_cmd,
+            RESET,
+        )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
