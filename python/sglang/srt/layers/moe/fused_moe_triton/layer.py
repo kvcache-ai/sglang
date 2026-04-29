@@ -273,6 +273,29 @@ class FusedMoE(torch.nn.Module):
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
                 gpu_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
+            # NEW (2026-04-29): V4-Flash routed experts are MXFP4 packed, but
+            # quant_config.get_quant_method returns Fp8MoEMethod (V4 model uses
+            # FP8 for attn / shared experts; the model_level config). Wrap with
+            # DeepSeekMxfp4MoEMethod so create_weights / apply use the MXFP4
+            # path (and SGLANG_V4_USE_TRITON_KERNELS dispatch fires). Origin:
+            # kt-sglang 耦合.
+            try:
+                from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                    use_v4_triton_kernels,
+                )
+                from sglang.srt.layers.quantization.mxfp4_deepseek import (
+                    DeepSeekMxfp4MoEMethod,
+                )
+                if (
+                    use_v4_triton_kernels()
+                    and isinstance(gpu_method, Fp8MoEMethod)
+                ):
+                    gpu_method = DeepSeekMxfp4MoEMethod(gpu_method, prefix=prefix)
+            except Exception as _e:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    f"[kt-fused-moe] V4-Flash MXFP4 wrap skipped: {_e}"
+                )
             self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
         else:
             if quant_config is not None:

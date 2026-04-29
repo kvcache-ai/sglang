@@ -1043,6 +1043,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            out_cache_loc=forward_batch.out_cache_loc,
         )
 
         # Store fields

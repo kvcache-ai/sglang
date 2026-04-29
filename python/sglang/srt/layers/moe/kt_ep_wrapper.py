@@ -195,6 +195,33 @@ class SharedFullContext:
             self.gpu_method = UnquantizedFusedMoEMethod(
                 self.gpu_layer.use_triton_kernels
             )
+        # NEW (2026-04-29): V4-Flash routed experts are MXFP4-packed (FP4 e2m1
+        # in int8 + ue8m0 scales) but quant_config.get_quant_method picks
+        # Fp8MoEMethod (V4-Flash uses FP8 for attn / shared experts). The
+        # default mxfp4_deepseek pipeline wraps Fp8MoEMethod with
+        # DeepSeekMxfp4MoEMethod for V4-Flash routed experts; replicate that
+        # wrap here so kt_ep_wrapper's gpu_method correctly handles MXFP4
+        # (with shape K = hidden, not hidden/2 as the FP8 path assumes), and
+        # so SGLANG_V4_USE_TRITON_KERNELS dispatch in mxfp4_deepseek.apply
+        # fires on the wrapped path. Origin: kt-sglang 耦合 (V4-Flash routed
+        # experts MXFP4 detection in kt_ep_wrapper).
+        try:
+            from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                use_v4_triton_kernels,
+            )
+            from sglang.srt.layers.quantization.mxfp4_deepseek import (
+                DeepSeekMxfp4MoEMethod,
+            )
+            if (
+                use_v4_triton_kernels()
+                and isinstance(self.gpu_method, Fp8MoEMethod)
+            ):
+                self.gpu_method = DeepSeekMxfp4MoEMethod(self.gpu_method, prefix="")
+        except Exception as _v4_tk_wrap_exc:
+            logger.warning(
+                f"[kt-ep-wrapper] V4-Flash MXFP4 wrap skipped: {_v4_tk_wrap_exc}"
+            )
         self.gpu_layer.quant_method = self.gpu_method
 
         self.gpu_method.create_weights(
@@ -1441,8 +1468,21 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         return None
 
     # Get first_k_dense_replace to identify which layers are MoE layers
-    first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0)
+    first_k_dense_replace = getattr(hf_config, "first_k_dense_replace", 0) or 0
     moe_layer_freq = getattr(hf_config, "moe_layer_freq", 1)
+
+    # NEW (2026-04-29): V4-Flash has hash-MoE layers at the front (num_hash_layers,
+    # typically 3) which the HF DeepseekV3Config treats as first_k_dense_replace=3
+    # by default. But hash layers DO have routed experts (n_routed_experts=256)
+    # — they are NOT dense. Letting generate_uniform_masks set masks[0..2,:] = True
+    # for hash layers makes the kt_ep_wrapper send all 256 experts to a GPU MoE
+    # that only loaded num_gpu_experts_per_layer worth of weights, triggering
+    # the fused_moe Hidden size mismatch assert. Subtract num_hash_layers so
+    # hash layers are correctly classified as MoE for mask purposes.
+    # Origin: kt-sglang 耦合 (V4-Flash hash-MoE handling in kt_ep_wrapper).
+    num_hash_layers = getattr(hf_config, "num_hash_layers", 0) or 0
+    if num_hash_layers > 0:
+        first_k_dense_replace = max(0, first_k_dense_replace - num_hash_layers)
 
     # Normalize list-form moe_layer_freq (e.g., MiMo-V2-Flash: [0, 1, 1, ...])
     # to standard (first_k_dense_replace, moe_layer_freq=1) form
@@ -1458,6 +1498,16 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         if i >= first_k_dense_replace and i % moe_layer_freq == 0
     )
     total_experts = num_moe_layers * num_experts
+    print(
+        f"[kt-mask-debug] num_layers={num_layers} num_experts={num_experts} "
+        f"first_k_dense_replace={first_k_dense_replace} (type={type(first_k_dense_replace).__name__}) "
+        f"moe_layer_freq={moe_layer_freq} (type={type(moe_layer_freq).__name__}) "
+        f"computed_num_moe_layers={num_moe_layers} "
+        f"hf_config_class={type(hf_config).__module__}.{type(hf_config).__name__} "
+        f"num_hash_layers={getattr(hf_config, 'num_hash_layers', '<missing>')} "
+        f"n_hash_layers={getattr(hf_config, 'n_hash_layers', '<missing>')}",
+        flush=True,
+    )
 
     # Determine num_gpu_experts (total across all layers)
     if server_args.kt_gpu_experts_ratio is not None:
@@ -1654,14 +1704,19 @@ def create_kt_config_from_server_args(
     if masks is None:
         return None
 
-    # Get mask for this specific layer
-    gpu_experts_mask = masks[layer_idx]
-
     # Get num_layers from model config (unwrap VL configs)
     hf_config = server_args.get_hf_config()
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
+
+    # NOTE: hash-layer skip experiment was tried here (return None when
+    # layer_idx < num_hash_layers); it didn't help because the underlying
+    # fused_moe shape-mismatch in V4 hash MoE happens with or without KT wrap.
+    # Reverted; root cause is in V4 MoE weight layout vs sglang fused_moe.
+
+    # Get mask for this specific layer
+    gpu_experts_mask = masks[layer_idx]
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -1996,6 +2051,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
+        # [kt-wrap-init diag] show every wrapper construction with caller info
+        # to debug whether dense layers / cuda-graph dummies build wrappers
+        # with layer_idx=0 and an all-True 256/256 mask.
+        import traceback as _tb
+        _stk = _tb.extract_stack()
+        _caller = _stk[-2] if len(_stk) >= 2 else None
+        print(
+            f"[kt-wrap-init] tp_rank={self.tp_rank} "
+            f"layer_idx={kt_config.layer_idx} "
+            f"num_gpu_experts={self.num_gpu_experts} "
+            f"mask_sum={int(self.gpu_experts_mask.sum().item())} "
+            f"mask_shape={tuple(self.gpu_experts_mask.shape)} "
+            f"gpu_method={type(gpu_method).__name__} "
+            f"caller={(_caller.filename + ':' + str(_caller.lineno)) if _caller else '?'}",
+            flush=True,
+        )
 
         # Mapping tables for non-contiguous GPU expert allocation (CPU tensors)
         # Used by weight_loader to remap expert_id when loading weights
@@ -2313,6 +2384,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        _kt_t_apply_start = time.perf_counter() if (
+            os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
+            and self.tp_rank == 0
+            and getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
+        ) else None
+        _kt_t_cpu_wait_ms = 0.0
 
         # Check for full GPU fallback
         if (
@@ -2439,13 +2516,31 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0 and self._cpu_stream is not None:
             with torch.cuda.stream(self._cpu_stream):
                 # Use staging_buffer for sync to get correct buffer reference
+                _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
                 cpu_output = self._sync_with_staged_input(staging_buffer)
+                if _kt_t_sync_pre is not None:
+                    _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
                 self._sync_done_event.record(self._cpu_stream)
 
             # Main stream waits for cpu_stream to complete before merging results
             torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             output = output + cpu_output
 
+        if _kt_t_apply_start is not None:
+            _kt_total_ms = (time.perf_counter() - _kt_t_apply_start) * 1000.0
+            _cls = type(self)
+            if not hasattr(_cls, '_kt_layer_step'):
+                _cls._kt_layer_step = {}
+            _li = getattr(self.kt_config, 'layer_idx', -1)
+            _cls._kt_layer_step[_li] = _cls._kt_layer_step.get(_li, 0) + 1
+            _step = _cls._kt_layer_step[_li]
+            if _step <= 16 or _step % 16 == 0:
+                print(
+                    f'[kt-time] layer={_li} step={_step} '
+                    f'total={_kt_total_ms:.2f}ms cpu_wait={_kt_t_cpu_wait_ms:.2f}ms '
+                    f'num_tokens={num_tokens}',
+                    flush=True,
+                )
         return StandardCombineInput(hidden_states=output)
 
     def _update_gpu_experts_from_batch(

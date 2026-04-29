@@ -361,6 +361,23 @@ def fused_experts_impl(
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
+    # [diag] log shapes for first N calls to identify normal vs capture diff
+    global _DIAG_CALL_COUNT
+    try:
+        _DIAG_CALL_COUNT
+    except NameError:
+        _DIAG_CALL_COUNT = 0
+    if _DIAG_CALL_COUNT < 6:
+        _DIAG_CALL_COUNT += 1
+        import os as _os
+        print(
+            f"[fused-moe-call#{_DIAG_CALL_COUNT}] hidden_states.shape={tuple(hidden_states.shape)} "
+            f"w1.shape={tuple(w1.shape)} w2.shape={tuple(w2.shape)} "
+            f"padded_size={padded_size} use_fp8_w8a8={use_fp8_w8a8} "
+            f"block_shape={block_shape}",
+            flush=True,
+        )
+
     # Check constraints.
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"

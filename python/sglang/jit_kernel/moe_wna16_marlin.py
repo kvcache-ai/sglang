@@ -66,11 +66,26 @@ def moe_wna16_marlin_gemm(
 ) -> torch.Tensor:
     device = a.device
 
-    # Allocate output if not provided
+    # Allocate output if not provided. When use_atomic_add=True the kernel does
+    # atomicAdd into c, so c MUST be zero-initialized — otherwise the result is
+    # uninit_garbage + correct_sum. PyTorch's caching allocator reuses freed
+    # pages, so subsequent calls see the previous gemm's output and produce
+    # non-deterministic, exploding outputs (observed on V4-Flash MXFP4 MoE on
+    # SM_120 where use_atomic_add is forced True by cap[0]>=9).
+    # Origin: sglang 本身.
     if c_or_none is not None:
         c = c_or_none
+    elif use_atomic_add:
+        c = torch.zeros((size_m * top_k, size_n), dtype=a.dtype, device=device)
     else:
-        c = torch.empty((size_m * top_k, size_n), dtype=a.dtype, device=device)
+        # NOTE(2026-04-29): also zero-init non-atomic path. For
+        # use_fp32_reduce=True the kernel does a final reduce that writes
+        # all (m, n) outputs, but on SM_120 we observed wholesale-noise
+        # output when c was torch.empty — the prior fp32-partial-sum bytes
+        # from a previously-freed allocator page apparently leak into the
+        # final-reduce store. Zero-init removes this dependency on
+        # allocator state. Origin: sglang 本身.
+        c = torch.zeros((size_m * top_k, size_n), dtype=a.dtype, device=device)
 
     # Early return for zero-size M
     if size_m == 0:
@@ -111,7 +126,10 @@ def moe_wna16_marlin_gemm(
     else:
         a_tmp = torch.empty(0, dtype=a.dtype, device=device)
 
-    # Allocate c_tmp for fp32 reduce
+    # Allocate c_tmp for fp32 reduce. Same logic as c above: any kernel path
+    # that accumulates (vs full-overwrites) into c_tmp must see zero-init,
+    # or PyTorch's caching allocator will hand us a previously-used page and
+    # we get garbage + correct_sum. Origin: sglang 本身.
     if use_fp32_reduce and not use_atomic_add:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         # max num of threadblocks is sms * 4
@@ -121,7 +139,7 @@ def moe_wna16_marlin_gemm(
         )
         if moe_block_size == 8:
             max_c_tmp_size *= 2
-        c_tmp = torch.empty(max_c_tmp_size, dtype=torch.float32, device=device)
+        c_tmp = torch.zeros(max_c_tmp_size, dtype=torch.float32, device=device)
     else:
         c_tmp = torch.empty(0, dtype=torch.float32, device=device)
 

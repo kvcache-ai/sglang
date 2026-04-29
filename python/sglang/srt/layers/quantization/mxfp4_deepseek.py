@@ -243,6 +243,53 @@ class DeepSeekMxfp4MoEMethod:
         # silu_and_mul can compute silu(first_half) * second_half = silu(gate)
         # * up. Branch BEFORE reorder_w1w3_to_w3w1, which is a TRT-LLM-only
         # rearrangement.
+        # NEW (2026-04-29): V4 MXFP4 GPU MoE via OAI triton_kernels package.
+        # Activated by SGLANG_V4_USE_TRITON_KERNELS=1 to bypass marlin path
+        # which has unresolved kernel-level numerical issues on SM_120.
+        # Origin: sglang 本身.
+        try:
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                use_v4_triton_kernels,
+                convert_v4_weights_to_triton_kernels,
+            )
+        except Exception:
+            use_v4_triton_kernels = lambda: False
+        if use_v4_triton_kernels():
+            w13_raw = layer.w13_weight.data
+            w2_raw = layer.w2_weight.data
+            w13_scale_raw = layer.w13_weight_scale_inv.data
+            w2_scale_raw = layer.w2_weight_scale_inv.data
+
+            if w13_scale_raw.dtype == torch.float32:
+                w13_scale_raw = w13_scale_raw.to(torch.float8_e8m0fnu)
+                w2_scale_raw = w2_scale_raw.to(torch.float8_e8m0fnu)
+
+            hidden_size_tk = w13_raw.shape[2] * 2
+            intermediate_size_tk = w2_raw.shape[2] * 2
+            log_info_on_rank0(
+                logger,
+                f'[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs '
+                f'(layer: {self.prefix}, hidden_size={hidden_size_tk}, '
+                f'intermediate_size={intermediate_size_tk})...',
+            )
+            w13_swiz, w13_pcg, w2_swiz, w2_pcg = convert_v4_weights_to_triton_kernels(
+                w13_raw, w13_scale_raw, w2_raw, w2_scale_raw,
+            )
+            # Free raw tensors; the triton_kernels Tensor objects keep their
+            # own swizzled storage.
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale_inv
+            del layer.w2_weight_scale_inv
+            layer._v4_tk_w13 = w13_swiz
+            layer._v4_tk_w13_pcg = w13_pcg
+            layer._v4_tk_w2 = w2_swiz
+            layer._v4_tk_w2_pcg = w2_pcg
+            layer._v4_tk_intermediate_size = intermediate_size_tk
+            layer._v4_tk_num_experts = w13_raw.shape[0]
+            layer._v4_tk_path = True
+            return
+
         if _use_v4_marlin_fallback():
             from sglang.srt.layers.quantization.v4_marlin_moe import (
                 convert_v4_weights_to_marlin,
@@ -410,6 +457,52 @@ class DeepSeekMxfp4MoEMethod:
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+
+        # NEW (2026-04-29): V4 triton_kernels MoE path. Origin: sglang 本身.
+        # Must dispatch before accessing layer.w13_weight (we deleted it
+        # during process_weights_after_loading on the triton_kernels path).
+        if getattr(layer, "_v4_tk_path", False):
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                apply_v4_triton_kernels_moe,
+            )
+            # Extract topk_ids/weights from topk_output (mirror v4_marlin_path
+            # extraction below, which happens after this dispatch).
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
+            if TopKOutputChecker.format_is_standard(topk_output):
+                topk_ids = topk_output.topk_ids
+                topk_weights = topk_output.topk_weights
+            elif TopKOutputChecker.format_is_hash(topk_output):
+                topk_ids = topk_output.topk_ids
+                topk_weights = topk_output.topk_weights
+            else:
+                raise NotImplementedError(
+                    f'triton_kernels V4 path: unsupported topk format {topk_output.format}'
+                )
+            if not envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get():
+                local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+                topk_ids = torch.where(
+                    topk_ids >= 0,
+                    topk_ids + local_expert_offset,
+                    topk_ids,
+                )
+            rsf = layer.moe_runner_config.routed_scaling_factor
+            output = apply_v4_triton_kernels_moe(
+                hidden_states=hidden_states,
+                w13_swiz=layer._v4_tk_w13,
+                w13_pcg=layer._v4_tk_w13_pcg,
+                w2_swiz=layer._v4_tk_w2,
+                w2_pcg=layer._v4_tk_w2_pcg,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                intermediate_size=layer._v4_tk_intermediate_size,
+                num_experts=layer._v4_tk_num_experts,
+                routed_scaling_factor=rsf if rsf is not None else 1.0,
+            )
+            if envs.SGLANG_DSV4_2604_SUBMODE.get() == '2604B' and (
+                self._gemm1_clamp_limit_tensor is not None
+            ):
+                deepseek_v4_moe_code_path_checker.observed += 1
+            return StandardCombineInput(hidden_states=output)
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
