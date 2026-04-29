@@ -5283,6 +5283,7 @@ class ServerArgs:
         assert (
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        self.normalize_kt_method_aliases()
 
         if self.pp_size > 1:
             assert (
@@ -5410,6 +5411,26 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+    def normalize_kt_method_aliases(self):
+        if self.kt_method is None:
+            return
+
+        kt_method_aliases = {
+            "RAWFP8": "FP8",
+        }
+        normalized_method = kt_method_aliases.get(self.kt_method)
+        if normalized_method is None:
+            return
+
+        logger.warning(
+            "--kt-method %s is deprecated; using %s. "
+            "Use --kt-method %s in new scripts.",
+            self.kt_method,
+            normalized_method,
+            normalized_method,
+        )
+        self.kt_method = normalized_method
 
     def check_torch_2_9_1_cudnn_compatibility(self):
         if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
