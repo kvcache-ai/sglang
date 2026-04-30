@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -36,6 +37,28 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+
+# Workaround for flashinfer 0.6.8 Python <-> C++ binding skew where the Python
+# wrapper at flashinfer/sampling.py:425 passes 13 args (probs, samples, valid,
+# indices, top_k_arr, top_k_val, top_p_arr, top_p_val, deterministic,
+# seed_arr, seed_val, offset_arr, offset_val) while the wheel's C++ binding
+# still expects 10 (no valid / seed_arr / offset_arr). First T>0 +
+# top_k/top_p/min_p sampling call raises TypeError -> scheduler dies.
+# When SGLANG_FLASHINFER_SAMPLING_WORKAROUND=1, route the flashinfer backend
+# through top_k_renorm + top_p_renorm + (manual min_p mask) + multinomial
+# instead of flashinfer.sampling.{top_k_top_p,min_p}_sampling_from_probs.
+# Cost ~50-100us per step (3 kernel launches vs 1 fused), negligible.
+# Origin: kt-sglang 耦合 (works around venv flashinfer wheel skew).
+_FLASHINFER_SAMPLING_WORKAROUND = (
+    os.environ.get("SGLANG_FLASHINFER_SAMPLING_WORKAROUND", "0") == "1"
+)
+if _FLASHINFER_SAMPLING_WORKAROUND:
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "[sampler] SGLANG_FLASHINFER_SAMPLING_WORKAROUND=1: routing T>0 + "
+        "top_k/top_p/min_p sampling through renorm + multinomial to avoid "
+        "flashinfer 0.6.8 Python<->C++ 13-vs-10 binding skew."
+    )
 
 
 class Sampler(nn.Module):
@@ -210,7 +233,34 @@ class Sampler(nn.Module):
                 assert (
                     sampling_info.sampling_seed is None
                 ), "Sampling seed is not supported for flashinfer backend"
-                if sampling_info.need_min_p_sampling:
+                if _FLASHINFER_SAMPLING_WORKAROUND:
+                    # See module-level comment on _FLASHINFER_SAMPLING_WORKAROUND.
+                    # Manual top_k_renorm + top_p_renorm + (optional min_p mask)
+                    # + multinomial. Bypasses both flashinfer
+                    # top_k_top_p_sampling_from_probs and
+                    # min_p_sampling_from_probs whose 0.6.8 Python wrappers
+                    # over-pass args to the wheel's older C++ binding.
+                    probs = probs.contiguous()
+                    if sampling_info.need_top_k_sampling:
+                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                    if sampling_info.need_top_p_sampling:
+                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    if sampling_info.need_min_p_sampling:
+                        max_probs = probs.amax(dim=-1, keepdim=True)
+                        min_thresh = (
+                            sampling_info.min_ps.view(-1, 1) * max_probs
+                        )
+                        probs = probs.masked_fill(probs < min_thresh, 0.0)
+                        sums = probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                        probs = probs / sums
+                    if self.use_nan_detection and torch.any(torch.isnan(probs)):
+                        raise ValueError("Input probs contains NaN.")
+                    batch_next_token_ids = (
+                        torch.multinomial(probs, num_samples=1)
+                        .view(-1)
+                        .to(torch.int32)
+                    )
+                elif sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                     batch_next_token_ids = min_p_sampling_from_probs(
