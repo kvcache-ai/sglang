@@ -812,6 +812,10 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
+        agent_id: Optional[str] = None,
+        default_branch_id: Optional[str] = None,
+        cache_scope: Optional[str] = None,
+        enable_agentic_branching: bool = False,
     ) -> str:
         """Open a session for multi-turn conversation with shared context.
 
@@ -822,6 +826,10 @@ class Engine(EngineScoreMixin, EngineBase):
             timeout: If set, the session is automatically closed after being inactive
                 for this many seconds. Inactivity is measured from session open or the
                 most recent request submission.
+            agent_id: Optional agent identity used by agent-aware cache policies.
+            default_branch_id: Optional default branch name for streaming branches.
+            cache_scope: Optional cache namespace scope for agent-aware requests.
+            enable_agentic_branching: Enable per-branch streaming session tracking.
 
         Returns:
             The session ID (either the provided one or a newly generated UUID).
@@ -831,6 +839,10 @@ class Engine(EngineScoreMixin, EngineBase):
             session_id=session_id,
             streaming=streaming,
             timeout=timeout,
+            agent_id=agent_id,
+            default_branch_id=default_branch_id,
+            cache_scope=cache_scope,
+            enable_agentic_branching=enable_agentic_branching,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.open_session(obj, None)

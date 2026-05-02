@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.managers.io_struct import (
@@ -30,6 +31,16 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SESSION_BRANCH_ID = "__default__"
+
+
+@dataclass
+class SessionBranch:
+    branch_id: str
+    head_rid: Optional[str] = None
+    parent_rid: Optional[str] = None
+    forked_from_rid: Optional[str] = None
 
 
 class SessionReqNode:
@@ -85,15 +96,87 @@ class Session:
         session_id: Optional[str] = None,
         streaming: bool = False,
         timeout: Optional[float] = None,
+        agent_id: Optional[str] = None,
+        default_branch_id: Optional[str] = None,
+        cache_scope: Optional[str] = None,
+        enable_agentic_branching: bool = False,
     ):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
         self.streaming = streaming
         self.timeout = timeout
+        self.agent_id = agent_id
+        self.default_branch_id = default_branch_id or DEFAULT_SESSION_BRANCH_ID
+        self.cache_scope = cache_scope or "session"
+        self.enable_agentic_branching = enable_agentic_branching
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
+        self.branches: Dict[str, SessionBranch] = {
+            self.default_branch_id: SessionBranch(branch_id=self.default_branch_id)
+        }
         self.close_on_finish: bool = False
         self._inflight: bool = False
+
+    def resolve_branch_id(self, session_params) -> str:
+        branch_id = getattr(session_params, "branch_id", None)
+        return branch_id or self.default_branch_id
+
+    def get_branch_head_node(self, branch_id: Optional[str]) -> Optional[SessionReqNode]:
+        branch_id = branch_id or self.default_branch_id
+        branch = self.branches.get(branch_id)
+        if branch is None or branch.head_rid is None:
+            return None
+        return self.req_nodes.get(branch.head_rid)
+
+    def update_branch_head(
+        self,
+        branch_id: str,
+        req_node: SessionReqNode,
+        *,
+        parent_rid: Optional[str],
+        forked_from_rid: Optional[str],
+    ) -> None:
+        branch = self.branches.get(branch_id)
+        if branch is None:
+            branch = SessionBranch(branch_id=branch_id)
+            self.branches[branch_id] = branch
+        if parent_rid is not None:
+            branch.parent_rid = parent_rid
+        if forked_from_rid is not None:
+            branch.forked_from_rid = forked_from_rid
+        branch.head_rid = req_node.req.rid
+
+    def iter_streaming_head_reqs(self):
+        has_tracked_head = False
+        seen = set()
+        for branch in self.branches.values():
+            if branch.head_rid is None or branch.head_rid in seen:
+                continue
+            has_tracked_head = True
+            req_node = self.req_nodes.get(branch.head_rid)
+            if req_node is None:
+                continue
+            seen.add(branch.head_rid)
+            yield req_node.req
+        if not has_tracked_head:
+            for req_node in self.req_nodes.values():
+                yield req_node.req
+
+    def _streaming_branching_enabled(self, session_params=None, req: Optional[Req] = None):
+        if self.enable_agentic_branching:
+            return True
+        if session_params is not None:
+            return (
+                getattr(session_params, "branch_id", None) is not None
+                or getattr(session_params, "fork_from_rid", None) is not None
+            )
+        if req is not None:
+            return (
+                getattr(req, "session_fork_from_rid", None) is not None
+                or getattr(req, "session_branch_id", None)
+                not in (None, DEFAULT_SESSION_BRANCH_ID)
+            )
+        return False
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -110,6 +193,10 @@ class Session:
         assert req.session_params is not None
         self.last_active_time = time.monotonic()
         session_params = req.session_params
+        branch_id = self.resolve_branch_id(session_params)
+        branch_parent_rid = None
+        fork_from_rid = getattr(session_params, "fork_from_rid", None)
+        anchor_rid = fork_from_rid or session_params.rid
 
         last_req_node = None
         last_req = None
@@ -131,37 +218,59 @@ class Session:
             elif session_params.offset and session_params.offset != 0:
                 abort = True
                 abort_message = "Streaming sessions do not support offset."
-            elif self.req_nodes:
-                assert len(self.req_nodes) == 1
-                # Peek (don't pop) the single req_node. req_nodes is updated
-                # only in finish_req after the request completes successfully.
-                [last_req_node] = self.req_nodes.values()
-                last_req = last_req_node.req
+            else:
+                branching_enabled = self._streaming_branching_enabled(
+                    session_params=session_params
+                )
+                if branching_enabled and anchor_rid is not None:
+                    if anchor_rid not in self.req_nodes:
+                        abort = True
+                        abort_message = "Invalid request session id"
+                    else:
+                        last_req_node = self.req_nodes[anchor_rid]
+                        last_req = last_req_node.req
+                        branch_parent_rid = anchor_rid
+                elif branching_enabled:
+                    last_req_node = self.get_branch_head_node(branch_id)
+                    if last_req_node is not None:
+                        last_req = last_req_node.req
+                        branch_parent_rid = last_req.rid
+                elif self.req_nodes:
+                    assert len(self.req_nodes) == 1
+                    # Peek (don't pop) the single req_node. req_nodes is updated
+                    # only in finish_req after the request completes successfully.
+                    [last_req_node] = self.req_nodes.values()
+                    last_req = last_req_node.req
         elif session_params.replace:
-            if session_params.rid is None:
+            if anchor_rid is None:
                 for _, req_node in self.req_nodes.items():
                     req_node.clear(self.req_nodes)
             else:
-                if session_params.rid not in self.req_nodes:
+                if anchor_rid not in self.req_nodes:
                     abort = True
                     abort_message = "Invalid request session id"
                 else:
-                    last_req_node = self.req_nodes[session_params.rid]
+                    last_req_node = self.req_nodes[anchor_rid]
                     last_req_node.abort()
                     last_req = last_req_node.req
                     last_req_node.clear_children(self.req_nodes)
         else:
-            if session_params.rid is not None:
-                if session_params.rid not in self.req_nodes:
+            if anchor_rid is not None:
+                if anchor_rid not in self.req_nodes:
                     abort = True
                     abort_message = "Invalid request session id"
                 else:
-                    last_req_node = self.req_nodes[session_params.rid]
+                    last_req_node = self.req_nodes[anchor_rid]
                     last_req = last_req_node.req
                     if not last_req.finished():
                         abort = True
                         abort_message = "Session request is appending to a request that hasn't finished."
                         logging.warning(abort_message)
+
+        if self.streaming and last_req is not None and not last_req.finished():
+            abort = True
+            abort_message = "Streaming session branch is appending to a request that hasn't finished."
+            logging.warning(abort_message)
 
         if last_req is not None:
             # trim bos token if it is an append
@@ -238,6 +347,10 @@ class Session:
             extra_key=req.extra_key,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
+            session_branch_id=branch_id,
+            session_fork_from_rid=fork_from_rid,
+            session_agent_id=session_params.agent_id or self.agent_id,
+            session_cache_scope=session_params.cache_scope or self.cache_scope,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
@@ -257,6 +370,34 @@ class Session:
     def finish_req(self, req):
         """Update req_nodes after a streaming request finishes successfully."""
         self._inflight = False
+        if self._streaming_branching_enabled(req=req):
+            branch_id = getattr(req, "session_branch_id", None) or self.default_branch_id
+            fork_from_rid = getattr(req, "session_fork_from_rid", None)
+            prev_branch_head = self.get_branch_head_node(branch_id)
+            parent_node = None
+            parent_rid = None
+
+            if fork_from_rid is not None:
+                parent_node = self.req_nodes.get(fork_from_rid)
+                if parent_node is not None:
+                    parent_rid = fork_from_rid
+            elif prev_branch_head is not None:
+                parent_node = prev_branch_head
+                parent_rid = prev_branch_head.req.rid
+
+            if prev_branch_head is not None and prev_branch_head.req.rid != fork_from_rid:
+                prev_branch_head.req.session = None
+
+            new_req_node = SessionReqNode(req, parent_node)
+            self.req_nodes[req.rid] = new_req_node
+            self.update_branch_head(
+                branch_id,
+                new_req_node,
+                parent_rid=parent_rid,
+                forked_from_rid=fork_from_rid,
+            )
+            return
+
         if self.req_nodes:
             [prev_node] = self.req_nodes.values()
             prev_node.req.session = None
@@ -294,6 +435,10 @@ class SessionController:
                 session_id,
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
+                agent_id=recv_req.agent_id,
+                default_branch_id=recv_req.default_branch_id,
+                cache_scope=recv_req.cache_scope,
+                enable_agentic_branching=recv_req.enable_agentic_branching,
             )
             log_info_on_rank0(
                 logger, f"Session opened: {session_id} (active={len(self.sessions)})"
@@ -314,11 +459,11 @@ class SessionController:
         if session.streaming and session._inflight:
             has_unfinished_request = True
         elif session.streaming and session.req_nodes:
-            assert len(session.req_nodes) == 1
-            [last_node] = session.req_nodes.values()
-            req = last_node.req
-            if not req.finished():
-                has_unfinished_request = True
+            for streaming_req in session.iter_streaming_head_reqs():
+                req = streaming_req
+                if not streaming_req.finished():
+                    has_unfinished_request = True
+                    break
 
         if has_unfinished_request:
             # An in-flight request is still decoding on this session's KV
@@ -335,8 +480,8 @@ class SessionController:
 
         # No owning request -- safe to release immediately.
         if session.streaming and session.req_nodes:
-            req = next(iter(session.req_nodes.values())).req
-            req.session = None
+            for streaming_req in session.iter_streaming_head_reqs():
+                streaming_req.session = None
 
         # Release multimodal features held by session requests.
         # Session reqs skip the normal mm cleanup path (scheduler and

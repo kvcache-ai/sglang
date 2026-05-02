@@ -112,6 +112,10 @@ class SessionParams:
     offset: Optional[int] = None
     replace: Optional[bool] = None
     drop_previous_output: Optional[bool] = None
+    agent_id: Optional[str] = None
+    branch_id: Optional[str] = None
+    fork_from_rid: Optional[str] = None
+    cache_scope: Optional[Literal["session", "agent", "branch", "global"]] = None
 
 
 # Type definitions for multimodal input data
@@ -1743,6 +1747,10 @@ class OpenSessionReqInput(BaseReq):
     session_id: Optional[str] = None
     streaming: Optional[bool] = None
     timeout: Optional[float] = None
+    agent_id: Optional[str] = None
+    default_branch_id: Optional[str] = None
+    cache_scope: Optional[Literal["session", "agent", "branch", "global"]] = None
+    enable_agentic_branching: bool = False
 
 
 @dataclass

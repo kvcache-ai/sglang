@@ -614,6 +614,10 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        session_branch_id: Optional[str] = None,
+        session_fork_from_rid: Optional[str] = None,
+        session_agent_id: Optional[str] = None,
+        session_cache_scope: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -629,6 +633,10 @@ class Req(ReqDllmMixin):
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
         self.session = session
+        self.session_branch_id = session_branch_id
+        self.session_fork_from_rid = session_fork_from_rid
+        self.session_agent_id = session_agent_id
+        self.session_cache_scope = session_cache_scope
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices

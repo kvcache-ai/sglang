@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_SESSION_BRANCH_ID = "__default__"
+SessionSlotKey = Union[str, Tuple[str, str]]
 
 
 class _VirtualNode:
@@ -125,7 +128,32 @@ class StreamingSession(BasePrefixCache):
 
     def __init__(self, inner: BasePrefixCache):
         self.inner = inner
-        self.slots: Dict[str, SessionSlot] = {}
+        self.slots: Dict[SessionSlotKey, SessionSlot] = {}
+
+    def _get_req_branch_id(self, req: Req) -> Optional[str]:
+        branch_id = getattr(req, "session_branch_id", None)
+        if branch_id is not None:
+            return branch_id
+        if req.session is None:
+            return None
+        return getattr(req.session, "default_branch_id", DEFAULT_SESSION_BRANCH_ID)
+
+    def _make_slot_key(
+        self, session_id: str, branch_id: Optional[str] = None
+    ) -> SessionSlotKey:
+        if branch_id is None or branch_id == DEFAULT_SESSION_BRANCH_ID:
+            return session_id
+        return (session_id, branch_id)
+
+    def _get_slot_key(self, req: Req) -> SessionSlotKey:
+        return self._make_slot_key(req.session.session_id, self._get_req_branch_id(req))
+
+    def _iter_session_slot_keys(self, session_id: str):
+        for key in list(self.slots.keys()):
+            if key == session_id:
+                yield key
+            elif isinstance(key, tuple) and key[0] == session_id:
+                yield key
 
     # -- Forward PrefixCacheTrait properties to inner cache --
 
@@ -172,7 +200,7 @@ class StreamingSession(BasePrefixCache):
     # -- Condition helpers (used by embedded-mode callers for pre-dispatch) --
 
     def has_slot(self, session_id: str) -> bool:
-        return session_id in self.slots
+        return any(True for _ in self._iter_session_slot_keys(session_id))
 
     def any_holding_kv(self) -> bool:
         return any(s.is_holding_kv for s in self.slots.values())
@@ -202,7 +230,7 @@ class StreamingSession(BasePrefixCache):
         """
         if not _is_streaming(req):
             return None
-        slot = self.slots.get(req.session.session_id)
+        slot = self.slots.get(self._get_slot_key(req))
         if slot is None or slot.req_pool_idx is None:
             return None
         if req.to_finish is not None:
@@ -272,8 +300,8 @@ class StreamingSession(BasePrefixCache):
 
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
-        session_id = req.session.session_id
-        slot = self.slots.get(session_id)
+        slot_key = self._get_slot_key(req)
+        slot = self.slots.get(slot_key)
         is_first = slot is None
 
         # Mid-processing abort only. Pre-aborted reqs have session=None
@@ -294,9 +322,9 @@ class StreamingSession(BasePrefixCache):
                     cache_protected_len=req.cache_protected_len,
                     swa_uuid_for_lock=req.swa_uuid_for_lock,
                 )
-                self.slots[session_id] = slot
+                self.slots[slot_key] = slot
             slot.kv_allocated_len = max(slot.kv_allocated_len, req.kv_allocated_len)
-            self.release_session(session_id)
+            self._release_slot(slot_key)
             req.req_pool_idx = None
             req.session.abort_req()
             self._mark_kv_freed(req)
@@ -304,7 +332,7 @@ class StreamingSession(BasePrefixCache):
 
         if is_first:
             slot = SessionSlot()
-            self.slots[session_id] = slot
+            self.slots[slot_key] = slot
 
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
@@ -335,7 +363,7 @@ class StreamingSession(BasePrefixCache):
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return True
-        if req.session.session_id in self.slots:
+        if self._get_slot_key(req) in self.slots:
             return True
         return False
 
@@ -374,19 +402,15 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.dec_lock_ref(node, params)
 
-    # -- Session lifecycle --
-
-    def release_session(self, session_id: str) -> None:
-        slot = self.slots.pop(session_id, None)
+    def _release_slot(self, slot_key: SessionSlotKey) -> int:
+        slot = self.slots.pop(slot_key, None)
         if slot is None:
-            return
+            return 0
+
         protected_len = slot.cache_protected_len
         lock_node = slot.last_node
         tokens_freed = (
             max(0, slot.kv_allocated_len - protected_len) if slot.is_holding_kv else 0
-        )
-        logger.info(
-            "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
         )
 
         if lock_node is not None:
@@ -407,8 +431,30 @@ class StreamingSession(BasePrefixCache):
                 ]
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
-
         self._free_slot_mamba(slot)
+        return tokens_freed
+
+    # -- Session lifecycle --
+
+    def release_session(self, session_id: str):
+        """Release all KV resources held by a streaming session.
+
+        `slot.last_node` + `slot.cache_protected_len` are trusted directly: radix
+        tree splits mutate TreeNode objects in place (see RadixCache._split_node),
+        so a saved TreeNode reference remains valid and the locked prefix length
+        is unchanged. No rematch needed -- and `match_prefix` here would cause
+        further splits that disturb accounting.
+        """
+        total_tokens_freed = 0
+        for slot_key in self._iter_session_slot_keys(session_id):
+            total_tokens_freed += self._release_slot(slot_key)
+
+        if total_tokens_freed > 0:
+            logger.info(
+                "Session KV released: %s (%d tokens freed)",
+                session_id,
+                total_tokens_freed,
+            )
 
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
