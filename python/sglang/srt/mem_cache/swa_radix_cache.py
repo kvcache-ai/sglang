@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -835,8 +836,12 @@ class SWARadixCache(BasePrefixCache):
         match_len_since_tombstone = float("inf")
         best_value_len = 0
         best_last_node = node
+        enable_compact = envs.SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.get()
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+
+            if enable_compact:
+                self._compact_single_child_chain(child)
 
             if child.swa_tombstone:
                 # update best_value_len and best_last_node if needed
@@ -919,6 +924,38 @@ class SWARadixCache(BasePrefixCache):
             last_device_node=last_node,
             last_host_node=last_node,
         )
+
+    def _compact_single_child_chain(self, node: TreeNode) -> None:
+        while len(node.children) == 1:
+            child = next(iter(node.children.values()))
+            if len(child.children) == 0:
+                break
+            sum_gc_full_lock_ref = sum(
+                gc.full_lock_ref for gc in child.children.values()
+            )
+            if child.full_lock_ref > sum_gc_full_lock_ref:
+                break
+            if (
+                child.swa_tombstone != node.swa_tombstone
+                or child.full_lock_ref != node.full_lock_ref
+                or child.swa_lock_ref != node.swa_lock_ref
+            ):
+                break
+
+            node.key = RadixKey(
+                node.key.token_ids + child.key.token_ids, node.key.extra_key
+            )
+            node.value = torch.cat([node.value, child.value])
+            node.children = child.children
+            for grandchild in node.children.values():
+                grandchild.parent = node
+
+            if child.swa_uuid is not None:
+                node.swa_uuid = child.swa_uuid
+
+            self.full_lru_list.remove_node(child)
+            if not child.swa_tombstone:
+                self.swa_lru_list.remove_node(child)
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
@@ -1041,6 +1078,15 @@ class SWARadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
+            logger.debug(
+                f"Has Additional Node: len(key)={len(key)}, total_prefix_length={total_prefix_length}, swa_evicted_seqlen={swa_evicted_seqlen}, len(value)={len(value)}"
+            )
+
+
+            if swa_evicted_seqlen == total_prefix_length + len(key):
+                self.token_to_kv_pool_allocator.free(value)
+                return total_prefix_length
+
             if (
                 swa_evicted_seqlen > total_prefix_length
                 and swa_evicted_seqlen < total_prefix_length + len(key)

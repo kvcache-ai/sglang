@@ -68,6 +68,12 @@ class SchedulerRuntimeCheckerMixin:
         swa_num_used = self.swa_tokens_per_layer - (
             swa_available_size + swa_evictable_size
         )
+        if self.enable_hisparse:
+            full_num_used = max(0, full_num_used)
+            swa_num_used = max(0, swa_num_used)
+        else:
+            if swa_num_used < 0:
+                raise ValueError(f"swa_num_used < 0")
         full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
         return (
@@ -176,7 +182,91 @@ class SchedulerRuntimeCheckerMixin:
 
         return ret
 
+    def _get_batch_swa_uncached_sizes(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> tuple[int, int]:
+        full_uncached = 0
+        swa_uncached = 0
+        for req in batch.reqs:
+            assert req.kv_committed_freed == req.kv_overallocated_freed
+            if req.kv_committed_freed:
+                continue
+
+            allocated_len = req.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.cache_protected_len % self.page_size == 0
+
+            full_uncached += allocated_len - req.cache_protected_len
+            swa_uncached += allocated_len - max(
+                req.cache_protected_len, req.swa_evicted_seqlen
+            )
+
+        return full_uncached, swa_uncached
+
+    def self_check_swa_during_busy(self: Scheduler):
+        current_batch: ScheduleBatch = self.last_batch
+
+        if current_batch is None:
+            return
+
+        spec_topk = self.server_args.speculative_eagle_topk or 1
+        if spec_topk > 1:
+            warnings.warn(
+                "Runtime memory check (busy) is not supported when speculation topk > 1."
+            )
+            return
+
+        (
+            _,
+            _,
+            _,
+            _,
+            full_available,
+            full_evictable,
+            swa_available,
+            swa_evictable,
+        ) = self._get_swa_token_info()
+
+        full_protected = self.tree_cache.full_protected_size()
+        swa_protected = self.tree_cache.swa_protected_size()
+
+        full_uncached, swa_uncached = self._get_batch_swa_uncached_sizes(current_batch)
+
+        if (
+            self.running_batch is not None
+            and self.running_batch is not current_batch
+            and not self.running_batch.is_empty()
+        ):
+            f_unc, s_unc = self._get_batch_swa_uncached_sizes(self.running_batch)
+            full_uncached += f_unc
+            swa_uncached += s_unc
+
+        full_total = full_available + full_evictable + full_protected + full_uncached
+        swa_total = swa_available + swa_evictable + swa_protected + swa_uncached
+
+        if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
+            log_msg = (
+                f"[SWA Mem Check (BUSY)] "
+                f"full: ({full_available=} + {full_evictable=} + {full_protected=} + {full_uncached=}) = {full_total=} "
+                f"swa: ({swa_available=} + {swa_evictable=} + {swa_protected=} + {swa_uncached=}) = {swa_total=}"
+            )
+            logger.info(log_msg)
+
+        assert full_total == self.full_tokens_per_layer, (
+            f"Full Pool Mem Leak Detected! {full_total=} vs {self.full_tokens_per_layer=}, "
+            f"{full_available=}, {full_evictable=}, {full_protected=}, {full_uncached=}"
+        )
+        assert swa_total == self.swa_tokens_per_layer, (
+            f"SWA Pool Mem Leak Detected! {swa_total=} vs {self.swa_tokens_per_layer=}, "
+            f"{swa_available=}, {swa_evictable=}, {swa_protected=}, {swa_uncached=}"
+        )
+
     def self_check_during_busy(self: Scheduler):
+        if self.is_hybrid_swa:
+            self.self_check_swa_during_busy()
+            return
+
         current_batch: ScheduleBatch = self.last_batch
 
         if current_batch is None:
@@ -218,7 +308,11 @@ class SchedulerRuntimeCheckerMixin:
         else:
             req_total_size = self.req_to_token_pool.size
 
-        if len(self.req_to_token_pool.free_slots) != req_total_size:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            expected_free = req_total_size
+        else:
+            expected_free = req_total_size - 1
+        if len(self.req_to_token_pool.free_slots) != expected_free:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
@@ -232,6 +326,9 @@ class SchedulerRuntimeCheckerMixin:
             )
 
     def check_memory(self: Scheduler):
+        if self.enable_hisparse:
+            return
+
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
@@ -328,6 +425,13 @@ class SchedulerRuntimeCheckerMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
             if queue_size:
                 return
+
+        if (
+            self.enable_hisparse
+            and self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.has_ongoing_staging()
+        ):
+            return
 
         self.check_memory()
         self.check_tree_cache()

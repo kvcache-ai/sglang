@@ -458,6 +458,12 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
     """
+    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+        from .custom_all_reduce_v2 import CustomAllReduceV2
+
+        logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+        return CustomAllReduceV2
+
     if _is_cuda or _is_musa:
         return CustomAllreduce
 

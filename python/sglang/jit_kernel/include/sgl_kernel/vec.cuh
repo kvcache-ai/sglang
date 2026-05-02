@@ -50,14 +50,10 @@ struct AlignedVector {
   using storage_t = AlignedStorage<element_t, N>;
 
  public:
-  template <typename U>
-  SGL_DEVICE void load(const U* ptr, std::size_t offset = 0) {
-    static_assert(std::is_same_v<U, T> || std::is_same_v<U, void>);
+  SGL_DEVICE void load(const void* ptr, std::size_t offset = 0) {
     m_storage = reinterpret_cast<const storage_t*>(ptr)[offset];
   }
-  template <typename U>
-  SGL_DEVICE void store(U* ptr, std::size_t offset = 0) const {
-    static_assert(std::is_same_v<U, T> || std::is_same_v<U, void>);
+  SGL_DEVICE void store(void* ptr, std::size_t offset = 0) const {
     reinterpret_cast<storage_t*>(ptr)[offset] = m_storage;
   }
   SGL_DEVICE void fill(T value) {

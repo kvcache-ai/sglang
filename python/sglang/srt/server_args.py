@@ -127,6 +127,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "compressed",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -544,6 +545,7 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
+    enable_hisparse: bool = False
     hierarchical_sparse_attention_extra_config: Optional[str] = None
 
     # LMCache
@@ -640,6 +642,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_indexer_topk: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -1197,6 +1200,48 @@ class ServerArgs:
             self.dtype = "bfloat16"
 
         if model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            self.attention_backend = "compressed"
+            self.page_size = 256
+            logger.info(
+                f"Use compressed attention backend for {model_arch}, setting page_size to 256."
+            )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 256
+                logger.warning(
+                    f"Setting max_running_requests to {self.max_running_requests} for {model_arch}."
+                )
+
+            if self.kv_cache_dtype == "auto":
+                self.kv_cache_dtype = "fp8_e4m3"
+                logger.warning(
+                    f"Setting KV cache dtype to {self.kv_cache_dtype} for {model_arch}."
+                )
+            assert self.kv_cache_dtype in [
+                "fp8_e4m3"
+            ], f"{self.kv_cache_dtype} is not supported for {model_arch}"
+
+            if self.speculative_algorithm is not None:
+                assert (
+                    self.speculative_algorithm == "EAGLE"
+                ), f"Only EAGLE speculative algorithm is supported for {model_arch}"
+                assert (
+                    self.speculative_eagle_topk == 1
+                ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
+
+            if self.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+                self.swa_full_tokens_ratio = 0.1
+                logger.info(
+                    f"Setting swa_full_tokens_ratio to {self.swa_full_tokens_ratio} for {model_arch}."
+                )
+
+        if model_arch in [
             "DeepseekV3ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
@@ -1236,8 +1281,8 @@ class ServerArgs:
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                            self.tp_size <= 8
+                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
 
                         logger.warning(
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
@@ -1251,9 +1296,10 @@ class ServerArgs:
                             )
 
                     if is_hip():
-                        self.page_size = 1
+                        self.page_size = 64
                         logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
+                            "Setting page size to 64 for DeepSeek DSA on torch implementation.\n"
+                            "Need to be changed based on ROCm implementation.\n"
                         )
                     else:
                         # For CUDA GPU
@@ -1338,6 +1384,29 @@ class ServerArgs:
                         logger.info(
                             "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
+
+        elif model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            if self.enable_nsa_prefill_context_parallel:
+                if self.nsa_prefill_cp_mode == "round-robin-split":
+                    self.moe_dense_tp_size = 1
+                    assert (
+                        self.dp_size == 1
+                    ), "For round-robin split mode, dp attention is not supported."
+                    assert (
+                        self.tp_size <= 8
+                    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                    logger.warning(
+                        f"Enable Context Parallel for DeepSeekV4, "
+                        f"dp_size={self.dp_size}, moe_dense_tp_size={self.moe_dense_tp_size}, "
+                        f"ep_size={self.ep_size}, tp_size={self.tp_size}"
+                    )
+                else:
+                    raise ValueError(
+                        f"DeepSeekV4 only supports round-robin-split CP mode, "
+                        f"got {self.nsa_prefill_cp_mode}"
+                    )
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
@@ -2439,6 +2508,7 @@ class ServerArgs:
             if model_arch in [
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
+                "DeepseekV4ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
@@ -4412,6 +4482,11 @@ class ServerArgs:
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
 
+        parser.add_argument(
+            "--enable-hisparse",
+            action="store_true",
+            help="Enable hierarchical sparse attention",
+        )
         # Hierarchical sparse attention
         parser.add_argument(
             "--hierarchical-sparse-attention-extra-config",
@@ -4873,6 +4948,11 @@ class ServerArgs:
             help="Enable returning routed experts of each layer with responses.",
         )
         parser.add_argument(
+            "--enable-return-indexer-topk",
+            action="store_true",
+            help="Enable returning indexer topk indices of layers with indexer with responses.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -5283,7 +5363,6 @@ class ServerArgs:
         assert (
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
-        self.normalize_kt_method_aliases()
 
         if self.pp_size > 1:
             assert (
@@ -5412,109 +5491,48 @@ class ServerArgs:
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
-    def normalize_kt_method_aliases(self):
-        if self.kt_method is None:
-            return
-
-        kt_method_aliases = {
-            "RAWFP8": "FP8",
-        }
-        normalized_method = kt_method_aliases.get(self.kt_method)
-        if normalized_method is None:
-            return
-
-        logger.warning(
-            "--kt-method %s is deprecated; using %s. "
-            "Use --kt-method %s in new scripts.",
-            self.kt_method,
-            normalized_method,
-            normalized_method,
-        )
-        self.kt_method = normalized_method
-
     def check_torch_2_9_1_cudnn_compatibility(self):
         if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
             return
 
-        if not self.get_model_config().is_multimodal:
-            return
+        if self.get_model_config().is_multimodal:
+            import torch
 
-        import torch
-
-        if torch_release[:3] != (2, 9, 1):
-            return
-
-        def _format_cudnn_version(version):
-            if version is None:
-                return "unknown"
-            try:
-                version_int = int(version)
-            except (TypeError, ValueError):
-                return str(version)
-            if version_int >= 10000:
-                major = version_int // 10000
-                minor = (version_int % 10000) // 100
-                patch = version_int % 100
-            else:
-                major = version_int // 1000
-                minor = (version_int % 1000) // 100
-                patch = version_int % 100
-            return f"{major}.{minor}.{patch}"
-
-        try:
-            cudnn_version = torch.backends.cudnn.version()
-        except Exception:
-            cudnn_version = None
-
-        if cudnn_version is None:
-            RED = "\033[91m"
-            RESET = "\033[0m"
-            logger.warning(
-                "%sWARNING: Could not determine CuDNN version for torch==2.9.1. "
-                "Please ensure CuDNN >= 9.15 to avoid the known nn.Conv3d "
-                "performance and memory issue.%s",
-                RED,
-                RESET,
-            )
-            return
-
-        if int(cudnn_version) >= 91500:
-            return
-
-        cuda_version = getattr(torch.version, "cuda", None)
-        cuda_major = str(cuda_version).split(".", 1)[0] if cuda_version else ""
-        if cuda_major == "13":
-            cudnn_package = "nvidia-cudnn-cu13"
-        elif cuda_major == "12":
-            cudnn_package = "nvidia-cudnn-cu12"
-        else:
-            cudnn_package = "nvidia-cudnn-cu12_or_nvidia-cudnn-cu13"
-
-        if cudnn_package == "nvidia-cudnn-cu12_or_nvidia-cudnn-cu13":
-            install_cmd = (
-                "pip install --force-reinstall --no-deps "
-                "nvidia-cudnn-cu12==9.16.0.29  # or nvidia-cudnn-cu13 for CUDA 13"
-            )
-        else:
-            install_cmd = (
-                "pip install --force-reinstall --no-deps "
-                f"{cudnn_package}==9.16.0.29"
-            )
-
-        RED = "\033[91m"
-        RESET = "\033[0m"
-        logger.warning(
-            "%sWARNING: PyTorch 2.9.1 with CuDNN %s detected for a multimodal model. "
-            "PyTorch issue https://github.com/pytorch/pytorch/issues/168167 reports "
-            "an nn.Conv3d performance and memory regression with CuDNN older than 9.15. "
-            "SGLang will continue startup, but the recommended post-install override is:\n"
-            "    %s\n"
-            "Set SGLANG_DISABLE_CUDNN_CHECK=1 to suppress this warning.%s",
-            RED,
-            _format_cudnn_version(cudnn_version),
-            install_cmd,
-            RESET,
-        )
+            if torch_release[:3] == (2, 9, 1):
+                cudnn_version = None
+                try:
+                    cudnn_version = torch.backends.cudnn.version()
+                except Exception:
+                    cudnn_version = None
+                if cudnn_version is not None:
+                    version_float = float(str(cudnn_version)[:3]) / 100
+                    if version_float < 9.15:
+                        RED = "\033[91m"
+                        BOLD = "\033[1m"
+                        RESET = "\033[0m"
+                        msg = (
+                            f"{RED}{BOLD}"
+                            "CRITICAL WARNING: PyTorch 2.9.1 & CuDNN Compatibility Issue Detected\n"
+                            "--------------------------------------------------------------------------------\n"
+                            f"Current Environment: PyTorch {torch.__version__} | CuDNN {version_float:.2f}\n\n"
+                            "Issue:     There is a KNOWN BUG in PyTorch 2.9.1's `nn.Conv3d` implementation\n"
+                            "           when used with CuDNN versions older than 9.15. This can cause\n"
+                            "           SEVERE PERFORMANCE DEGRADATION and EXCESSIVE MEMORY USAGE.\n\n"
+                            "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
+                            "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
+                            "Run the following command immediately to fix:\n"
+                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
+                            "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
+                            "--------------------------------------------------------------------------------\n"
+                            f"{RESET}"
+                        )
+                        raise RuntimeError(msg)
+                else:
+                    RED = "\033[91m"
+                    RESET = "\033[0m"
+                    logger.warning(
+                        f"{RED}WARNING: Could not determine CuDNN version for torch==2.9.1. Please ensure CuDNN >= 9.15 to avoid nn.Conv3d bugs.{RESET}"
+                    )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

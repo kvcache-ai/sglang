@@ -1,14 +1,26 @@
 import logging
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, is_blackwell_supported
 
 logger = logging.getLogger(__name__)
 
 
+# Capabilities where DeepGEMM's wgmma / tcgen05.mma kernels actually run.
+# Hopper (SM_90a) + DC Blackwell (SM_100f, SM_103a). NOT consumer Blackwell
+# (SM_120) which lacks both, NOT Ada (SM_89) / Ampere (SM_8x). Outside this
+# set, importing DeepGEMM may succeed but invoking its kernels raises
+# "Unsupported architecture" (verified on RTX 5090: deep_gemm.attention's
+# get_paged_mqa_logits_metadata crashes during CUDA Graph capture).
+DEEPGEMM_CAPS = {(9, 0), (10, 0), (10, 3)}
+
+
 def _compute_enable_deep_gemm():
-    sm_version = get_device_sm()
-    if sm_version < 90:
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability() not in DEEPGEMM_CAPS:
         return False
 
     try:

@@ -225,7 +225,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[1];
+  cudaLaunchAttribute m_attrs[2];
 };
 
 }  // namespace host

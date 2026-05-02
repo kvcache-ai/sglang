@@ -1243,17 +1243,25 @@ __global__ void Marlin(
       }
     }
 
-    // Commented out FP4/FP8 scale dequantization since we don't generate
-    // kFE2M1f kernels to reduce compilation time
-    // if constexpr (w_type == host::kFE2M1f) {
-    //   int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
-    //   int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
-    //
-    //   dequant_fp8_scales<scalar_t2, s_type_id>(
-    //       s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-    //   dequant_fp8_scales<scalar_t2, s_type_id>(
-    //       s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
-    // }
+    // FP4/FP8 scale dequantization. Original code was commented out "to
+    // reduce compilation time" but the only-MoE marlin kernel still
+    // multiplies frag_b by frag_s in the inner loop — without this dequant
+    // call frag_s holds raw ue8m0 / e4m3 bytes interpreted as bf16 bits,
+    // which (for ue8m0 byte b) gives bf16 ≈ (1 + b/128) × 2^(2b - 127)
+    // instead of the intended 2^(b - 127). Empirically reproduced on
+    // RTX 5090: V4-Flash MXFP4 MoE outputs explode by 2^byte (NaN propagates
+    // through SiLU/down_proj). Linear (non-MoE) marlin does NOT have this
+    // bug — gemm/marlin/marlin_template.h:1083 calls dequant_fp8_scales
+    // unconditionally for w_type == kFE2M1f.
+    if constexpr (w_type == host::kFE2M1f) {
+      int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
+      int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+
+      dequant_fp8_scales<scalar_t2, s_type_id>(
+          s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+      dequant_fp8_scales<scalar_t2, s_type_id>(
+          s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+    }
 
 // We have the m dimension as the inner loop in order to encourage overlapping
 // dequantization and matmul operations.

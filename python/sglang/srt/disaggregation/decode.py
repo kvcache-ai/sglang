@@ -52,6 +52,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -308,6 +309,12 @@ class DecodePreallocQueue:
             self.metadata_buffers.get_buf_infos()
         )
 
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            assert self.prefill_pp_size == 1, (
+                "V4 PD disaggregation requires PP=1 "
+                "(get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized flat list)"
+            )
+
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
                 self.token_to_kv_pool.get_state_buf_infos()
@@ -316,7 +323,7 @@ class DecodePreallocQueue:
             kv_args.state_data_lens = state_data_lens
             kv_args.state_item_lens = state_item_lens
 
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
+            if isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)):
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
@@ -633,8 +640,9 @@ class DecodePreallocQueue:
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(self.token_to_kv_pool, SWAKVPool):
-                # SWA hybrid model: send decode-side SWA window indices
+            elif isinstance(
+                self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)
+            ):
                 seq_len = len(decode_req.req.origin_input_ids)
                 window_size = self.scheduler.sliding_window_size
 

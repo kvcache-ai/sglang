@@ -55,6 +55,7 @@ class DraftBackendFactory:
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
+            "compressed": self._create_compressed_decode_backend,
         }
 
         return self._create_backend(
@@ -79,6 +80,7 @@ class DraftBackendFactory:
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
+            "compressed": self._create_compressed_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -189,6 +191,15 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
+    def _create_compressed_decode_backend(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
+            DeepseekV4MultiStepBackend,
+        )
+
+        return DeepseekV4MultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
     def _create_flashinfer_prefill_backend(self):
         if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
@@ -247,3 +258,10 @@ class DraftBackendFactory:
             "flashmla prefill backend is not yet supported for draft extend."
         )
         return None
+
+    def _create_compressed_prefill_backend(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
+            DeepseekV4BackendRadix,
+        )
+
+        return DeepseekV4BackendRadix(self.draft_model_runner, skip_prefill=False)

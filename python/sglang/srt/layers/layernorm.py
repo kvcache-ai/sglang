@@ -52,6 +52,7 @@ if _is_cuda or _is_xpu:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
+            from flashinfer.norm import rmsnorm as fi_rmsnorm
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
@@ -123,6 +124,9 @@ class RMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if x.numel() == 0:
             return x
+        if envs.SGLANG_OPT_USE_FLASHINFER_NORM.get():
+            return fi_rmsnorm(x, self.weight, self.variance_epsilon)
+
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
@@ -169,11 +173,15 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_hip:
+            if x.shape[0] == 0:
+                if residual is not None:
+                    return x, residual
+                return x
+
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
             fused_add_rms_norm(
                 output,
                 x,
