@@ -37,6 +37,21 @@ def pad_or_narrow_weight(
     )
 
 
+def is_strict_contiguous(x: torch.Tensor) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(x.shape), reversed(x.stride())):
+        if stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+def strict_contiguous(x: torch.Tensor) -> torch.Tensor:
+    if is_strict_contiguous(x):
+        return x
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 class PPMissingLayer(torch.nn.Identity):
     # Adapted from
     # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1

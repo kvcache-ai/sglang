@@ -57,6 +57,9 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def on_after_cuda_graph_warmup_pass(self):
+        pass
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers of verify attention kernels that needs to be filled after draft.
@@ -128,6 +131,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for decode."""
         raise NotImplementedError()
@@ -140,6 +144,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for extend."""
         raise NotImplementedError()

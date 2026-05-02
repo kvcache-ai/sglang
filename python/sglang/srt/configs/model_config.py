@@ -67,8 +67,15 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     )
 
 
+def is_deepseek_compressed(config: PretrainedConfig) -> bool:
+    return config.architectures is not None and (
+        config.architectures[0] == "DeepseekV4ForCausalLM"
+        or config.architectures[0] == "DeepseekV4ForCausalLMNextN"
+    )
+
+
 def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+    assert is_deepseek_nsa(config) or is_deepseek_compressed(config)
     return config.index_head_dim
 
 
@@ -80,6 +87,64 @@ def get_nsa_index_topk(config: PretrainedConfig) -> int:
 def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
+
+
+import re as _re
+
+# Matches routed-expert weight keys in both HF-style layouts
+# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepseekV4 2604-style
+# layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
+# excluded because the index segment requires a digit after ``.experts.``.
+_ROUTED_EXPERT_KEY_RE = _re.compile(
+    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
+)
+
+
+def _probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
+    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
+    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
+    no matching key. Reads only the safetensors header of the relevant shard.
+    """
+    import struct
+
+    if not os.path.isdir(model_path):
+        return None
+
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    target_key = None
+    target_shard_path = None
+
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {}) or {}
+        for k, shard in weight_map.items():
+            if _ROUTED_EXPERT_KEY_RE.search(k):
+                target_key = k
+                target_shard_path = os.path.join(model_path, shard)
+                break
+        if target_key is None:
+            return None
+    else:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+        if not shards:
+            return None
+        target_shard_path = str(shards[0])
+
+    with open(target_shard_path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+
+    if target_key is not None:
+        meta = header.get(target_key)
+        return meta.get("dtype") if meta else None
+
+    for k, meta in header.items():
+        if k == "__metadata__" or not isinstance(meta, dict):
+            continue
+        if _ROUTED_EXPERT_KEY_RE.search(k):
+            return meta.get("dtype")
+    return None
 
 
 class ModelConfig:
@@ -156,6 +221,9 @@ class ModelConfig:
 
         # Config draft model
         self._config_draft_model()
+
+        # Auto-detect FP4 vs FP8 routed-expert storage for DeepseekV4 2604 mode
+        self._maybe_auto_set_dsv4_fp4_experts()
 
         # Check model type
         self.attention_chunk_size = getattr(
@@ -278,6 +346,13 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
             "Glm4MoeLiteForCausalLM",
@@ -336,6 +411,55 @@ class ModelConfig:
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+    def _maybe_auto_set_dsv4_fp4_experts(self):
+        """Auto-set SGLANG_DSV4_FP4_EXPERTS based on the checkpoint's routed-
+        expert weight dtype for DeepseekV4 in 2604 mode.
+
+        mxfp4-packed experts are stored as ``U8`` in safetensors; FP4-to-FP8
+        converted experts are stored as ``F8_E4M3``. The flag defaults to True
+        (mxfp4); only flip it automatically when we can positively identify the
+        converted-FP8 layout. Explicit env settings always win.
+        """
+        if envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
+            return
+        if not is_deepseek_compressed(self.hf_config):
+            return
+        if envs.SGLANG_DSV4_MODE.get() != "2604":
+            return
+        try:
+            dtype = _probe_routed_expert_weight_dtype(self.model_path)
+        except Exception as e:
+            logger.warning(
+                "Failed to probe routed-expert dtype for %s; keeping "
+                "SGLANG_DSV4_FP4_EXPERTS default. Reason: %s",
+                self.model_path,
+                e,
+            )
+            return
+        if dtype is None:
+            return
+        # Packed mxfp4 expert weights are stored as int8/uint8 (or native F4);
+        # the FP4-to-FP8 conversion path writes F8_E4M3. Anything else is
+        # unexpected for 2604 mode, so leave the env alone and log it.
+        if dtype in ("U8", "I8", "F4"):
+            is_fp4_experts = True
+        elif dtype == "F8_E4M3":
+            is_fp4_experts = False
+        else:
+            logger.warning(
+                "Unexpected routed-expert safetensors dtype=%s for 2604 mode; "
+                "keeping SGLANG_DSV4_FP4_EXPERTS default.",
+                dtype,
+            )
+            return
+        envs.SGLANG_DSV4_FP4_EXPERTS.set(is_fp4_experts)
+        logger.info(
+            "Auto-detected routed-expert safetensors dtype=%s; "
+            "SGLANG_DSV4_FP4_EXPERTS=%s",
+            dtype,
+            is_fp4_experts,
+        )
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
@@ -343,7 +467,17 @@ class ModelConfig:
             and not self.disable_hybrid_swa_memory
         )
 
-        if self.is_hybrid_swa:
+        if not self.is_hybrid_swa:
+            return
+
+        logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
+
+        self.is_swa_with_compressed_attention = any(
+            arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
+            for arch in self.hf_config.architectures
+        )
+
+        if self.is_hybrid_swa and not self.is_swa_with_compressed_attention:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
@@ -456,6 +590,32 @@ class ModelConfig:
                     scaling_factor = rope_scaling["factor"]
                     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                     self.scaling = self.scaling * mscale * mscale
+        elif (
+            "DeepseekV4ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+                self.window_size = self.hf_config.sliding_window
+            else:
+                self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+                self.window_size = self.hf_config.window_size
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.v_head_dim = self.head_dim
+            self.index_head_dim = self.hf_config.index_head_dim
+            self.compress_ratios = self.hf_config.compress_ratios
+            self.attention_arch = AttentionArch.MHA
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
+
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -538,6 +698,14 @@ class ModelConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
+        hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
+        self.spec_hidden_size = (
+            self.hidden_size * hc_mult
+            if hc_mult > 1
+            and envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
+            and envs.SGLANG_DSV4_MODE.get() == "2604"
+            else self.hidden_size
+        )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -810,10 +978,11 @@ class ModelConfig:
             return "fp8"  # Default fallback
 
     def _get_sliding_window_size(self) -> Optional[int]:
-        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
-        if sliding_window_size is None:
-            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
-        return sliding_window_size
+        key_list = ["sliding_window_size", "sliding_window", "window_size"]
+        for key in key_list:
+            if hasattr(self.hf_text_config, key):
+                return getattr(self.hf_text_config, key)
+        return None
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
@@ -1339,6 +1508,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",

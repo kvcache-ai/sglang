@@ -162,6 +162,10 @@ class Envs:
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # "none" = use checkpoint's config.json, "small"/"large" = force the packaged
+    # config_backup_{small,large}.json, "auto" = pick small/large based on the
+    # checkpoint's num_hidden_layers.
+    SGLANG_APPLY_CONFIG_BACKUP = EnvStr("auto")
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -356,6 +360,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT = EnvBool(True)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
@@ -365,6 +370,8 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM = EnvBool(False)
+    SGLANG_HACK_FORCE_TID2EID_ZERO = EnvBool(False)
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
@@ -478,6 +485,73 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    SGLANG_ENABLE_THINKING = EnvBool(False)
+    # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
+    # Accepts "", "max", "high" (empty string means unset). Other values filtered to None.
+    SGLANG_REASONING_EFFORT = EnvStr("")
+
+    SGLANG_DSV4_MODE = EnvStr("2604")
+    SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
+    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted checkpoint with 2604 config
+    SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_FLASHMLA_BACKEND_OVERRIDE = EnvStr("kernel")
+    SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+
+
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(True)
+    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+
+    SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(True)
+    SGLANG_FIX_ATTN_BACKEND_IDLE = EnvBool(True)
+    SGLANG_FIX_PD_IDLE = EnvBool(True)
+    SGLANG_FIX_SWA_CHUNKED_REQ_DOUBLE_FREE = EnvBool(True)
+    SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)  # usually not useful
+    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
+    SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM = EnvBool(True)  # verified in journal 2026-04-21-017
+    SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
+    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(True)
+    SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(True)
+    SGLANG_OPT_MXFP4_STATIC_SCALE_ONES = EnvBool(True)
+    SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING = EnvBool(True)
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+    SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
+    SGLANG_DSV4_FIX_ATTN_PADDING = EnvBool(True)  # verified in journal 2026-04-21-017
+    SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
+    SGLANG_DEBUG_SANITY_CHECK_CONFIG = EnvBool(False)
+    SGLANG_DEBUG_HACK_CP_ASSERT_PURE_EXTEND = EnvBool(False)
+    SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY = EnvBool(False)
+    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
+    SGLANG_OPT_FIX_APE_2604 = EnvBool(True)
+    SGLANG_OPT_CP_REARRANGE_TRITON = EnvBool(True)
+    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+    SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH = EnvBool(True)
+    SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    SGLANG_OPT_USE_JIT_NORM = EnvBool(False)
+    SGLANG_OPT_FIX_HASH_MEGA_MOE = EnvBool(False)
+    SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(False)
+    SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+
+    # Dangerous untested flagas
+    SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)
+    SGLANG_OPT_USE_FLASHINFER_NORM = EnvBool(False)
+
+    SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
+
+    SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
 
@@ -492,6 +566,14 @@ class Envs:
 
 envs = Envs()
 EnvField._allow_set_name = False
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def is_large_dummy_model() -> bool:
+    return os.environ.get("SGLANG_HACK_ASSERT_CKPT_VERSION") == "large-dummy"
 
 
 def _print_deprecated_env(new_name: str, old_name: str):
@@ -520,8 +602,7 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
     )
     _print_deprecated_env(
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
-        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        "SGLANG_PREP_IN_CUDA_GRAPH", "SGLANG_ADVANCED_CUDA_GRAPH_CAPTURE"
     )
     _deprecated_ms_to_s = {
         "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",

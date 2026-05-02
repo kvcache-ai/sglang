@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -504,6 +505,7 @@ class Req(ReqDllmMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -715,6 +717,11 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+
+        self.return_indexer_topk = return_indexer_topk
+        self.indexer_topk: Optional[torch.Tensor] = (
+            None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
+        )
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -792,6 +799,8 @@ class Req(ReqDllmMixin):
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
+
+        self.hisparse_staging = False
 
     @property
     def seqlen(self) -> int:
@@ -1080,6 +1089,7 @@ class Req(ReqDllmMixin):
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.indexer_topk = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
@@ -1283,6 +1293,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return captured experts
     return_routed_experts: bool = False
 
+    return_indexer_topk: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1295,6 +1307,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     @classmethod
     def init_new(
@@ -1315,7 +1329,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
 
-        return cls(
+        batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -1330,10 +1344,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
+            return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
+        return batch
 
     def batch_size(self):
         return len(self.reqs)
@@ -1879,6 +1895,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
 
+        if self.hisparse_coordinator is not None and not req.finished():
+            self.hisparse_coordinator.retract_req(req)
+
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
@@ -1982,6 +2001,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+            )
 
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
@@ -2283,7 +2310,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
         new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen, pre_len - sliding_window_size
+            req.swa_evicted_seqlen,
+            pre_len - sliding_window_size - self.tree_cache.page_size,
         )
 
         if self.tree_cache.page_size > 1:

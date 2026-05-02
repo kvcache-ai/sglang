@@ -4211,3 +4211,11 @@ def bind_to_closest_numa_node_cuda():
     if is_numa_available() and nvgpu_available():
         node_id = get_current_device_numa_node_cuda()
         numa_bind_to_node(node_id)
+
+
+def maybe_torch_compile(func):
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    if get_is_capture_mode():
+        return torch.compile(func)
+    return func
