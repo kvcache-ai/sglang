@@ -25,6 +25,21 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import next_power_of_2
 
 if is_flashinfer_available():
+    # V4-Flash needs flashinfer >= 0.6.9 (mxfp8_quantize, trtllm_fp4_block_scale_routed_moe
+    # and friends were not exported in 0.6.3, the version pinned by sglang-kt's pyproject).
+    # Fail loud with the exact upgrade command rather than letting the imports below crash
+    # with a bare ImportError. Origin: sglang 本身.
+    import flashinfer as _flashinfer
+    from packaging.version import Version as _Version
+
+    _MIN_FI_VERSION = "0.6.9"
+    _fi_ver = getattr(_flashinfer, "__version__", "0.0.0")
+    if _Version(_fi_ver) < _Version(_MIN_FI_VERSION):
+        raise ImportError(
+            f"DeepSeek-V4-Flash MXFP4 MoE requires flashinfer >= {_MIN_FI_VERSION} "
+            f"(found {_fi_ver}). Upgrade with: "
+            f"pip install --upgrade flashinfer-python flashinfer-cubin"
+        )
     from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
@@ -49,7 +64,7 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 
 # Capabilities for which flashinfer's `trtllm_fp4_block_scale_routed_moe`
-# ships a working binary. flashinfer 0.6.8 only includes sm100f. Outside
+# ships a working binary. flashinfer 0.6.9 only includes sm100f. Outside
 # this whitelist the dispatcher routes V4 MXFP4 MoE through the portable
 # `triton_kernels.matmul_ogs` path in `v4_triton_kernels_moe.py`. Keep
 # this in sync with the same constant in `v4_triton_kernels_moe.py`.
