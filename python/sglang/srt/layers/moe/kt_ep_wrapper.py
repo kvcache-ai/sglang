@@ -316,8 +316,22 @@ class SharedFullContext:
         """Detect quant type from weight attributes created on gpu_layer."""
         layer = self.gpu_layer
 
+        # V4-Flash MXFP4 (must come before FP8 block — both register
+        # `w13_weight_scale_inv`, but MXFP4 is FP4 nibble-packed weights with
+        # ue8m0 scales rather than FP8 e4m3 weights with FP8 scales). Use the
+        # quant method's class name as discriminator to avoid a circular import
+        # of DeepSeekMxfp4MoEMethod. Origin: sglang 本身 (V4-Flash full-GPU
+        # prefill fallback compat).
+        if self.gpu_method.__class__.__name__ == "DeepSeekMxfp4MoEMethod":
+            self.is_mxfp4_quant = True
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
         # INT4 Marlin
         if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
+            self.is_mxfp4_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -325,6 +339,7 @@ class SharedFullContext:
 
         # FP8 block
         if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
+            self.is_mxfp4_quant = False
             self.is_fp8_quant = True
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -332,6 +347,7 @@ class SharedFullContext:
 
         # FP8 per-channel
         if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
+            self.is_mxfp4_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = True
             self.is_bf16_quant = False
@@ -339,12 +355,14 @@ class SharedFullContext:
 
         # BF16 / unquantized
         if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
+            self.is_mxfp4_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = True
             return
 
         # Fallback to class-based detection for unknown layouts.
+        self.is_mxfp4_quant = False
         self.is_fp8_quant = self._detect_fp8_quant()
         self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
         self.is_bf16_quant = self._detect_bf16_quant()
@@ -457,6 +475,12 @@ class SharedFullContext:
     @property
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
+        if getattr(self, "is_mxfp4_quant", False):
+            # V4-Flash MXFP4 uses the same flat names as FP8 block (w13_weight,
+            # w13_weight_scale_inv, w2_weight, w2_weight_scale_inv); the
+            # underlying byte payload differs (FP4 nibble + ue8m0 scale) but
+            # the staging buffers don't care about content.
+            return self.WEIGHT_NAMES_FP8
         if self.is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
         elif self.is_fp8_channel_quant:
@@ -956,6 +980,44 @@ class SharedFullContext:
     # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
     # The conversion is handled separately in the normal weight loading path.
 
+    def _prepare_weight_mxfp4(self, wrapper, original_layer=None, gpu_experts_mask=None,
+                              logical_to_gpu_index=None):
+        """Prepare V4-Flash MXFP4 weights for the full-GPU prefill fallback.
+
+        V4-Flash MXFP4 routed-experts share flat attribute names with FP8 block
+        (`w13_weight` / `w13_weight_scale_inv` / `w2_weight` / `w2_weight_scale_inv`)
+        but with different payload semantics: FP4 e2m1 nibble-packed weights +
+        ue8m0 per-kgroup scales instead of FP8 e4m3 weights + FP8 scales. The
+        staging-buffer byte-copy machinery in `_prepare_weight_fp8` does not
+        care about content semantics, so we reuse it as-is for the 144 GPU +
+        112 CPU expert load.
+
+        After all 256 experts are filled into `gpu_layer.w13_weight` etc., we
+        re-run `gpu_method.process_weights_after_loading(gpu_layer)`, which
+        invokes `convert_v4_weights_to_triton_kernels` and stores the swizzled
+        result in `gpu_layer._v4_tk_w13` / `_v4_tk_w13_pcg` / `_v4_tk_w2` /
+        `_v4_tk_w2_pcg` — exactly what the downstream `gpu_method.apply` →
+        `apply_v4_triton_kernels_moe` path expects to read. This requires the
+        outer model loader to have skipped the post-swizzle deletes (gated on
+        `kt_gpu_prefill_token_threshold > 0` in `mxfp4_deepseek.py`).
+
+        Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat).
+        """
+        # Phase 1+2: byte-copy via the FP8 path (works for FP4-packed bytes).
+        self._prepare_weight_fp8(
+            wrapper,
+            original_layer=original_layer,
+            gpu_experts_mask=gpu_experts_mask,
+            logical_to_gpu_index=logical_to_gpu_index,
+        )
+
+        # Phase 3: re-swizzle the now-256-expert flat tensors into the
+        # triton_kernels form `gpu_method.apply` will consume. Ensure all
+        # in-flight CPU→GPU copies from Phase 2 are visible first.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.gpu_method.process_weights_after_loading(self.gpu_layer)
+
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
                                      logical_to_gpu_index=None):
         """Prepare FP8 per-channel quant weights by writing from KT and copying to GPU.
@@ -1301,7 +1363,12 @@ class SharedFullContext:
 
         # Select appropriate prepare_weight method based on quantization type
         # FP8/BF16 methods support GPU expert optimization; INT4 uses full CPU pipeline
-        if self.is_fp8_quant:
+        if getattr(self, "is_mxfp4_quant", False):
+            # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
+            # triton_kernels form. Origin: sglang 本身.
+            self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
+                                       logical_to_gpu_index)
+        elif self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
                                      logical_to_gpu_index)
         elif self.is_fp8_channel_quant:
@@ -2423,10 +2490,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _kt_t_after_merge = None
         _kt_t_cpu_wait_ms = 0.0
 
-        # Check for full GPU fallback
+        # Check for full GPU fallback. The full-GPU path's _build_full_context →
+        # _prepare_weight_{mxfp4,fp8,fp8_channel,bf16,int4} helpers read flat
+        # `w13_weight` / `w13_weight_packed` attributes off `layer`. V4-Flash
+        # MXFP4 (triton_kernels path) optionally preserves these when
+        # `kt_gpu_prefill_token_threshold > 0` is set (see
+        # `mxfp4_deepseek.process_weights_after_loading`); accept either the
+        # flat attr or the v4 triton-kernels marker as a hint that the loader
+        # can populate the layer. Layouts without either are still skipped to
+        # avoid crashing the scheduler. Origin: sglang 本身 (V4-Flash
+        # full-GPU prefill fallback compat).
+        _full_gpu_fallback_supported = (
+            hasattr(layer, "w13_weight")
+            or hasattr(layer, "w13_weight_packed")
+            or getattr(layer, "_v4_tk_path", False)
+        )
         if (
             self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
+            and _full_gpu_fallback_supported
         ):
             ctx = self._build_full_context(layer)
 
@@ -2436,8 +2518,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 torch.cuda.synchronize()
             compute_time = (time.perf_counter() - t_compute) * 1000.0
 
-            # Dynamic expert update: analyze batch and update GPU experts
-            if self.kt_config.kt_enable_dynamic_expert_update:
+            # Dynamic expert update: analyze batch and update GPU experts.
+            # Skip for V4-Flash MXFP4 — `_update_gpu_experts_from_batch` →
+            # `copy_experts_weights_int4` hardcodes int4 weight names
+            # (`w13_weight_packed` etc.) and crashes on MXFP4 layouts. The
+            # full-GPU fallback re-loads all 256 experts on every fire anyway,
+            # so the dynamic-promote optimization is a no-op for MXFP4. Origin:
+            # sglang 本身 (V4-Flash full-GPU prefill fallback compat).
+            _mxfp4_skip_dyn_update = getattr(ctx, "is_mxfp4_quant", False)
+            if self.kt_config.kt_enable_dynamic_expert_update and not _mxfp4_skip_dyn_update:
                 t_update = time.perf_counter()
                 self._update_gpu_experts_from_batch(
                     layer=layer,
