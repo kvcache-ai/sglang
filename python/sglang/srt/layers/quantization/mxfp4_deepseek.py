@@ -310,11 +310,19 @@ class DeepSeekMxfp4MoEMethod:
                 w13_raw, w13_scale_raw, w2_raw, w2_scale_raw,
             )
             # Free raw tensors; the triton_kernels Tensor objects keep their
-            # own swizzled storage.
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale_inv
-            del layer.w2_weight_scale_inv
+            # own swizzled storage. The kt_ep_wrapper's full-GPU prefill
+            # fallback (kt_gpu_prefill_token_threshold > 0) needs the raw
+            # attributes around to materialize all 256 experts on GPU when
+            # the gate fires, so opt-in keep them in that mode. Origin: sglang
+            # 本身 (V4-Flash full-GPU prefill fallback compat).
+            _keep_raw_for_full_gpu_fallback = (
+                getattr(get_global_server_args(), "kt_gpu_prefill_token_threshold", 0) or 0
+            ) > 0
+            if not _keep_raw_for_full_gpu_fallback:
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale_inv
+                del layer.w2_weight_scale_inv
             layer._v4_tk_w13 = w13_swiz
             layer._v4_tk_w13_pcg = w13_pcg
             layer._v4_tk_w2 = w2_swiz
