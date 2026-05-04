@@ -982,61 +982,180 @@ class SharedFullContext:
 
     def _prepare_weight_mxfp4(self, wrapper, original_layer=None, gpu_experts_mask=None,
                               logical_to_gpu_index=None):
-        """Prepare V4-Flash MXFP4 weights for the full-GPU prefill fallback.
+        """Prepare V4-Flash MXFP4 weights by writing from KT and copying to GPU.
 
-        V4-Flash MXFP4 routed-experts share flat attribute names with FP8 block
-        (`w13_weight` / `w13_weight_scale_inv` / `w2_weight` / `w2_weight_scale_inv`)
-        but with different payload semantics: FP4 e2m1 nibble-packed weights +
-        ue8m0 per-kgroup scales instead of FP8 e4m3 weights + FP8 scales. The
-        staging-buffer byte-copy machinery in `_prepare_weight_fp8` does not
-        care about content semantics, so we reuse it as-is for the 144 GPU +
-        112 CPU expert load.
+        Pipeline: write(e+1) || copy(e) || postprocess(e-1)
 
-        After all 256 experts are filled into `gpu_layer.w13_weight` etc., we
-        re-run `gpu_method.process_weights_after_loading(gpu_layer)`, which
-        invokes `convert_v4_weights_to_triton_kernels` and stores the swizzled
-        result in `gpu_layer._v4_tk_w13` / `_v4_tk_w13_pcg` / `_v4_tk_w2` /
-        `_v4_tk_w2_pcg` — exactly what the downstream `gpu_method.apply` →
-        `apply_v4_triton_kernels_moe` path expects to read. This requires the
-        outer model loader to have skipped the post-swizzle deletes (gated on
-        `kt_gpu_prefill_token_threshold > 0` in `mxfp4_deepseek.py`).
+        严格仿照 _prepare_weight_fp8 的 per-expert pipeline 骨架，与其他四个量化
+        方式（fp8 / fp8_channel / bf16 / int4）结构对等。MXFP4 路由专家在 V4-Flash
+        中复用 FP8 block 的 flat 属性名（w13_weight / w13_weight_scale_inv /
+        w2_weight / w2_weight_scale_inv）但 payload 是 FP4 e2m1 nibble-packed
+        + ue8m0 per-kgroup scales。staging-buffer byte-copy 不关心内容语义，
+        与 fp8 路径完全一致。
 
-        **Caching**: V4-Flash MXFP4 weights are immutable across requests
-        (no dynamic-expert-update for MXFP4 — see apply()), so the 256-expert
-        load + swizzle is done **once per SharedFullContext** and skipped on
-        every subsequent `load()` invocation. Without caching the per-chunk
-        wall is dominated by ~40ms × 43 layers ≈ 1.7s of CPU→GPU staging,
-        which floors prefill throughput at ~430 tok/s for chunked-prefill
-        regardless of how fast the GPU MoE forward actually is. With caching
-        the per-chunk overhead drops to ~0 and throughput is bound by attention
-        + MoE compute only.
+        与 _prepare_weight_fp8 的差异仅在末尾的 Phase 3 layer-level swizzle：
+        把 256 专家 flat tensors 包装成 triton_kernels.Tensor (StridedLayout) 写入
+        gpu_layer._v4_tk_w13 / _v4_tk_w13_pcg / _v4_tk_w2 / _v4_tk_w2_pcg，
+        供下游 gpu_method.apply → apply_v4_triton_kernels_moe 消费。包装本身是
+        metadata-only（无 GPU 存储分配），可每次重做完整覆盖。
 
-        Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat + perf).
+        Reload-every-call: _SHARED_FULL_CONTEXT 是进程级单例只持一份 gpu_layer，
+        每次 per-layer load() 必须重新覆盖 _v4_tk_* 槽位（它们是纯属性，不在
+        original_params 中，不会被 load() 顶部 restore 清掉）。
+
+        本 Phase 3 swizzle 的入口要求外层 model loader 在 threshold > 0 时已
+        跳过 post-swizzle 的 del layer.w13_weight 等（见 mxfp4_deepseek.py）。
+
+        Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat).
         """
-        # Cache hit: weights already loaded + swizzled by a previous load()
-        # call. The triton_kernels apply path reads `_v4_tk_w13` etc., which
-        # `process_weights_after_loading` produced last time. Nothing to do.
-        if getattr(self, "_mxfp4_loaded", False):
-            return
+        # Bind Python thread to specific CPU core (last cores for each rank)
+        tp_rank = get_tensor_model_parallel_rank()
+        num_cpus = os.cpu_count()
+        target_cpu = num_cpus - 1 - tp_rank
+        os.sched_setaffinity(0, {target_cpu})
 
-        # Phase 1+2: byte-copy via the FP8 path (works for FP4-packed bytes).
-        self._prepare_weight_fp8(
-            wrapper,
-            original_layer=original_layer,
-            gpu_experts_mask=gpu_experts_mask,
-            logical_to_gpu_index=logical_to_gpu_index,
-        )
+        layer = self.gpu_layer
+        num_experts = layer.num_experts
+        device = layer.w13_weight.device
 
-        # Phase 3: re-swizzle the now-256-expert flat tensors into the
-        # triton_kernels form `gpu_method.apply` will consume. Ensure all
-        # in-flight CPU→GPU copies from Phase 2 are visible first.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # Prepare weight tensors (cpu_buf is double-buffered with shape [2, ...])
+        weight_infos = []
+        for name in self.WEIGHT_NAMES_FP8:
+            cpu_buf = self.cpu_buffers[name]  # Shape: [2, ...expert_shape...]
+            gpu_t = getattr(layer, name)  # Shape: [num_experts, ...expert_shape...]
+            weight_infos.append((name, cpu_buf, gpu_t))
+
+        # Separate GPU experts (direct copy) from CPU experts (KT transfer)
+        gpu_expert_ids = []
+        cpu_expert_ids = []
+        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+            for e in range(num_experts):
+                if gpu_experts_mask[e].item():
+                    gpu_expert_ids.append(e)
+                else:
+                    cpu_expert_ids.append(e)
+        else:
+            # Fallback: all experts from CPU
+            cpu_expert_ids = list(range(num_experts))
+
+        # --- Phase 1: Copy GPU experts directly (fast GPU-to-GPU) ---
+        if gpu_expert_ids:
+            for e in gpu_expert_ids:
+                gpu_idx = logical_to_gpu_index[e].item()
+                for name, _, dst in weight_infos:
+                    src = getattr(original_layer, name)  # [num_gpu_experts, ...]
+                    dst[e].copy_(src[gpu_idx], non_blocking=True)
+
+        # --- Phase 2: Transfer CPU experts via KT pipeline ---
+        if cpu_expert_ids:
+            # Pipeline: write(e+1) || copy(e) || postprocess(e-1)
+            copy_stream = torch.cuda.Stream(device=device)
+            post_stream = torch.cuda.Stream(device=device)
+            # Events indexed by position in cpu_expert_ids
+            events = [torch.cuda.Event() for _ in range(len(cpu_expert_ids))]
+
+            def postprocess_expert(idx):
+                # MXFP4 swizzle 是 layer-level 操作（PrecisionConfig 持有整张
+                # [E, ...] 的 wrapper），不能拆到 per-expert。占位提供 pipeline
+                # 同步点，与 fp8/bf16 一致。layer-level swizzle 在函数末尾
+                # Phase 3 一次性完成。
+                pass
+
+            # Prepare write pipeline (rank 0 only)
+            tp_world_size = get_tensor_model_parallel_world_size()
+            do_write = tp_rank == 0 and wrapper is not None
+
+            if do_write:
+                # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
+                w13_weight_buf = self.cpu_buffers["w13_weight"]
+                w13_scale_buf = self.cpu_buffers["w13_weight_scale_inv"]
+                w2_weight_buf = self.cpu_buffers["w2_weight"]
+                w2_scale_buf = self.cpu_buffers["w2_weight_scale_inv"]
+
+                # Buffer shape is [2, ...], so numel() // 2 gives per-expert size
+                w13_weight_expert_nbytes = (
+                    w13_weight_buf.numel() // 2 * w13_weight_buf.element_size()
+                )
+                w13_scale_expert_nbytes = (
+                    w13_scale_buf.numel() // 2 * w13_scale_buf.element_size()
+                )
+                w2_weight_expert_nbytes = (
+                    w2_weight_buf.numel() // 2 * w2_weight_buf.element_size()
+                )
+                w2_scale_expert_nbytes = (
+                    w2_scale_buf.numel() // 2 * w2_scale_buf.element_size()
+                )
+
+                def submit_write_expert(expert_id, slot):
+                    # Use provided slot for double buffering
+                    w13_weight_ptrs = [
+                        ptr + slot * w13_weight_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w13_weight"]
+                    ]
+                    w13_scale_ptrs = [
+                        ptr + slot * w13_scale_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w13_weight_scale_inv"]
+                    ]
+                    w2_weight_ptrs = [
+                        ptr + slot * w2_weight_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w2_weight"]
+                    ]
+                    w2_scale_ptrs = [
+                        ptr + slot * w2_scale_expert_nbytes
+                        for ptr in self.all_rank_buffer_ptrs["w2_weight_scale_inv"]
+                    ]
+                    wrapper.submit_write_weight_scale_to_buffer(
+                        tp_world_size,
+                        expert_id,
+                        w13_weight_ptrs,
+                        w13_scale_ptrs,
+                        w2_weight_ptrs,
+                        w2_scale_ptrs,
+                    )
+
+                # Submit first CPU expert ahead of time
+                submit_write_expert(cpu_expert_ids[0], 0)
+
+            for idx, e in enumerate(cpu_expert_ids):
+                slot = idx % 2  # Double buffering based on iteration index
+
+                # Sync write for expert e, submit write for next CPU expert
+                if do_write:
+                    wrapper.sync_write_weight_scale_to_buffer()
+                    if idx + 1 < len(cpu_expert_ids):
+                        next_slot = (idx + 1) % 2
+                        # Before writing to next_slot, ensure copy from that slot is complete.
+                        if idx > 0:
+                            events[idx - 1].synchronize()
+                        submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
+
+                # Barrier to ensure all ranks see the written data
+                if dist.is_initialized():
+                    dist.barrier(group=get_tp_group().device_group)
+
+                with torch.cuda.stream(copy_stream):
+                    for _, cpu_buf, gpu_t in weight_infos:
+                        gpu_t[e].copy_(cpu_buf[slot], non_blocking=True)
+                    events[idx].record(copy_stream)
+
+                # Postprocess expert idx-1: provides pipeline structure for future extensions
+                if idx > 0:
+                    with torch.cuda.stream(post_stream):
+                        post_stream.wait_event(events[idx - 1])
+                        postprocess_expert(idx - 1)
+
+            # Process last CPU expert
+            with torch.cuda.stream(post_stream):
+                post_stream.wait_event(events[-1])
+                postprocess_expert(len(cpu_expert_ids) - 1)
+
+            torch.cuda.current_stream(device).wait_stream(post_stream)
+
+        # --- Phase 3: MXFP4-only layer-level swizzle ---
+        # 必须放在 Phase 1+2 stream 同步之后；包装是 metadata-only（StridedLayout
+        # no-op + Python wrapper），每次重做完整覆盖 _v4_tk_w13 / _v4_tk_w13_pcg /
+        # _v4_tk_w2 / _v4_tk_w2_pcg。Origin: sglang 本身.
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
-
-        # Mark cached so subsequent gate fires (every chunk in a chunked
-        # prefill) skip the 1.7s reload.
-        self._mxfp4_loaded = True
 
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
                                      logical_to_gpu_index=None):
