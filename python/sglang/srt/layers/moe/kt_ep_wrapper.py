@@ -556,9 +556,15 @@ class SharedFullContext:
             gpu_tensor = getattr(self.gpu_layer, name)
             # Only allocate 2 experts worth of buffer (double buffering)
             expert_shape = gpu_tensor.shape[1:]  # Shape per expert
-            expert_nbytes = (
-                gpu_tensor.numel() // num_experts * gpu_tensor.element_size()
-            )
+            if (
+                getattr(self, "is_mxfp4_quant", False)
+                and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
+            ):
+                buf_dtype = torch.bfloat16
+            else:
+                buf_dtype = gpu_tensor.dtype
+            element_size = torch.empty((), dtype=buf_dtype).element_size()
+            expert_nbytes = gpu_tensor.numel() // num_experts * element_size
             double_buf_nbytes = expert_nbytes * 2
 
             shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
@@ -568,7 +574,7 @@ class SharedFullContext:
             self.shm_handles[name] = shm
 
             # Shape: [2, ...expert_shape...]
-            cpu_buffer = torch.frombuffer(shm.buf, dtype=gpu_tensor.dtype).reshape(
+            cpu_buffer = torch.frombuffer(shm.buf, dtype=buf_dtype).reshape(
                 (2,) + expert_shape
             )
 
