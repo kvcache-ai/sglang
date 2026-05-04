@@ -998,10 +998,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise
 
         backend = get_default_distributed_backend(self.device)
-        if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
+        if self.device == "cuda" and (
+            self.server_args.elastic_ep_backend == "mooncake"
+            or self.server_args.moe_a2a_backend == "mooncake"
+        ):
             backend = "mooncake"
-            if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+            mooncake_ib_device = self.server_args.get_ep_mooncake_ib_device()
+            if mooncake_ib_device:
+                mooncake_ib_device = mooncake_ib_device.split(",")
                 try:
                     from mooncake import ep as mooncake_ep
 
@@ -1162,9 +1166,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             init_mooncake_transfer_engine(
                 hostname=get_local_ip_auto(),
                 gpu_id=self.gpu_id,
-                ib_device=(
-                    self.server_args.disaggregation_ib_device
-                    or self.server_args.mooncake_ib_device
+                ib_device=self.server_args.get_mooncake_transfer_engine_ib_device(
+                    reuse_hicache_te=envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
                 ),
             )
 

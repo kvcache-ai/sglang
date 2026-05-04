@@ -40,6 +40,31 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     mooncake_ib_device: Optional[str] = None
 
+    def get_pd_mooncake_ib_device(self) -> Optional[str]:
+        return self.disaggregation_ib_device or self.mooncake_ib_device
+
+    def get_epd_mooncake_ib_device(self) -> Optional[str]:
+        return self.disaggregation_ib_device or self.mooncake_ib_device
+
+    def get_hicache_mooncake_ib_device(self) -> Optional[str]:
+        return self.mooncake_ib_device
+
+    def get_ep_mooncake_ib_device(self) -> Optional[str]:
+        return self.mooncake_ib_device
+
+    def get_mooncake_transfer_engine_ib_device(
+        self, *, reuse_hicache_te: bool
+    ) -> Optional[str]:
+        if self.disaggregation_mode != "null" and self.disaggregation_transfer_backend == "mooncake":
+            return self.get_pd_mooncake_ib_device()
+        if reuse_hicache_te and self.enable_hierarchical_cache and self.hicache_storage_backend == "mooncake":
+            return self.get_hicache_mooncake_ib_device()
+        if (self.encoder_only or self.language_only) and self.encoder_transfer_backend == "mooncake":
+            return self.get_epd_mooncake_ib_device()
+        if self.enable_elastic_expert_backup and self.elastic_ep_backend is not None:
+            return self.get_ep_mooncake_ib_device()
+        return self.mooncake_ib_device
+
 
 def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
     """
@@ -123,8 +148,8 @@ def run_mooncake_init(
             )
             from sglang.srt.utils import get_local_ip_auto
 
-            ib_device = (
-                server_args.disaggregation_ib_device or server_args.mooncake_ib_device
+            ib_device = server_args.get_mooncake_transfer_engine_ib_device(
+                reuse_hicache_te=True
             )
 
             print(f"[Rank {rank}] IB device: {ib_device}")

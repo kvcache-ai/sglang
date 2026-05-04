@@ -19,14 +19,15 @@ _mock_device.start()
 
 class TestPrepareServerArgs(CustomTestCase):
     def test_prepare_server_args(self):
-        server_args = prepare_server_args(
-            [
-                "--model-path",
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-                "--json-model-override-args",
-                '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
-            ]
-        )
+        with patch.object(ServerArgs, "__post_init__", return_value=None):
+            server_args = prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--json-model-override-args",
+                    '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
+                ]
+            )
         self.assertEqual(server_args.model_path, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN)
         self.assertEqual(
             json.loads(server_args.json_model_override_args),
@@ -257,6 +258,157 @@ class TestSSLArgs(unittest.TestCase):
         with self.assertRaises(ValueError) as context:
             ServerArgs(model_path="dummy", ssl_ca_certs="ca.pem")
         self.assertIn("--ssl-ca-certs", str(context.exception))
+
+
+class TestMooncakeIbDeviceConfig(unittest.TestCase):
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1", "ib2", "ib3", "ib4"])
+    def test_legacy_string_remains_global_fallback(self, _mock_listdir, _mock_isdir):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.mooncake_ib_device = "ib0, ib1"
+
+        server_args._handle_mooncake_ib_device()
+
+        self.assertEqual(server_args.mooncake_ib_device, "ib0,ib1")
+        self.assertEqual(server_args.get_mooncake_ib_device_for("pd"), "ib0,ib1")
+        self.assertEqual(server_args.get_mooncake_ib_device_for("ep"), "ib0,ib1")
+
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1", "ib2", "ib3", "ib4"])
+    def test_feature_mapping_supports_python_literal_sets(
+        self, _mock_listdir, _mock_isdir
+    ):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.mooncake_ib_device = (
+            '{"pd": {"ib1", "ib0"}, "ep": ["ib3", "ib4"], "default": "ib2"}'
+        )
+
+        server_args._handle_mooncake_ib_device()
+
+        self.assertEqual(server_args.get_mooncake_ib_device_for("pd"), "ib0,ib1")
+        self.assertEqual(server_args.get_mooncake_ib_device_for("ep"), "ib3,ib4")
+        self.assertEqual(
+            server_args.get_mooncake_ib_device_for("hicache"),
+            "ib2",
+        )
+
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1", "ib2", "ib3", "ib4"])
+    def test_prepare_server_args_parses_mooncake_mapping_cli(
+        self, _mock_listdir, _mock_isdir
+    ):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--mooncake-ib-device",
+                '{"pd": ["ib0", "ib1"], "epd": ["ib2"], "ep": ["ib3", "ib4"]}',
+            ]
+        )
+
+        server_args._handle_mooncake_ib_device()
+
+        self.assertEqual(server_args.get_pd_mooncake_ib_device(), "ib0,ib1")
+        self.assertEqual(server_args.get_epd_mooncake_ib_device(), "ib2")
+        self.assertEqual(server_args.get_ep_mooncake_ib_device(), "ib3,ib4")
+
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1", "ib2", "ib3"])
+    def test_prepare_server_args_injects_hicache_device_name_from_cli(
+        self, _mock_listdir, _mock_isdir
+    ):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--hicache-storage-backend",
+                "mooncake",
+                "--hicache-storage-backend-extra-config",
+                '{"master_server_address": "127.0.0.1:50051"}',
+                "--mooncake-ib-device",
+                '{"hicache": ["ib2", "ib3"]}',
+            ]
+        )
+
+        server_args._handle_mooncake_ib_device()
+
+        self.assertEqual(server_args.get_hicache_mooncake_ib_device(), "ib2,ib3")
+        self.assertEqual(
+            json.loads(server_args.hicache_storage_backend_extra_config)["device_name"],
+            "ib2,ib3",
+        )
+
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1", "ib2", "ib3"])
+    def test_transfer_engine_routing_prefers_matching_feature(
+        self, _mock_listdir, _mock_isdir
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="mooncake",
+            enable_elastic_expert_backup=True,
+            elastic_ep_backend="mooncake",
+        )
+        server_args.hicache_storage_backend_extra_config = json.dumps(
+            {"master_server_address": "127.0.0.1:50051"}
+        )
+        server_args.mooncake_ib_device = (
+            '{"hicache": ["ib0"], "ep": ["ib1"], "default": "ib2"}'
+        )
+
+        server_args._handle_mooncake_ib_device()
+
+        self.assertEqual(
+            server_args.get_mooncake_transfer_engine_ib_device(reuse_hicache_te=True),
+            "ib0",
+        )
+        server_args.enable_hierarchical_cache = False
+        self.assertEqual(
+            server_args.get_mooncake_transfer_engine_ib_device(reuse_hicache_te=True),
+            "ib1",
+        )
+
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1", "ib2", "ib3"])
+    def test_disaggregation_param_keeps_precedence(self, _mock_listdir, _mock_isdir):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.disaggregation_ib_device = "ib3"
+        server_args.mooncake_ib_device = '{"pd": ["ib0", "ib1"], "epd": ["ib2"]}'
+
+        server_args._handle_mooncake_ib_device()
+        server_args.disaggregation_ib_device = server_args._validate_ib_devices(
+            server_args.disaggregation_ib_device
+        )
+
+        self.assertEqual(server_args.get_pd_mooncake_ib_device(), "ib3")
+        self.assertEqual(server_args.get_epd_mooncake_ib_device(), "ib3")
+
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1", "ib2", "ib3"])
+    def test_hicache_injects_device_name(self, _mock_listdir, _mock_isdir):
+        server_args = ServerArgs(model_path="dummy", hicache_storage_backend="mooncake")
+        server_args.hicache_storage_backend_extra_config = json.dumps(
+            {"master_server_address": "127.0.0.1:50051"}
+        )
+        server_args.mooncake_ib_device = '{"hicache": ["ib2", "ib3"]}'
+
+        server_args._handle_mooncake_ib_device()
+
+        self.assertEqual(server_args.get_hicache_mooncake_ib_device(), "ib2,ib3")
+        self.assertEqual(
+            json.loads(server_args.hicache_storage_backend_extra_config)["device_name"],
+            "ib2,ib3",
+        )
+
+    @patch("os.path.isdir", return_value=True)
+    @patch("os.listdir", return_value=["ib0", "ib1"])
+    def test_invalid_mooncake_target_raises(self, _mock_listdir, _mock_isdir):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.mooncake_ib_device = '{"unknown": ["ib0"]}'
+
+        with self.assertRaises(ValueError):
+            server_args._handle_mooncake_ib_device()
 
     def test_ssl_keyfile_password_without_certfile_raises(self):
         with self.assertRaises(ValueError) as context:

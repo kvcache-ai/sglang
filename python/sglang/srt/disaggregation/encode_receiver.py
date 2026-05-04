@@ -635,10 +635,7 @@ class MMReceiverBase(ABC):
 
                 self.embeddings_engine = init_mooncake_transfer_engine(
                     hostname=self.host,
-                    ib_device=(
-                        server_args.disaggregation_ib_device
-                        or server_args.mooncake_ib_device
-                    ),
+                    ib_device=server_args.get_epd_mooncake_ib_device(),
                 )
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":

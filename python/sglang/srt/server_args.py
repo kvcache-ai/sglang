@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import importlib
 import importlib.util
@@ -75,6 +76,23 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+
+MOONCAKE_IB_DEVICE_TARGET_ALIASES = {
+    "pd": ("pd", "disaggregation", "pd_disaggregation"),
+    "epd": ("epd", "encoder", "encoder_disaggregation"),
+    "hicache": (
+        "hicache",
+        "hierarchical_cache",
+        "hicache_mooncake_backend",
+    ),
+    "ep": ("ep", "expert_parallel", "expert", "elastic_ep", "moe"),
+    "global": ("default", "all", "global"),
+}
+MOONCAKE_IB_DEVICE_TARGET_LOOKUP = {
+    alias: canonical
+    for canonical, aliases in MOONCAKE_IB_DEVICE_TARGET_ALIASES.items()
+    for alias in aliases
+}
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 
@@ -823,6 +841,7 @@ class ServerArgs:
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
+        self._handle_mooncake_ib_device()
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -2979,10 +2998,14 @@ class ServerArgs:
                     "elasticity_aware_hierarchical",
                 ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
-            if self.elastic_ep_backend == "mooncake":
-                self.mooncake_ib_device = self._validate_ib_devices(
-                    self.mooncake_ib_device
-                )
+    def _handle_mooncake_ib_device(self):
+        if self.mooncake_ib_device is not None:
+            self.mooncake_ib_device = self._normalize_mooncake_ib_device(
+                self.mooncake_ib_device
+            )
+
+        if self.hicache_storage_backend == "mooncake":
+            self._inject_hicache_mooncake_ib_device()
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -3604,7 +3627,202 @@ class ServerArgs:
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
             )
 
-    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
+    def _normalize_mooncake_ib_device_target(self, target: str) -> str:
+        normalized_target = target.strip().lower().replace("-", "_")
+        canonical_target = MOONCAKE_IB_DEVICE_TARGET_LOOKUP.get(normalized_target)
+        if canonical_target is None:
+            valid_targets = ", ".join(sorted(MOONCAKE_IB_DEVICE_TARGET_LOOKUP))
+            raise ValueError(
+                "Invalid --mooncake-ib-device target "
+                f"'{target}'. Supported targets: {valid_targets}"
+            )
+        return canonical_target
+
+    def _parse_mooncake_ib_device_mapping(
+        self, device_str: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if device_str is None:
+            return None
+
+        candidate = device_str.strip()
+        if not candidate.startswith("{"):
+            return None
+
+        try:
+            config = json.loads(candidate)
+        except json.JSONDecodeError:
+            try:
+                config = ast.literal_eval(candidate)
+            except (SyntaxError, ValueError) as e:
+                raise ValueError(
+                    "Invalid --mooncake-ib-device mapping. Expected either a "
+                    "comma-separated device list or an object like "
+                    "'{\"pd\": [\"ib0\", \"ib1\"], \"ep\": [\"ib3\", \"ib4\"]}'."
+                ) from e
+
+        if not isinstance(config, dict):
+            raise ValueError(
+                "--mooncake-ib-device mapping must be an object keyed by feature name."
+            )
+
+        return config
+
+    def _normalize_ib_device_value(self, value: Any, *, target: str) -> str:
+        if isinstance(value, str):
+            return self._validate_ib_devices(value)
+
+        if isinstance(value, (list, tuple, set)):
+            raw_devices = sorted(value) if isinstance(value, set) else value
+            devices = []
+            for device in raw_devices:
+                if not isinstance(device, str):
+                    raise ValueError(
+                        f"--mooncake-ib-device target '{target}' must contain only strings, got {type(device).__name__}."
+                    )
+                stripped_device = device.strip()
+                if stripped_device:
+                    devices.append(stripped_device)
+            return self._validate_ib_devices(",".join(devices))
+
+        raise ValueError(
+            f"--mooncake-ib-device target '{target}' must be a string, list, tuple, or set, got {type(value).__name__}."
+        )
+
+    def _normalize_mooncake_ib_device(self, device_str: Optional[str]) -> Optional[str]:
+        mooncake_config = self._parse_mooncake_ib_device_mapping(device_str)
+        if mooncake_config is None:
+            return self._validate_ib_devices(device_str)
+
+        normalized_config = {}
+        for raw_target, raw_value in mooncake_config.items():
+            if not isinstance(raw_target, str):
+                raise ValueError(
+                    "--mooncake-ib-device mapping keys must be strings."
+                )
+            canonical_target = self._normalize_mooncake_ib_device_target(raw_target)
+            if canonical_target in normalized_config:
+                raise ValueError(
+                    "Duplicate --mooncake-ib-device target detected after alias "
+                    f"normalization: '{raw_target}' -> '{canonical_target}'."
+                )
+            normalized_config[canonical_target] = self._normalize_ib_device_value(
+                raw_value, target=raw_target
+            )
+
+        return json.dumps(normalized_config, sort_keys=True)
+
+    def get_mooncake_ib_device_for(self, target: str) -> Optional[str]:
+        if self.mooncake_ib_device is None:
+            return None
+
+        mooncake_config = self._parse_mooncake_ib_device_mapping(self.mooncake_ib_device)
+        if mooncake_config is None:
+            return self.mooncake_ib_device
+
+        normalized_config = {}
+        for raw_target, raw_value in mooncake_config.items():
+            canonical_target = self._normalize_mooncake_ib_device_target(raw_target)
+            normalized_config[canonical_target] = (
+                raw_value
+                if isinstance(raw_value, str)
+                else self._normalize_ib_device_value(raw_value, target=raw_target)
+            )
+
+        canonical_target = self._normalize_mooncake_ib_device_target(target)
+        device_str = normalized_config.get(canonical_target)
+        if device_str is None and canonical_target != "global":
+            device_str = normalized_config.get("global")
+        return device_str
+
+    def get_pd_mooncake_ib_device(self) -> Optional[str]:
+        return self.disaggregation_ib_device or self.get_mooncake_ib_device_for("pd")
+
+    def get_epd_mooncake_ib_device(self) -> Optional[str]:
+        return self.disaggregation_ib_device or self.get_mooncake_ib_device_for("epd")
+
+    def _parse_hicache_storage_backend_extra_config(self) -> Dict[str, Any]:
+        if not self.hicache_storage_backend_extra_config:
+            return {}
+
+        config_str = self.hicache_storage_backend_extra_config
+        if config_str.startswith("@"):
+            path = config_str[1:]
+            ext = os.path.splitext(path)[1].lower()
+            with open(path, "rb" if ext == ".toml" else "r") as f:
+                if ext == ".json":
+                    extra_config = json.load(f)
+                elif ext == ".toml":
+                    import tomllib
+
+                    extra_config = tomllib.load(f)
+                elif ext in (".yaml", ".yml"):
+                    import yaml
+
+                    extra_config = yaml.safe_load(f)
+                else:
+                    raise ValueError(
+                        f"Unsupported HiCache config file format: {path}"
+                    )
+        else:
+            extra_config = json.loads(config_str)
+
+        if not isinstance(extra_config, dict):
+            raise ValueError(
+                "--hicache-storage-backend-extra-config must deserialize to a dictionary."
+            )
+        return extra_config
+
+    def _inject_hicache_mooncake_ib_device(self):
+        hicache_ib_device = self.get_mooncake_ib_device_for("hicache")
+        if hicache_ib_device is None:
+            return
+
+        extra_config = self._parse_hicache_storage_backend_extra_config()
+        if extra_config.get("device_name"):
+            return
+
+        extra_config["device_name"] = hicache_ib_device
+        self.hicache_storage_backend_extra_config = json.dumps(extra_config)
+
+    def get_hicache_mooncake_ib_device(self) -> Optional[str]:
+        if self.hicache_storage_backend == "mooncake":
+            extra_config = self._parse_hicache_storage_backend_extra_config()
+            device_name = extra_config.get("device_name")
+            if isinstance(device_name, str) and device_name:
+                return device_name
+        return self.get_mooncake_ib_device_for("hicache")
+
+    def get_ep_mooncake_ib_device(self) -> Optional[str]:
+        return self.get_mooncake_ib_device_for("ep")
+
+    def get_mooncake_transfer_engine_ib_device(
+        self, *, reuse_hicache_te: bool
+    ) -> Optional[str]:
+        if (
+            self.disaggregation_mode != "null"
+            and self.disaggregation_transfer_backend == "mooncake"
+        ):
+            return self.get_pd_mooncake_ib_device()
+
+        if (
+            reuse_hicache_te
+            and self.enable_hierarchical_cache
+            and self.hicache_storage_backend == "mooncake"
+        ):
+            return self.get_hicache_mooncake_ib_device()
+
+        if (
+            (self.encoder_only or self.language_only)
+            and self.encoder_transfer_backend == "mooncake"
+        ):
+            return self.get_epd_mooncake_ib_device()
+
+        if self.enable_elastic_expert_backup and self.elastic_ep_backend is not None:
+            return self.get_ep_mooncake_ib_device()
+
+        return self.get_mooncake_ib_device_for("global")
+
+    def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
 
@@ -5413,9 +5631,11 @@ class ServerArgs:
             "--mooncake-ib-device",
             type=str,
             default=ServerArgs.mooncake_ib_device,
-            help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
-            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
-            "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
+            help="The InfiniBand devices for Mooncake features. Accepts either a legacy comma-separated device list "
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1) or a per-feature object "
+            "(e.g., --mooncake-ib-device '{\"pd\": [\"ib0\", \"ib1\"], \"ep\": [\"ib3\", \"ib4\"]}'). "
+            "Supported targets include pd, epd, hicache, ep, and default/global. "
+            "Default is None, which triggers automatic device detection when the corresponding Mooncake feature is enabled.",
         )
 
         # Mamba Cache
