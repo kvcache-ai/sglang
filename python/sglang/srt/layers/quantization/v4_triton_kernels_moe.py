@@ -362,6 +362,7 @@ def apply_v4_triton_kernels_moe(
     intermediate_size: int,         # per-partition N
     num_experts: int,
     routed_scaling_factor: float = 1.0,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Run V4 sparse MoE through `triton_kernels.matmul_ogs`.
 
@@ -369,6 +370,14 @@ def apply_v4_triton_kernels_moe(
     byte-level reproducible under same input.
 
     Activation: silu_and_mul (V4 default), applied between the two GEMMs.
+
+    `swiglu_limit` (DSV4 2604B): if not None, applies the same gate/up
+    asymmetric clamp the trtllm path's `gemm1_clamp_limit` and the
+    deep_gemm path's `_apply_swiglu_limit` use, on the gemm1 output before
+    silu_and_mul:
+        gate = clamp(gate, max=limit)            # one-sided
+        up   = clamp(up, min=-limit, max=limit)  # symmetric
+    Origin: sglang 本身 (matches `moe_runner/deep_gemm.py:_apply_swiglu_limit`).
     """
     from triton_kernels.matmul_ogs import matmul_ogs
     from sgl_kernel import silu_and_mul
@@ -396,7 +405,16 @@ def apply_v4_triton_kernels_moe(
         gather_indx=gather_indx,
         precision_config=w13_pcg,
     )
-    # intermediate1 shape: [M*topk, 2*N]
+    # intermediate1 shape: [M*topk, 2*N]; layout = [gate, up] along last dim.
+    # We skipped reorder_w1w3_to_w3w1 for this path so the natural [w1, w3]
+    # = [gate, up] order from the checkpoint is preserved.
+    if swiglu_limit is not None:
+        # 2604B asymmetric SwiGLU clamp. View slices and clamp_ in place to
+        # avoid chunk+cat copy; safe because intermediate1 is a fresh
+        # matmul_ogs output, not a cached buffer.
+        N_int = intermediate1.shape[-1] // 2
+        intermediate1[..., :N_int].clamp_(max=swiglu_limit)
+        intermediate1[..., N_int:].clamp_(min=-swiglu_limit, max=swiglu_limit)
     M_topk = intermediate1.shape[0]
     intermediate2 = torch.empty(
         (M_topk, N), device=hidden_states.device, dtype=hidden_states.dtype

@@ -412,6 +412,17 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # issue1985 fix (sglang 本身): skip self-check when any in-flight work
+        # is still holding KV slots. With --disable-radix-cache + hybrid SWA +
+        # chunked prefill, between chunks the chunked_req keeps the chunk's
+        # slots in `used` state but they do not count toward evictable nor
+        # protected. _check_hybrid_memory's `used != 0` then false-positives.
+        if (
+            self.chunked_req is not None
+            or not self.running_batch.is_empty()
+            or len(self.waiting_queue) > 0
+        ):
+            return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

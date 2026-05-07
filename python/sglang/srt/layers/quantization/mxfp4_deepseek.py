@@ -481,6 +481,12 @@ class DeepSeekMxfp4MoEMethod:
                     topk_ids,
                 )
             rsf = layer.moe_runner_config.routed_scaling_factor
+            # 2604B SwiGLU clamp: thread swiglu_limit through so the triton-
+            # kernels GPU MoE path applies the same gate/up clamp as
+            # trtllm's gemm1_clamp_limit and deep_gemm's _apply_swiglu_limit.
+            # When submode != 2604B, moe_runner_config.swiglu_limit is None
+            # and apply_v4_triton_kernels_moe skips the clamp.
+            # Origin: sglang 本身.
             output = apply_v4_triton_kernels_moe(
                 hidden_states=hidden_states,
                 w13_swiz=layer._v4_tk_w13,
@@ -492,6 +498,7 @@ class DeepSeekMxfp4MoEMethod:
                 intermediate_size=layer._v4_tk_intermediate_size,
                 num_experts=layer._v4_tk_num_experts,
                 routed_scaling_factor=rsf if rsf is not None else 1.0,
+                swiglu_limit=layer.moe_runner_config.swiglu_limit,
             )
             if envs.SGLANG_DSV4_2604_SUBMODE.get() == '2604B' and (
                 self._gemm1_clamp_limit_tensor is not None

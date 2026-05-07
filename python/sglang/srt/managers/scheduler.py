@@ -2071,9 +2071,17 @@ class Scheduler(
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # issue1985 fix (sglang 本身): the inline comment above explicitly says
+        # "Ignore the check if self.chunked_req is not None", but the code below
+        # used `is not None`, which is the opposite. With --disable-radix-cache +
+        # hybrid SWA, the chunked_req keeps holding its req_pool slot across
+        # chunks (ChunkCache.cache_unfinished_req does not release), so when the
+        # req pool only has one slot effectively (ReqToTokenPool initializes
+        # free_slots = list(range(1, size)), wasting index 0), available_size
+        # becomes 0 and this early-return fires forever -> silent hang.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
+            and self.chunked_req is None
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True

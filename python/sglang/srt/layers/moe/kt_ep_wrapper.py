@@ -556,9 +556,15 @@ class SharedFullContext:
             gpu_tensor = getattr(self.gpu_layer, name)
             # Only allocate 2 experts worth of buffer (double buffering)
             expert_shape = gpu_tensor.shape[1:]  # Shape per expert
-            expert_nbytes = (
-                gpu_tensor.numel() // num_experts * gpu_tensor.element_size()
-            )
+            if (
+                getattr(self, "is_mxfp4_quant", False)
+                and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
+            ):
+                buf_dtype = torch.bfloat16
+            else:
+                buf_dtype = gpu_tensor.dtype
+            element_size = torch.empty((), dtype=buf_dtype).element_size()
+            expert_nbytes = gpu_tensor.numel() // num_experts * element_size
             double_buf_nbytes = expert_nbytes * 2
 
             shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
@@ -568,7 +574,7 @@ class SharedFullContext:
             self.shm_handles[name] = shm
 
             # Shape: [2, ...expert_shape...]
-            cpu_buffer = torch.frombuffer(shm.buf, dtype=gpu_tensor.dtype).reshape(
+            cpu_buffer = torch.frombuffer(shm.buf, dtype=buf_dtype).reshape(
                 (2,) + expert_shape
             )
 
@@ -2285,6 +2291,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
         if self.tp_rank == 0:
+            # V4-Flash 2604B SwiGLU clamp on routed experts. The full
+            # moe_runner_config (which carries swiglu_limit) does not arrive
+            # until create_moe_runner(), but the value is fully determined
+            # by the DSV4 submode env (fixed at process start), so we read
+            # it here without waiting. Matches the assert
+            # `swiglu_limit == 10` in moe_runner/deep_gemm.py:_apply_swiglu_limit
+            # and the default 10.0 set for 2604B in mxfp4_deepseek.py.
+            # Origin: kt-sglang 耦合 (carries V4-2604B limit into kt-kernel).
+            from sglang.srt.environ import envs as _envs
+            _kt_swiglu_limit = (
+                10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
+            )
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
@@ -2294,6 +2312,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
+                swiglu_limit=_kt_swiglu_limit,
                 numa_nodes=self.kt_config.numa_nodes,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
