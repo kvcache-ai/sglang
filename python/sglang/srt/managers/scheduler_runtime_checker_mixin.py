@@ -437,12 +437,11 @@ class SchedulerRuntimeCheckerMixin:
             if queue_size:
                 return
 
-        if (
-            self.enable_hisparse
-            and self.hisparse_coordinator is not None
-            and self.hisparse_coordinator.has_ongoing_staging()
-        ):
-            return
+        if self.enable_hisparse:
+            from sglang.srt.managers.forward_hooks_registry import query_any
+
+            if query_any("query_has_ongoing_staging"):
+                return
 
         self.check_memory()
         self.check_tree_cache()

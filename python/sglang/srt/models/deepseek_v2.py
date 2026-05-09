@@ -38,6 +38,7 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
+    is_deepseek_compressed,
     is_deepseek_nsa,
 )
 from sglang.srt.distributed import (
@@ -93,10 +94,9 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.moe.deepseek_v4_topk import HashTopK
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.quant_method_registry import is_wrapped_method
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -114,7 +114,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
-from sglang.srt.layers.quantization.mxfp4_deepseek import DeepSeekMxfp4MoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
@@ -310,7 +309,6 @@ class MoEGate(nn.Module):
         prefix: str = "",
         is_nextn: bool = False,
         is_hash_moe: bool = False,
-        is_deepseek_v4: bool = False,
     ):
         super().__init__()
         self.is_nextn = is_nextn
@@ -419,6 +417,17 @@ def _get_mega_moe_symm_buffer(
 
 class DeepseekV2MoE(nn.Module):
 
+    def _compute_is_hash(
+        self, layer_id: int, n_hash_layers: int, is_nextn: bool
+    ) -> bool:
+        """Whether this layer should use hash MoE.
+
+        Default: layer-index-based — early layers (< n_hash_layers) use hash.
+        Subclasses (e.g. V4-Flash) override to add model-specific gating
+        such as bypassing hash for V4 NextN draft layers.
+        """
+        return layer_id < n_hash_layers
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -427,7 +436,6 @@ class DeepseekV2MoE(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
-        is_deepseek_v4: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -444,11 +452,15 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
+        # Gate on the model actually being DSV4-compressed: SGLANG_DSV4_MODE may
+        # be set in the operator's shell from a previous DSV4 launch and leak
+        # into non-DSV4 startups (e.g. GLM-5.1 inheriting DeepseekV2MoE), where
+        # `config.num_hash_layers` doesn't exist on the non-DSV4 config class.
+        if envs.SGLANG_DSV4_MODE.get() == "2604" and is_deepseek_compressed(config):
             n_hash_layers = config.num_hash_layers
         else:
             n_hash_layers = getattr(config, "n_hash_layers", 0)
-        self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
+        self.is_hash = self._compute_is_hash(layer_id, n_hash_layers, is_nextn)
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -468,7 +480,6 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("gate", prefix),
             is_nextn=is_nextn,
             is_hash_moe=self.is_hash,
-            is_deepseek_v4=is_deepseek_v4,
         )
 
         # scaling factor for fused shared experts on AMD-platform.
@@ -499,7 +510,13 @@ class DeepseekV2MoE(nn.Module):
 
         self.use_grouped_topk = config.n_group > config.topk_group
 
-        if self.is_hash and not (is_nextn and is_deepseek_v4):
+        if self.is_hash:
+            # Hash decision is computed by `_compute_is_hash` (overridable by
+            # model subclasses; V4-Flash overrides to skip NextN draft layers).
+            # Lazy-import the DSV4 hash topk — only used for V4 / Step3P5
+            # hash-MoE layers; non-DSV4 models never enter this branch.
+            from sglang.srt.layers.moe.deepseek_v4_topk import HashTopK
+
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
                 num_experts=config.n_routed_experts,
@@ -657,7 +674,7 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
-                and not isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                and not is_wrapped_method(self.experts.quant_method, "kt_ep")
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -703,13 +720,13 @@ class DeepseekV2MoE(nn.Module):
             topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
             topk_output = self.topk(hidden_states, router_logits, **topk_kwargs)
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            if not _is_cuda or is_wrapped_method(self.experts.quant_method, "kt_ep"):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
 
         if (
-            isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
+            is_wrapped_method(self.experts.quant_method, "mxfp4_deepseek")
             and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
         ):
             final_hidden_states = shared_output.add_(
@@ -793,13 +810,13 @@ class DeepseekV2MoE(nn.Module):
         if (
             not _is_cuda
             and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or is_wrapped_method(self.experts.quant_method, "kt_ep")
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
         if (
-            isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
+            is_wrapped_method(self.experts.quant_method, "mxfp4_deepseek")
             and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
         ):
             if shared_output is not None:

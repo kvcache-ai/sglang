@@ -91,11 +91,6 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.indexer_topk_capturer import (
-    create_indexer_capturer,
-    get_global_indexer_capturer,
-    set_global_indexer_capturer,
-)
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -607,9 +602,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_attention_backend()
             self.kernel_warmup()
             if self.enable_hisparse:
-                from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+                # Resolve coordinator via the plugin registry — the
+                # HiSparseCoordinator class self-registers under "hisparse"
+                # at module load time (triggered by deepseek_v4.py).
+                from sglang.srt.managers.coordinator_registry import (
+                    create_coordinator,
+                )
 
-                self.hisparse_coordinator = HiSparseCoordinator(
+                self.hisparse_coordinator = create_coordinator(
+                    "hisparse",
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     top_k=512,
@@ -621,6 +622,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         else self.tp_group.cpu_group
                     ),
                 )
+                # Attach the coordinator to the forward-hook adapter so
+                # base scheduler / output processor can dispatch lifecycle
+                # events without importing HiSparseCoordinator.
+                from sglang.srt.managers.hisparse_coordinator import (
+                    _HiSparseHookAdapter,
+                )
+
+                _HiSparseHookAdapter.attach(self.hisparse_coordinator)
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
@@ -685,6 +694,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
+        # Lazy-import the DSV4 indexer-topk capturer so it stays out of the
+        # import graph when the feature isn't used.
+        from sglang.srt.layers.attention.indexer_topk_capturer import (
+            create_indexer_capturer,
+            set_global_indexer_capturer,
+        )
+
         set_global_indexer_capturer(
             create_indexer_capturer(
                 enable=get_global_server_args().enable_return_indexer_topk,
@@ -2472,6 +2488,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch=forward_batch,
             can_run_graph=output.can_run_graph,
             cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+        )
+
+        # Lazy-import — module is already loaded if init_indexer_capturer ran;
+        # otherwise the module-global is None and the no-op call is fine.
+        from sglang.srt.layers.attention.indexer_topk_capturer import (
+            get_global_indexer_capturer,
         )
 
         get_global_indexer_capturer().on_forward_end(

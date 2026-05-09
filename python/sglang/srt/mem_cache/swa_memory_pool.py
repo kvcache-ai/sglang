@@ -11,7 +11,6 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 
@@ -232,10 +231,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: str,
-        kvcache: Union[SWAKVPool, DeepSeekV4TokenToKVPool],
+        kvcache: Union[SWAKVPool, "DeepSeekV4TokenToKVPool"],  # noqa: F821
         need_sort: bool,
     ):
-        assert isinstance(kvcache, (SWAKVPool, DeepSeekV4TokenToKVPool))
+        # `_is_v4_token_pool` is the duck-type tag set on
+        # DeepSeekV4TokenToKVPool — avoids importing the DSV4-only class.
+        assert isinstance(kvcache, SWAKVPool) or getattr(
+            kvcache, "_is_v4_token_pool", False
+        )
         self._size_full = size
         self._size_swa = size_swa
         self.dtype = dtype

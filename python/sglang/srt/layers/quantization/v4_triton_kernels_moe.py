@@ -248,11 +248,47 @@ def _patch_strided_mxfp():
     # opt_flags imports has_native_mxfp into its namespace at import time;
     # refresh the binding there too. Also force is_persistent=False so the
     # auto-selector in make_opt_flags can't pick the native path.
+    #
+    # Source-level patch make_default_opt_flags_nvidia: replace the bare
+    # `assert num_stages >= 1` with `num_stages = max(num_stages, 1)`. The
+    # assertion fires for capabilities outside the tested matrix (observed
+    # on certain Hopper / SM_120 configs under MXFP4 strided layout). The
+    # update_opt_flags_constraints API does NOT override num_stages before
+    # the heuristic's local computation, so a constraint-only fix would be
+    # honored too late. Patching the function source at import time is the
+    # only place this can be neutralized without forking triton_kernels.
     try:
         import triton_kernels.matmul_ogs_details.opt_flags as _of
         if hasattr(_of, "has_native_mxfp"):
             _of.has_native_mxfp = target_info.has_native_mxfp
         _of.update_opt_flags_constraints({"is_persistent": False})
+
+        if (
+            hasattr(_of, "make_default_opt_flags_nvidia")
+            and not getattr(_of, "_v4_assert_patched", False)
+        ):
+            import inspect as _inspect
+            import textwrap as _textwrap
+
+            _src = _textwrap.dedent(
+                _inspect.getsource(_of.make_default_opt_flags_nvidia)
+            )
+            _patched_src = _src.replace(
+                "assert num_stages >= 1",
+                "num_stages = max(num_stages, 1)  # v4-flash patch",
+            )
+            if _patched_src != _src:
+                # rename to avoid recursive shadow when exec'd
+                _patched_src = _patched_src.replace(
+                    "def make_default_opt_flags_nvidia",
+                    "def _v4_make_default_opt_flags_nvidia",
+                    1,
+                )
+                exec(_patched_src, _of.__dict__)
+                _of.make_default_opt_flags_nvidia = (
+                    _of._v4_make_default_opt_flags_nvidia
+                )
+                _of._v4_assert_patched = True
     except Exception:
         pass
 

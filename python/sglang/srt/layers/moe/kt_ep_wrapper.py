@@ -2152,6 +2152,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         method = KTEPWrapperMethod(gpu_method, kt_config)
     """
 
+    # Tag for quant_method_registry.is_wrapped_method() — set as a class
+    # attribute so isinstance-style checks in deepseek_v2 / glm4_moe work
+    # without importing this module.
+    _quant_wrapper_id = "kt_ep"
+
     def __init__(
         self,
         gpu_method: FusedMoEMethodBase,
@@ -2888,3 +2893,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration: makes KTEPWrapperMethod available to FusedMoE without
+# any base-file import. Activated by importing this module, which happens via
+# sglang.srt.models.deepseek_v4 -> auto-discovered by ModelRegistry.
+# ---------------------------------------------------------------------------
+
+def _kt_ep_predicate(layer, server_args):
+    return create_kt_config_from_server_args(server_args, layer.layer_id)
+
+
+def _kt_ep_factory(layer, gpu_method, kt_config):
+    return KTEPWrapperMethod(gpu_method, kt_config)
+
+
+from sglang.srt.layers.moe.quant_method_registry import register_moe_quant_wrapper
+
+# priority=20 → wraps after mxfp4 (matches PR #38 Phase 3 → outer wrapper)
+register_moe_quant_wrapper(
+    "kt_ep", _kt_ep_predicate, _kt_ep_factory, priority=20
+)

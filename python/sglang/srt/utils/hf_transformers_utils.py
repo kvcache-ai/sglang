@@ -88,6 +88,11 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DbrxConfig,
     ExaoneConfig,
     DeepseekVL2Config,
+    # DeepSeekV4Config must be registered eagerly here because
+    # AutoConfig.from_pretrained is called during ModelConfig construction —
+    # well before the auto-discovery in models/registry.py would run a side-
+    # effect registration. The dataclass is lightweight and doesn't pull
+    # DSV4 module deps.
     DeepSeekV4Config,
     MultiModalityConfig,
     KimiVLConfig,
@@ -179,6 +184,27 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+def _peek_is_deepseek_arch(model) -> bool:
+    """Peek the checkpoint's config.json to decide whether to route through the
+    DeepSeek backup-config path. Returns True for DeepSeek-family checkpoints
+    (so the existing config-patching path runs) and False for other models.
+    Fail-open: returns True if the config can't be read, preserving prior behavior."""
+    try:
+        local_path = download_from_hf(str(model))
+        config_file = os.path.join(local_path, "config.json")
+        if not os.path.exists(config_file):
+            return True
+        with open(config_file) as f:
+            cfg = json.load(f)
+        model_type = (cfg.get("model_type") or "").lower()
+        if model_type.startswith("deepseek"):
+            return True
+        archs = cfg.get("architectures") or []
+        return any("deepseek" in str(a).lower() for a in archs)
+    except Exception:
+        return True
+
+
 # Temporary hack for DeepSeek-V3.2 model
 def _load_deepseek_temp_model(
     model_path: str,
@@ -239,7 +265,15 @@ def _load_deepseek_temp_model(
         config_json = json.load(f)
 
     config_json["architectures"] = [architecture]
-    config_json["model_type"] = "deepseek_v3"
+    # model_type drives which PretrainedConfig class AutoConfig.from_pretrained
+    # picks. For V4 we need DeepSeekV4Config (registered eagerly above) so V4
+    # model code can read its V4-only fields (rope_theta, compress_rope_theta,
+    # compress_ratios, etc.). For V3-class architectures the original
+    # "deepseek_v3" mapping still applies.
+    if architecture == "DeepseekV4ForCausalLM":
+        config_json["model_type"] = "deepseek_v4"
+    else:
+        config_json["model_type"] = "deepseek_v3"
 
     tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
@@ -356,7 +390,7 @@ def get_config(
         config = _load_mistral_large_3_for_causal_LM(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    elif envs.SGLANG_APPLY_CONFIG_BACKUP.get() != "none":
+    elif envs.SGLANG_APPLY_CONFIG_BACKUP.get() != "none" and _peek_is_deepseek_arch(model):
         config = _load_deepseek_temp_model(
             model,
             model_type="deepseek_ref",

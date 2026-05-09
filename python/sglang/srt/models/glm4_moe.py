@@ -62,7 +62,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.quant_method_registry import is_wrapped_method
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -495,10 +495,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             if (
                 not _is_cuda
                 and not _use_aiter
-                or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+                or is_wrapped_method(self.experts.quant_method, "kt_ep")
             ):
                 # fused in biased_grouped_topk so we can skip here
-                # For KTEPWrapperMethod, routed_scaling_factor is not applied
+                # For kt_ep wrapper, routed_scaling_factor is not applied
                 # internally (disabled in gpu_runner_config), so apply here
                 final_hidden_states *= self.routed_scaling_factor
 
@@ -538,10 +538,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if (
             not _is_cuda
             and not _use_aiter
-            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            or is_wrapped_method(self.experts.quant_method, "kt_ep")
         ):
             # fused in biased_grouped_topk so we can skip here
-            # For KTEPWrapperMethod, routed_scaling_factor is not applied
+            # For kt_ep wrapper, routed_scaling_factor is not applied
             # internally (disabled in gpu_runner_config), so apply here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:

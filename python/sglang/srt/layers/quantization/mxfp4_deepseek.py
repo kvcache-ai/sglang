@@ -156,6 +156,11 @@ def _pack_topk_ids_triton_kernel(
 
 
 class DeepSeekMxfp4MoEMethod:
+    # Tag for quant_method_registry.is_wrapped_method() — set as a class
+    # attribute so any DeepSeekMxfp4MoEMethod instance is identifiable
+    # regardless of whether it was constructed via the registry or directly
+    # from Fp8Config.get_quant_method.
+    _quant_wrapper_id = "mxfp4_deepseek"
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -636,3 +641,39 @@ class DeepSeekMxfp4MoEMethod:
                 output.mul_(rsf)
 
         return StandardCombineInput(hidden_states=output)
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration: V4-Flash MXFP4 wrap. Predicate gate matches what
+# fused_moe_triton/layer.py used to do inline (env override + kt-method
+# check). Activated when DSV4 model module loads.
+# ---------------------------------------------------------------------------
+
+def _mxfp4_predicate(layer, server_args):
+    import os
+    env = os.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
+    if env == "1":
+        do_wrap = True
+    elif env == "0":
+        do_wrap = False
+    else:
+        do_wrap = (server_args.kt_method or "").upper() == "MXFP4"
+    if not do_wrap:
+        return None
+    return True  # ctx sentinel; factory reads layer attrs
+
+
+def _mxfp4_factory(layer, gpu_method, _ctx):
+    from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+    if not isinstance(gpu_method, Fp8MoEMethod):
+        return gpu_method
+    prefix = getattr(layer, "_registry_prefix", "")
+    return DeepSeekMxfp4MoEMethod(gpu_method, prefix=prefix)
+
+
+from sglang.srt.layers.moe.quant_method_registry import register_moe_quant_wrapper
+
+# priority=10 → wraps Fp8MoEMethod first (matches PR #38 Phase 2, runs before kt_ep Phase 3)
+register_moe_quant_wrapper(
+    "mxfp4_deepseek", _mxfp4_predicate, _mxfp4_factory, priority=10
+)

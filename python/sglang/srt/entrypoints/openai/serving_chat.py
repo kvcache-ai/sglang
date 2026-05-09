@@ -13,7 +13,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -436,6 +436,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 v4_reasoning_effort = (
                     effort_source if effort_source in ("max", "high") else None
                 )
+                from sglang.srt.entrypoints.openai import encoding_dsv4
+
                 real_input = encoding_dsv4.encode_messages(
                     messages,
                     thinking_mode=thinking_mode,

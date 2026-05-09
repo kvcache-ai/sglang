@@ -35,7 +35,6 @@ try:
 except ImportError:
     pass
 
-from sglang.jit_kernel.deepseek_v4 import mask_topk_ids
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -700,6 +699,10 @@ def _mask_topk_ids_padded_region(
     if num_token_non_padded is None:
         return
     if envs.SGLANG_OPT_USE_FAST_MASK_EP.get():
+        # Lazy-import the DSV4 jit kernel — only used when the fast-mask env
+        # is set, which only fires for DSV4 (default OFF after 424da2a55).
+        from sglang.jit_kernel.deepseek_v4 import mask_topk_ids
+
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
@@ -1047,8 +1050,6 @@ def select_experts(
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 correction_bias=correction_bias,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
                 scoring_func=scoring_func,
             )
     else:

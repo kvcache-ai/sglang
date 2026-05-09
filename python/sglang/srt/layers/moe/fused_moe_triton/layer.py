@@ -31,9 +31,9 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.kt_ep_wrapper import (
-    KTEPWrapperMethod,
-    create_kt_config_from_server_args,
+from sglang.srt.layers.moe.quant_method_registry import (
+    is_wrapped_method,
+    maybe_wrap_moe_quant_method,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
@@ -267,7 +267,6 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
         server_args = get_global_server_args()
-        kt_config = create_kt_config_from_server_args(server_args, layer_id)
 
         # Phase 1: pick the base GPU MoE method (or unquantized).
         if quant_config is not None:
@@ -279,53 +278,15 @@ class FusedMoE(torch.nn.Module):
                 self.use_triton_kernels, self.use_flashinfer_trtllm_moe
             )
 
-        # Phase 2: V4-Flash MXFP4 wrap. The routed experts are MXFP4 packed but
-        # quant_config.get_quant_method returns Fp8MoEMethod (the model-level
-        # quant for attn / shared experts). Wrap with DeepSeekMxfp4MoEMethod so
-        # create_weights / apply use the MXFP4 path. This must run for BOTH
-        # the kt-hybrid path (main 43 hidden layers) AND the spec NextN draft
-        # path (which has speculative_kt_ep_disabled_context active, so
-        # kt_config is None but the weights are still MXFP4).
-        #
-        # Gate (capability/method-driven, env override only):
-        #   SGLANG_V4_USE_TRITON_KERNELS=1 -> force wrap on (debug)
-        #   SGLANG_V4_USE_TRITON_KERNELS=0 -> force wrap off (debug)
-        #   env unset:
-        #     - kt-method MXFP4 selected -> wrap on (kt prod path).
-        #     - otherwise -> wrap off (pure sglang non-MXFP path).
-        # Origin: sglang 本身.
-        try:
-            import os as _os_v4
-            from sglang.srt.layers.quantization.mxfp4_deepseek import (
-                DeepSeekMxfp4MoEMethod,
-            )
-            _v4_env = _os_v4.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
-            if _v4_env == "1":
-                _do_v4_wrap = True
-            elif _v4_env == "0":
-                _do_v4_wrap = False
-            else:
-                from sglang.srt.server_args import (
-                    get_global_server_args as _v4_get_args,
-                )
-                _do_v4_wrap = (
-                    (_v4_get_args().kt_method or "").upper() == "MXFP4"
-                )
-            if _do_v4_wrap and isinstance(gpu_method, Fp8MoEMethod):
-                gpu_method = DeepSeekMxfp4MoEMethod(gpu_method, prefix=prefix)
-        except Exception as _e:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                f"[fused-moe] V4-Flash MXFP4 wrap skipped: {_e}"
-            )
-
-        # Phase 3: optionally wrap with kt-ep wrapper (main model only;
-        # speculative_kt_ep_disabled_context forces kt_config=None for the
-        # NextN draft so it runs the gpu_method directly).
-        if kt_config is not None:
-            self.quant_method = KTEPWrapperMethod(gpu_method, kt_config)
-        else:
-            self.quant_method = gpu_method
+        # Phases 2/3: chain-wrap via quant_method_registry. Plugins (DSV4
+        # registers mxfp4_deepseek then kt_ep) self-attach at import time.
+        # Non-DSV4 paths get gpu_method back unchanged.
+        # `prefix` is needed by the mxfp4_deepseek factory; stash on self so
+        # registered factories can read it.
+        self._registry_prefix = prefix
+        self.quant_method = maybe_wrap_moe_quant_method(
+            self, gpu_method, server_args
+        )
 
         self.quant_method.create_weights(
             layer=self,
@@ -691,9 +652,9 @@ class FusedMoE(torch.nn.Module):
                 return
 
         kt_method = None
-        if isinstance(self.quant_method, KTEPWrapperMethod):
+        if is_wrapped_method(self.quant_method, "kt_ep"):
             kt_method = self.quant_method
-        elif hasattr(self, "scheme") and isinstance(self.scheme, KTEPWrapperMethod):
+        elif hasattr(self, "scheme") and is_wrapped_method(self.scheme, "kt_ep"):
             # Some code paths store KT wrapper on self.scheme instead of self.quant_method.
             kt_method = self.scheme
 
@@ -734,7 +695,7 @@ class FusedMoE(torch.nn.Module):
         method = self.quant_method
         if hasattr(self, "scheme"):
             method = self.scheme
-        if method.__class__.__name__ == "KTEPWrapperMethod":
+        if is_wrapped_method(method, "kt_ep"):
             method = method.gpu_method
 
         loaded_weight = (
