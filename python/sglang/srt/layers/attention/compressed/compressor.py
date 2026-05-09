@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.nsa.utils import (
+from sglang.srt.layers.attention.nsa.utils_v4 import (
     assert_tensor_identical_across_cp_ranks,
 )
 

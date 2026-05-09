@@ -17,11 +17,6 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseekv4_memory_pool import (
-    DeepSeekV4IndexerPool,
-    DeepSeekV4TokenToKVPool,
-)
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
@@ -57,6 +52,10 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if is_deepseek_compressed(self.model_config.hf_config):
+            from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                DeepSeekV4IndexerPool,
+            )
+
             assert kv_size == 1, kv_size  # uint8
 
             cell_size = (
@@ -605,6 +604,10 @@ class ModelRunnerKVCacheMixin:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
         if is_v4_model:
+            # Resolve V4 KV pool factory via plugin registry.
+            # deepseekv4_memory_pool.py self-registers under the
+            # is_deepseek_compressed predicate.
+            from sglang.srt.mem_cache.pool_registry import resolve_kv_pool_factory
 
             swa_page_size = self.page_size
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
@@ -619,7 +622,14 @@ class ModelRunnerKVCacheMixin:
                 ] * self.num_effective_layers
             else:
                 compression_ratios = self.model_config.compress_ratios
-            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+
+            resolved = resolve_kv_pool_factory(self.model_config, self.server_args)
+            assert resolved is not None, (
+                "is_deepseek_compressed() returned True but no KV pool plugin "
+                "is registered — ensure models/deepseek_v4.py has been imported."
+            )
+            _, factory = resolved
+            self.token_to_kv_pool = factory(
                 max_num_reqs=self.server_args.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
@@ -889,6 +899,10 @@ class ModelRunnerKVCacheMixin:
                             need_sort=need_sort,
                         )
                 if self.enable_hisparse:
+                    from sglang.srt.mem_cache.hisparse_memory_pool import (
+                        HiSparseTokenToKVPoolAllocator,
+                    )
+
                     self.token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
                         self.token_to_kv_pool_allocator
                     )

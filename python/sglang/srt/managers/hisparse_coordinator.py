@@ -447,3 +447,73 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
         )
         return top_k_indices
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration: makes HiSparseCoordinator available to model_runner /
+# scheduler via coordinator_registry.create("hisparse", ...). Triggered when
+# this module is loaded as a side-effect of importing models/deepseek_v4.py.
+# ---------------------------------------------------------------------------
+
+from sglang.srt.managers.coordinator_registry import register_request_coordinator
+
+register_request_coordinator("hisparse", HiSparseCoordinator)
+
+
+# ---------------------------------------------------------------------------
+# Forward-hook adapter. Lets the base scheduler / output processor dispatch
+# lifecycle events without holding a HiSparseCoordinator reference. The
+# active coordinator instance is set by model_runner.init_hisparse_coordinator
+# via _HiSparseHookAdapter.attach(coordinator); dispatch is a no-op until then.
+# ---------------------------------------------------------------------------
+
+
+class _HiSparseHookAdapter:
+    """Forward-hook proxy. Methods mirror the lifecycle calls the scheduler
+    used to make on `self.hisparse_coordinator.<method>` directly. When no
+    coordinator is attached (non-DSV4 / hisparse disabled), every method is
+    a no-op."""
+
+    _coordinator: "HiSparseCoordinator | None" = None
+
+    @classmethod
+    def attach(cls, coordinator: "HiSparseCoordinator | None") -> None:
+        cls._coordinator = coordinator
+
+    # -- lifecycle dispatch --
+    def on_request_admit(self, req):
+        if self._coordinator is not None:
+            self._coordinator.admit_request_into_staging(req)
+
+    def on_request_finished(self, req):
+        if self._coordinator is not None:
+            self._coordinator.request_finished(req)
+
+    def on_request_retract(self, req):
+        if self._coordinator is not None:
+            self._coordinator.retract_req(req)
+
+    def on_decode_loc_mapped(self, batch):
+        if self._coordinator is not None:
+            self._coordinator.map_last_loc_to_buffer(
+                batch.seq_lens,
+                batch.out_cache_loc,
+                batch.req_pool_indices,
+                batch.seq_lens_cpu,
+            )
+
+    # -- queries --
+    def query_ready_reqs(self):
+        if self._coordinator is None:
+            return []
+        return self._coordinator.collect_ready_reqs()
+
+    def query_has_ongoing_staging(self):
+        if self._coordinator is None:
+            return False
+        return self._coordinator.has_ongoing_staging()
+
+
+from sglang.srt.managers.forward_hooks_registry import register_forward_hook
+
+register_forward_hook("hisparse", _HiSparseHookAdapter())

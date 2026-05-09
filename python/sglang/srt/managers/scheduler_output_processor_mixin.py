@@ -7,9 +7,6 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.indexer_topk_capturer import (
-    get_global_indexer_capturer,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
@@ -104,6 +101,11 @@ class SchedulerOutputProcessorMixin:
         )
 
     def maybe_collect_indexer_topk(self: Scheduler, req: Req):
+        # Lazy-import to keep DSV4-only indexer module out of non-DSV4 paths.
+        from sglang.srt.layers.attention.indexer_topk_capturer import (
+            get_global_indexer_capturer,
+        )
+
         req.indexer_topk = get_global_indexer_capturer().get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
@@ -189,7 +191,11 @@ class SchedulerOutputProcessorMixin:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                            from sglang.srt.managers.forward_hooks_registry import (
+                                dispatch,
+                            )
+
+                            dispatch("on_request_admit", req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -482,7 +488,11 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                 else:
                     if self.enable_hisparse:
-                        self.hisparse_coordinator.request_finished(req)
+                        from sglang.srt.managers.forward_hooks_registry import (
+                            dispatch,
+                        )
+
+                        dispatch("on_request_finished", req)
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()

@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -62,7 +62,6 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -377,7 +376,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
-    hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    # DSV4 HiSparse coordinator handle, attached by ModelRunner.forward_*
+    # before dispatching. Typed as Any to avoid importing the DSV4-only class
+    # in this base file. See managers/hisparse_coordinator.py.
+    hisparse_coordinator: Optional[Any] = None
 
     @classmethod
     def init_new(

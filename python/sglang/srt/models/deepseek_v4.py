@@ -13,8 +13,61 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
+
+# Side-effect imports: register DSV4 plugins into quant_method_registry,
+# coordinator_registry, pool_registry, forward_hooks_registry. Order matters
+# for quant_method_registry: priority kwarg in each registration enforces
+# mxfp4 (10) → kt_ep (20) wrap order regardless of import order.
+#
+# We wrap each import in try/except: if a sibling plugin (e.g. mxfp4_deepseek
+# with flashinfer < 0.6.9) raises ImportError at module load, we still want
+# DeepseekV4ForCausalLM to register so the model can dispatch through the
+# legacy lazy-import path in Fp8Config.get_quant_method, which surfaces the
+# real error message to the user. The original PR #38 design relied on
+# Fp8Config's lazy import for this; preserving that safety net here.
+import logging as _dsv4_logging
+
+_dsv4_log = _dsv4_logging.getLogger(__name__)
+
+
+def _try_side_effect(import_path):
+    try:
+        __import__(import_path)
+    except Exception as exc:  # noqa: BLE001
+        _dsv4_log.warning(
+            "DSV4 side-effect import failed: %s -> %s. "
+            "DSV4 model will register but the affected plugin may not be "
+            "available; legacy lazy-import paths will surface the real error.",
+            import_path,
+            exc,
+        )
+
+
+_try_side_effect("sglang.srt.layers.quantization.mxfp4_deepseek")
+_try_side_effect("sglang.srt.layers.moe.kt_ep_wrapper")
+_try_side_effect("sglang.srt.managers.hisparse_coordinator")
+_try_side_effect("sglang.srt.mem_cache.deepseekv4_memory_pool")
 from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32, rmsnorm_self
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+
+# Register DSV4 config with HF AutoConfig as a side-effect of loading the
+# DSV4 model. Mirrors what hf_transformers_utils.py does for non-DSV4 configs
+# in its _CONFIG_REGISTRY, but lives here so the DSV4 config dataclass is not
+# imported when DSV4 archs are disabled.
+import contextlib as _contextlib
+from transformers import AutoConfig as _AutoConfig
+
+with _contextlib.suppress(ValueError):
+    _AutoConfig.register(DeepSeekV4Config.model_type, DeepSeekV4Config)
+
+# Register the DSV4 tool-call detector lazily so non-DSV4 servers don't
+# import deepseekv4_detector (and its dependency chain).
+from sglang.srt.function_call.function_call_parser import FunctionCallParser as _FCP
+from sglang.srt.function_call.deepseekv4_detector import (
+    DeepSeekV4Detector as _DeepSeekV4Detector,
+)
+
+_FCP.ToolCallParserEnum.setdefault("deepseekv4", _DeepSeekV4Detector)
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
@@ -24,7 +77,6 @@ from sglang.srt.environ import envs, is_large_dummy_model
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
-    assert_tensor_identical_across_cp_ranks,
     can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -32,6 +84,9 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
+)
+from sglang.srt.layers.attention.nsa.utils_v4 import (
+    assert_tensor_identical_across_cp_ranks,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
@@ -907,6 +962,20 @@ class MQALayer(nn.Module):
         return o
 
 
+class _V4MoE(deepseek_v2.DeepseekV2MoE):
+    """V4-Flash override of DeepseekV2MoE.
+
+    The only V4-specific behavior is that NextN draft layers always bypass
+    hash MoE — the draft head doesn't carry the hash routing weights.
+    Main V4 layers fall back to the base layer-index check.
+    """
+
+    def _compute_is_hash(self, layer_id, n_hash_layers, is_nextn):
+        if is_nextn:
+            return False
+        return super()._compute_is_hash(layer_id, n_hash_layers, is_nextn)
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -942,14 +1011,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
         )
-        self.mlp = deepseek_v2.DeepseekV2MoE(
+        self.mlp = _V4MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
             prefix=add_prefix("mlp", prefix),
             layer_id=self.layer_id,
             alt_stream=alt_streams[0] if alt_streams is not None else None,
             is_nextn=is_nextn,
-            is_deepseek_v4=True,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

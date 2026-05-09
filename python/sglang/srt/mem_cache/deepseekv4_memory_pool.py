@@ -354,6 +354,10 @@ class DeepSeekV4LayerItem(NamedTuple):
 
 
 class DeepSeekV4TokenToKVPool(KVCache):
+    # Tag for duck-type identification without importing the class.
+    # Used by disaggregation/{decode,prefill}.py and other base files
+    # that need `isinstance(pool, DeepSeekV4TokenToKVPool)` semantics.
+    _is_v4_token_pool = True
 
     def __init__(
         self,
@@ -807,3 +811,21 @@ class DeepSeekV4TokenToKVPool(KVCache):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration: makes DeepSeekV4TokenToKVPool available to
+# model_runner_kv_cache_mixin via pool_registry.resolve_kv_pool_factory.
+# Triggered when this module is loaded as a side-effect of importing
+# models/deepseek_v4.py.
+# ---------------------------------------------------------------------------
+
+from sglang.srt.configs.model_config import is_deepseek_compressed
+from sglang.srt.mem_cache.pool_registry import register_kv_pool_factory
+
+
+def _v4_pool_predicate(model_config, server_args):
+    return is_deepseek_compressed(model_config.hf_config)
+
+
+register_kv_pool_factory("deepseek_v4", _v4_pool_predicate, DeepSeekV4TokenToKVPool)

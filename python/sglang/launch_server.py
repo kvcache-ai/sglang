@@ -4,6 +4,60 @@ import asyncio
 import os
 import sys
 
+
+def _sweep_stale_torch_extension_locks():
+    """Remove stale ninja locks under ~/.cache/torch_extensions before any
+    torch.utils.cpp_extension build runs.
+
+    Background: torch's cpp_extension uses ninja to build C++ / CUDA modules
+    JIT. Ninja takes a `lock` / `.ninja_lock` file in the build dir and
+    blocks while it's held. If a previous sglang run was killed mid-build
+    (SIGKILL, OOM, scheduler crash), the lock survives on disk. Subsequent
+    runs hang forever waiting on the orphaned lock with zero CPU/GPU
+    activity — appearing identical to a deadlock.
+
+    Sweeping locks older than `SGLANG_STALE_LOCK_AGE_MINUTES` (default 30
+    minutes; long enough to never interrupt a real build, short enough to
+    auto-recover same-day reruns) eliminates this class of hang at startup.
+    Origin: sglang 本身 (bare-metal kt_1 deployment recovery).
+    """
+    try:
+        import time
+
+        cache_dir = os.path.expanduser(
+            os.environ.get("TORCH_EXTENSIONS_DIR", "~/.cache/torch_extensions")
+        )
+        if not os.path.isdir(cache_dir):
+            return
+        max_age_min = int(os.environ.get("SGLANG_STALE_LOCK_AGE_MINUTES", "30"))
+        if max_age_min <= 0:
+            return
+        cutoff = time.time() - max_age_min * 60
+        swept = 0
+        for root, _dirs, files in os.walk(cache_dir):
+            for name in files:
+                if name not in ("lock", ".ninja_lock"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.unlink(path)
+                        swept += 1
+                except OSError:
+                    pass
+        if swept:
+            print(
+                f"[sglang] swept {swept} stale ninja locks under {cache_dir} "
+                f"(older than {max_age_min}m)",
+                file=sys.stderr,
+            )
+    except Exception:
+        # Best-effort cleanup. Failures here must not block startup.
+        pass
+
+
+_sweep_stale_torch_extension_locks()
+
 # Auto-inject CUDA arch list for flashinfer / torch JIT before sglang imports.
 # flashinfer's fp4 modules and torch C++ extensions JIT-compile cubins at
 # import time using these env vars; on CUDA 12.8 with consumer Blackwell

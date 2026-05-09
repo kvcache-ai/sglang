@@ -6,10 +6,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import einops
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.environ import envs, is_large_dummy_model
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -233,6 +229,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
 
             if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+                from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                    deepseek_v4_moe_code_path_checker,
+                )
+
                 gateup_output = _apply_swiglu_limit(
                     gateup_output, swiglu_limit=self.swiglu_limit
                 )
@@ -338,6 +338,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                 swiglu_limit_arg = self.swiglu_limit
             else:
+                from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                    deepseek_v4_moe_code_path_checker,
+                )
+
                 gateup_output = einops.rearrange(
                     gateup_output, "grp tok hidden -> (grp tok) hidden"
                 )
@@ -707,6 +711,8 @@ def _varlen_deep_gemm_silu_mul_quant(
     )
 
     if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
+        from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
+
         assert N % 4 == 0 and G % 4 == 0
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(

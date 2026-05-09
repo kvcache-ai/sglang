@@ -73,7 +73,6 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -324,7 +323,8 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        # Forward-ref so we don't have to import HiSparseCoordinator (DSV4-only).
+        self.hisparse_coordinator: Optional["HiSparseCoordinator"] = None  # noqa: F821
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -1952,7 +1952,9 @@ class Scheduler(
                 self.stash_chunked_request(self.chunked_req)
 
         if self.enable_hisparse:
-            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            from sglang.srt.managers.forward_hooks_registry import query_collect
+
+            ready_reqs = query_collect("query_ready_reqs")
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
                 if self.running_batch.is_empty():

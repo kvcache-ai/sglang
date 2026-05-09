@@ -12,7 +12,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend_radix import DeepseekV4BackendRadix
 from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLAMultiStepDraftBackend,
@@ -289,7 +288,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             or (
                 _is_cuda
-                and isinstance(self.draft_extend_attn_backend, DeepseekV4BackendRadix)
+                and getattr(self.draft_extend_attn_backend, "_is_dsv4_backend_radix", False)
                 and envs.SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH.get()
             )
         ):

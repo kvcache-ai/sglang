@@ -93,7 +93,6 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -1308,7 +1307,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
 
-    hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    # DSV4 HiSparse coordinator handle. Typed as Any to avoid importing the
+    # DSV4-only class in this base file.
+    hisparse_coordinator: Optional[Any] = None
 
     @classmethod
     def init_new(
@@ -1896,7 +1897,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
-            self.hisparse_coordinator.retract_req(req)
+            from sglang.srt.managers.forward_hooks_registry import dispatch
+
+            dispatch("on_request_retract", req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
@@ -2003,12 +2006,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.map_last_loc_to_buffer(
-                self.seq_lens,
-                self.out_cache_loc,
-                self.req_pool_indices,
-                self.seq_lens_cpu,
-            )
+            from sglang.srt.managers.forward_hooks_registry import dispatch
+
+            dispatch("on_decode_loc_mapped", self)
 
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(

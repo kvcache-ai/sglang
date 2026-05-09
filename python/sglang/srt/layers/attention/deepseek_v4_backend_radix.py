@@ -373,6 +373,10 @@ class _DecodeCudaGraphSharedData:
 
 
 class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBackend):
+    # Tag for duck-type identification — eagle_worker_v2 uses this to
+    # avoid importing DeepseekV4BackendRadix from a base file.
+    _is_dsv4_backend_radix = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
