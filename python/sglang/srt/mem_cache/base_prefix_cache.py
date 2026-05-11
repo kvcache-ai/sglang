@@ -71,10 +71,26 @@ class InsertResult:
 
 
 @dataclasses.dataclass
+class IncLockRefResult:
+    delta: Optional[int] = None
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefParams:
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefResult:
+    delta: Optional[int] = None
+
+
+@dataclasses.dataclass
 class EvictParams:
     """Unified parameters for evict across different cache types"""
 
-    num_tokens: int
+    num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
 
@@ -155,11 +171,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> "IncLockRefResult":
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(
+        self, node: Any, params: Optional["DecLockRefParams"] = None, **kwargs
+    ) -> "DecLockRefResult":
         pass
 
     def evictable_size(self):

@@ -8,8 +8,11 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -123,21 +126,15 @@ class RadixCacheCpp(BasePrefixCache):
 
         raise NotImplementedError("Host cache is not supported yet")
 
-    def dec_lock_ref(self, node: TreeNodeCpp):
-        """
-        Decrement the reference count of a node to root of the radix tree.
-        Args:
-            node (TreeNodeCpp): The handle of the node to decrement the reference count for.
-        """
-        self.tree.lock_ref(node, False)  # do not increment
+    def dec_lock_ref(
+        self, node: TreeNodeCpp, params=None, **kwargs
+    ) -> DecLockRefResult:
+        self.tree.lock_ref(node, False)
+        return DecLockRefResult()
 
-    def inc_lock_ref(self, node: TreeNodeCpp):
-        """
-        Increment the reference count of from a node to root of the radix tree.
-        Args:
-            node (TreeNodeCpp): The handle of the node to increment the reference count for.
-        """
+    def inc_lock_ref(self, node: TreeNodeCpp) -> IncLockRefResult:
         self.tree.lock_ref(node, True)
+        return IncLockRefResult()
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
