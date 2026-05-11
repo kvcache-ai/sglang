@@ -2303,10 +2303,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # it here without waiting. Matches the assert
             # `swiglu_limit == 10` in moe_runner/deep_gemm.py:_apply_swiglu_limit
             # and the default 10.0 set for 2604B in mxfp4_deepseek.py.
+            # Gate on method == "MXFP4" so the V4-only clamp does not leak
+            # into non-MXFP4 kt-MoE models (Qwen3-MoE / MiniMax / Kimi etc.)
+            # sharing this generic wrapper; kt-kernel's
+            # _create_inference_wrapper would otherwise fail-fast on
+            # swiglu_limit != 0 + non-MXFP4.
             # Origin: kt-sglang 耦合 (carries V4-2604B limit into kt-kernel).
             from sglang.srt.environ import envs as _envs
             _kt_swiglu_limit = (
-                10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
+                10.0
+                if self.kt_config.method == "MXFP4"
+                   and _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+                else 0.0
             )
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
@@ -2682,8 +2690,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # MoE forward). The trtllm path bumps it inside its body; the
             # bypass path mirrors that here so the assertion still passes
             # when GPU MoE is short-circuited in favour of CPU experts.
+            # Gate on method == "MXFP4" so non-V4 kt-MoE models do not
+            # pollute the V4-only global counter when this bypass path
+            # fires for them.
+            # Origin: kt-sglang 耦合 (V4-2604B debug counter bump).
             from sglang.srt.environ import envs as _envs
-            if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+            if (
+                self.kt_config.method == "MXFP4"
+                and _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+            ):
                 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
                     deepseek_v4_moe_code_path_checker,
                 )
