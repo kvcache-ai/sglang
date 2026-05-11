@@ -502,9 +502,14 @@ class DeepSeekMxfp4MoEMethod:
                 topk_ids=topk_ids,
                 intermediate_size=layer._v4_tk_intermediate_size,
                 num_experts=layer._v4_tk_num_experts,
-                routed_scaling_factor=rsf if rsf is not None else 1.0,
+                routed_scaling_factor=1.0,
                 swiglu_limit=layer.moe_runner_config.swiglu_limit,
             )
+            # rsf handled here (not inside kernel) to mirror the trtllm path
+            # (line ~638) and avoid double-apply with FUSE_RSF_SHARED_ADD.
+            if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
+                if rsf is not None and rsf != 1.0:
+                    output.mul_(rsf)
             if envs.SGLANG_DSV4_2604_SUBMODE.get() == '2604B' and (
                 self._gemm1_clamp_limit_tensor is not None
             ):
