@@ -839,7 +839,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ) -> None:
-        bucket = _GraphBucket.of(forward_mode)
 
         # FIXME: see cuda_graph_runner — this attribute is set out-of-band.
         fb = self._replay_forward_batch
