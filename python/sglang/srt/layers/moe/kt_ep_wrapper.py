@@ -2517,6 +2517,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        _assert_no_nan_kt(x, "kt.input", getattr(self.kt_config, 'layer_idx', None))  # K1
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
         _kt_timing = (
             os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
@@ -2688,7 +2689,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
-        _assert_no_nan_kt(output, "kt.gpu_experts", getattr(self.kt_config, 'layer_idx', None))
+        # Record GPU NaN status (don't throw yet)
+        _gpu_has_nan = output is not None and torch.isnan(output).any().item()
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -2703,7 +2705,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Use staging_buffer for sync to get correct buffer reference
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
                 cpu_output = self._sync_with_staged_input(staging_buffer)
-                _assert_no_nan_kt(cpu_output, "kt.cpu_experts", getattr(self.kt_config, 'layer_idx', None))
+                # Record CPU NaN status (don't throw yet)
+                _cpu_has_nan = cpu_output is not None and torch.isnan(cpu_output).any().item()
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
                 if not _no_cpu_stream:
@@ -2715,7 +2718,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             output = output + cpu_output
-            _assert_no_nan_kt(output, "kt.merged_output", getattr(self.kt_config, 'layer_idx', None))
+            # Combined NaN check with both GPU and CPU status
+            if _gpu_has_nan or _cpu_has_nan:
+                _layer_idx = getattr(self.kt_config, 'layer_idx', None)
+                raise RuntimeError(
+                    f"NaN in kt experts (layer {_layer_idx}): "
+                    f"gpu_has_nan={_gpu_has_nan}, cpu_has_nan={_cpu_has_nan}, "
+                    f"gpu_shape={output.shape if output is not None else None}, "
+                    f"cpu_shape={cpu_output.shape if cpu_output is not None else None}"
+                )
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU
