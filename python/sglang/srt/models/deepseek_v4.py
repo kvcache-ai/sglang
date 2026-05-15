@@ -12,6 +12,17 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+
+# NaN detection helper for debugging
+def _assert_no_nan(tensor, name, layer_id=None):
+    if torch.isnan(tensor).any():
+        loc = f"{name}" + (f" (layer {layer_id})" if layer_id is not None else "")
+        raise RuntimeError(
+            f"NaN detected at {loc}, shape={tensor.shape}, "
+            f"nan_count={torch.isnan(tensor).sum().item()}"
+        )
+
+
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 
 # Side-effect imports: register DSV4 plugins into quant_method_registry,
@@ -1177,6 +1188,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
         )
+        _assert_no_nan(hidden_states, "self_attn", self.layer_id)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
@@ -1222,6 +1234,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        _assert_no_nan(hidden_states, "mlp", self.layer_id)
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -1343,6 +1356,7 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        _assert_no_nan(hidden_states, "embed_tokens")
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -1415,7 +1429,9 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
+        _assert_no_nan(hidden_states, "hc_head")
         hidden_states = self.norm(hidden_states)
+        _assert_no_nan(hidden_states, "final_norm")
 
         if pre_hc_head is not None:
             return hidden_states, pre_hc_head
@@ -1542,6 +1558,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             and envs.SGLANG_DSV4_MODE.get() == "2604"
         ):
             hidden_states, pre_hc_head = hidden_states
+        _assert_no_nan(hidden_states, "pre_lm_head")
         return self.logits_processor(
             input_ids,
             hidden_states,
