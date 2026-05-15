@@ -40,6 +40,17 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 import torch.distributed as dist
 
+
+# NaN detection helper for debugging
+def _assert_no_nan_kt(tensor, name, layer_id=None):
+    if tensor is not None and torch.isnan(tensor).any():
+        loc = f"{name}" + (f" (layer {layer_id})" if layer_id is not None else "")
+        raise RuntimeError(
+            f"NaN detected at {loc}, shape={tensor.shape}, "
+            f"nan_count={torch.isnan(tensor).sum().item()}"
+        )
+
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -2677,6 +2688,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
+        _assert_no_nan_kt(output, "kt.gpu_experts", getattr(self.kt_config, 'layer_idx', None))
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -2691,6 +2703,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Use staging_buffer for sync to get correct buffer reference
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
                 cpu_output = self._sync_with_staged_input(staging_buffer)
+                _assert_no_nan_kt(cpu_output, "kt.cpu_experts", getattr(self.kt_config, 'layer_idx', None))
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
                 if not _no_cpu_stream:
@@ -2702,6 +2715,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             output = output + cpu_output
+            _assert_no_nan_kt(output, "kt.merged_output", getattr(self.kt_config, 'layer_idx', None))
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU

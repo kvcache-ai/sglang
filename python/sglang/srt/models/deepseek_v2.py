@@ -28,6 +28,16 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+
+# NaN detection helper for debugging
+def _assert_no_nan_moe(tensor, name, layer_id=None):
+    if tensor is not None and torch.isnan(tensor).any():
+        loc = f"{name}" + (f" (layer {layer_id})" if layer_id is not None else "")
+        raise RuntimeError(
+            f"NaN detected at {loc}, shape={tensor.shape}, "
+            f"nan_count={torch.isnan(tensor).sum().item()}"
+        )
+
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -765,10 +775,13 @@ class DeepseekV2MoE(nn.Module):
                 shared_output = self._forward_shared_experts(
                     hidden_states, gemm_output_zero_allocator
                 )
+                _assert_no_nan_moe(shared_output, "moe.shared_experts", self.layer_id)
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            _assert_no_nan_moe(router_logits, "moe.gate", self.layer_id)
             topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
             topk_output = self.topk(hidden_states, router_logits, **topk_kwargs)
+            _assert_no_nan_moe(topk_output.topk_weights, "moe.topk_weights", self.layer_id)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -807,6 +820,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_states,
             topk_output,
         )
+        _assert_no_nan_moe(final_hidden_states, "moe.experts", self.layer_id)
         if (
             not _is_cuda
             and not _use_aiter
@@ -828,6 +842,7 @@ class DeepseekV2MoE(nn.Module):
         else:
             if shared_output is not None:
                 final_hidden_states += shared_output
+        _assert_no_nan_moe(final_hidden_states, "moe.final_output", self.layer_id)
 
         if (
             self.tp_size > 1
