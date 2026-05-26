@@ -14,12 +14,15 @@
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
+import json
 import logging
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 # Configs
@@ -80,6 +83,139 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 cached_get_processor = lru_cache(get_processor)
+
+
+_LORA_PREFIXES = ("", "base_model.", "base_model.model.", "base_model.model.model.")
+
+
+def _load_kt_lora_config(adapter_path: str) -> Tuple[int, float]:
+    config_path = Path(adapter_path) / "adapter_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"KT LoRA adapter config not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    rank = int(config["r"])
+    alpha = float(config.get("lora_alpha", rank))
+    return rank, alpha
+
+
+def _load_kt_lora_state_dict(adapter_path: str) -> Dict[str, torch.Tensor]:
+    from safetensors.torch import load_file
+
+    adapter_dir = Path(adapter_path)
+    weight_file = adapter_dir / "adapter_model.safetensors"
+    if not weight_file.is_file():
+        candidates = sorted(adapter_dir.glob("*.safetensors"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"No safetensors adapter weights found under {adapter_dir}"
+            )
+        weight_file = candidates[0]
+    return load_file(str(weight_file), device="cpu")
+
+
+def _find_lora_tensor(
+    state_dict: Dict[str, torch.Tensor],
+    suffix: str,
+) -> Tuple[Optional[str], Optional[torch.Tensor]]:
+    for prefix in _LORA_PREFIXES:
+        key = prefix + suffix
+        if key in state_dict:
+            return key, state_dict[key]
+    matches = [(key, tensor) for key, tensor in state_dict.items() if key.endswith(suffix)]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous KT LoRA tensor suffix {suffix!r}: {[x[0] for x in matches[:4]]}")
+    if matches:
+        return matches[0]
+    return None, None
+
+
+def _get_lora_pair(
+    state_dict: Dict[str, torch.Tensor],
+    consumed_keys: Set[str],
+    layer_id: int,
+    block_name: str,
+    proj_name: str,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    base = f"model.layers.{layer_id}.{block_name}.{proj_name}"
+    key_a, tensor_a = _find_lora_tensor(state_dict, f"{base}.lora_A.weight")
+    key_b, tensor_b = _find_lora_tensor(state_dict, f"{base}.lora_B.weight")
+    if tensor_a is None and tensor_b is None:
+        key_a, tensor_a = _find_lora_tensor(state_dict, f"{base}.lora_A.default.weight")
+        key_b, tensor_b = _find_lora_tensor(state_dict, f"{base}.lora_B.default.weight")
+    if (tensor_a is None) != (tensor_b is None):
+        raise ValueError(f"Incomplete KT LoRA pair for {base}")
+    if tensor_a is None or tensor_b is None:
+        return None
+    consumed_keys.add(key_a)
+    consumed_keys.add(key_b)
+    return tensor_a, tensor_b
+
+
+def _as_lora_weight(
+    tensor: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return tensor.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+
+
+def _slice_column_lora_b(
+    tensor: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    shard = tensor.shape[0] // tp_size
+    return tensor[tp_rank * shard : (tp_rank + 1) * shard, :]
+
+
+def _slice_merged_column_lora_b(
+    tensor: torch.Tensor,
+    output_sizes: Tuple[int, ...],
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    shards = []
+    offset = 0
+    for size in output_sizes:
+        shard = size // tp_size
+        shards.append(tensor[offset + tp_rank * shard : offset + (tp_rank + 1) * shard, :])
+        offset += size
+    return torch.cat(shards, dim=0).contiguous()
+
+
+def _slice_row_lora_a(
+    tensor: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    shard = tensor.shape[1] // tp_size
+    return tensor[:, tp_rank * shard : (tp_rank + 1) * shard]
+
+
+def _slice_full_attention_kv_lora_b(
+    tensor: torch.Tensor,
+    total_kv_heads: int,
+    head_dim: int,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor:
+    if total_kv_heads >= tp_size:
+        shard = tensor.shape[0] // tp_size
+        return tensor[tp_rank * shard : (tp_rank + 1) * shard, :]
+    replicas = tp_size // total_kv_heads
+    kv_rank = tp_rank // replicas
+    start = kv_rank * head_dim
+    return tensor[start : start + head_dim, :]
+
+
+def _lora_delta(
+    hidden_states: torch.Tensor,
+    lora_a: torch.Tensor,
+    lora_b: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    return F.linear(F.linear(hidden_states, lora_a), lora_b) * scale
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -233,6 +369,64 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+        self._kt_lora_scale: Optional[float] = None
+        self._kt_lora_in_proj_qkv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._kt_lora_in_proj_z: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._kt_lora_in_proj_b: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._kt_lora_in_proj_a: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._kt_lora_out_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def load_kt_lora(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        consumed_keys: Set[str],
+        rank: int,
+        alpha: float,
+    ) -> int:
+        device = self.in_proj_qkv.weight.device
+        dtype = self.in_proj_qkv.weight.dtype
+        self._kt_lora_scale = alpha / float(rank or 1)
+        loaded = 0
+
+        def set_column(name: str, attr: str, output_sizes: Tuple[int, ...]) -> None:
+            nonlocal loaded
+            pair = _get_lora_pair(state_dict, consumed_keys, self.layer_id, "linear_attn", name)
+            if pair is None:
+                return
+            lora_a, lora_b = pair
+            lora_b = (
+                _slice_merged_column_lora_b(lora_b, output_sizes, self.attn_tp_rank, self.attn_tp_size)
+                if len(output_sizes) > 1
+                else _slice_column_lora_b(lora_b, self.attn_tp_rank, self.attn_tp_size)
+            )
+            setattr(
+                self,
+                attr,
+                (
+                    _as_lora_weight(lora_a, device, dtype),
+                    _as_lora_weight(lora_b, device, dtype),
+                ),
+            )
+            loaded += 1
+
+        set_column("in_proj_qkv", "_kt_lora_in_proj_qkv", (self.key_dim, self.key_dim, self.value_dim))
+        set_column("in_proj_z", "_kt_lora_in_proj_z", (self.value_dim,))
+        set_column("in_proj_b", "_kt_lora_in_proj_b", (self.num_v_heads,))
+        set_column("in_proj_a", "_kt_lora_in_proj_a", (self.num_v_heads,))
+
+        pair = _get_lora_pair(state_dict, consumed_keys, self.layer_id, "linear_attn", "out_proj")
+        if pair is not None:
+            lora_a, lora_b = pair
+            self._kt_lora_out_proj = (
+                _as_lora_weight(
+                    _slice_row_lora_a(lora_a, self.attn_tp_rank, self.attn_tp_size),
+                    device,
+                    dtype,
+                ),
+                _as_lora_weight(lora_b, device, dtype),
+            )
+            loaded += 1
+        return loaded
 
     def fix_query_key_value_ordering(
         self,
@@ -259,10 +453,38 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         seq_len, _ = hidden_states.shape
 
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+        if self._kt_lora_in_proj_qkv is not None:
+            mixed_qkv = mixed_qkv + _lora_delta(
+                hidden_states,
+                self._kt_lora_in_proj_qkv[0],
+                self._kt_lora_in_proj_qkv[1],
+                self._kt_lora_scale,
+            )
         z, _ = self.in_proj_z(hidden_states)
+        if self._kt_lora_in_proj_z is not None:
+            z = z + _lora_delta(
+                hidden_states,
+                self._kt_lora_in_proj_z[0],
+                self._kt_lora_in_proj_z[1],
+                self._kt_lora_scale,
+            )
         z = z.reshape(z.size(0), -1, self.head_v_dim)
         b, _ = self.in_proj_b(hidden_states)
+        if self._kt_lora_in_proj_b is not None:
+            b = b + _lora_delta(
+                hidden_states,
+                self._kt_lora_in_proj_b[0],
+                self._kt_lora_in_proj_b[1],
+                self._kt_lora_scale,
+            )
         a, _ = self.in_proj_a(hidden_states)
+        if self._kt_lora_in_proj_a is not None:
+            a = a + _lora_delta(
+                hidden_states,
+                self._kt_lora_in_proj_a[0],
+                self._kt_lora_in_proj_a[1],
+                self._kt_lora_scale,
+            )
 
         b = b.contiguous()
         a = a.contiguous()
@@ -281,6 +503,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
+        if self._kt_lora_out_proj is not None:
+            output = output + _lora_delta(
+                core_attn_out,
+                self._kt_lora_out_proj[0],
+                self._kt_lora_out_proj[1],
+                self._kt_lora_scale,
+            )
         return output
 
 
@@ -545,6 +774,73 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
         self.alt_stream = alt_stream
+        self._kt_lora_scale: Optional[float] = None
+        self._kt_lora_q_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._kt_lora_k_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._kt_lora_v_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._kt_lora_o_proj: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    def load_kt_lora(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        consumed_keys: Set[str],
+        rank: int,
+        alpha: float,
+    ) -> int:
+        device = self.qkv_proj.weight.device
+        dtype = self.qkv_proj.weight.dtype
+        self._kt_lora_scale = alpha / float(rank or 1)
+        loaded = 0
+
+        q_pair = _get_lora_pair(state_dict, consumed_keys, self.layer_id, "self_attn", "q_proj")
+        if q_pair is not None:
+            lora_a, lora_b = q_pair
+            q_out_per_rank = self.q_size * (2 if self.attn_output_gate else 1)
+            lora_b = lora_b[
+                self.attn_tp_rank * q_out_per_rank : (self.attn_tp_rank + 1) * q_out_per_rank,
+                :,
+            ]
+            self._kt_lora_q_proj = (
+                _as_lora_weight(lora_a, device, dtype),
+                _as_lora_weight(lora_b, device, dtype),
+            )
+            loaded += 1
+
+        for proj_name, attr in (("k_proj", "_kt_lora_k_proj"), ("v_proj", "_kt_lora_v_proj")):
+            pair = _get_lora_pair(state_dict, consumed_keys, self.layer_id, "self_attn", proj_name)
+            if pair is None:
+                continue
+            lora_a, lora_b = pair
+            lora_b = _slice_full_attention_kv_lora_b(
+                lora_b,
+                self.total_num_kv_heads,
+                self.head_dim,
+                self.attn_tp_rank,
+                self.attn_tp_size,
+            )
+            setattr(
+                self,
+                attr,
+                (
+                    _as_lora_weight(lora_a, device, dtype),
+                    _as_lora_weight(lora_b, device, dtype),
+                ),
+            )
+            loaded += 1
+
+        o_pair = _get_lora_pair(state_dict, consumed_keys, self.layer_id, "self_attn", "o_proj")
+        if o_pair is not None:
+            lora_a, lora_b = o_pair
+            self._kt_lora_o_proj = (
+                _as_lora_weight(
+                    _slice_row_lora_a(lora_a, self.attn_tp_rank, self.attn_tp_size),
+                    device,
+                    dtype,
+                ),
+                _as_lora_weight(lora_b, device, dtype),
+            )
+            loaded += 1
+        return loaded
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -576,6 +872,40 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
+        if self._kt_lora_scale is not None:
+            qkv_delta_parts = []
+            for pair in (
+                self._kt_lora_q_proj,
+                self._kt_lora_k_proj,
+                self._kt_lora_v_proj,
+            ):
+                if pair is None:
+                    qkv_delta_parts.append(None)
+                else:
+                    qkv_delta_parts.append(
+                        _lora_delta(hidden_states, pair[0], pair[1], self._kt_lora_scale)
+                    )
+            if any(part is not None for part in qkv_delta_parts):
+                q_delta, k_delta, v_delta = qkv_delta_parts
+                if q_delta is None:
+                    q_delta = torch.zeros(
+                        qkv.shape[:-1] + ((self.q_size * (2 if self.attn_output_gate else 1)),),
+                        dtype=qkv.dtype,
+                        device=qkv.device,
+                    )
+                if k_delta is None:
+                    k_delta = torch.zeros(
+                        qkv.shape[:-1] + (self.kv_size,),
+                        dtype=qkv.dtype,
+                        device=qkv.device,
+                    )
+                if v_delta is None:
+                    v_delta = torch.zeros(
+                        qkv.shape[:-1] + (self.kv_size,),
+                        dtype=qkv.dtype,
+                        device=qkv.device,
+                    )
+                qkv = qkv + torch.cat((q_delta, k_delta, v_delta), dim=-1)
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -598,6 +928,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             attn_output = attn_output * gate
 
         output, _ = self.o_proj(attn_output)
+        if self._kt_lora_o_proj is not None:
+            output = output + _lora_delta(
+                attn_output,
+                self._kt_lora_o_proj[0],
+                self._kt_lora_o_proj[1],
+                self._kt_lora_scale,
+            )
         return output
 
     def forward(
@@ -707,6 +1044,44 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
+
+    def load_kt_lora(self, adapter_path: str) -> None:
+        rank, alpha = _load_kt_lora_config(adapter_path)
+        state_dict = _load_kt_lora_state_dict(adapter_path)
+        consumed_keys: Set[str] = set()
+        loaded_modules = 0
+
+        for layer_id, layer in enumerate(self.layers):
+            if hasattr(layer, "linear_attn"):
+                loaded_modules += layer.linear_attn.load_kt_lora(
+                    state_dict, consumed_keys, rank, alpha
+                )
+            elif hasattr(layer, "load_kt_lora"):
+                loaded_modules += layer.load_kt_lora(
+                    state_dict, consumed_keys, rank, alpha
+                )
+
+        expert_tensors = sum(".mlp.experts." in key for key in state_dict)
+        unknown_nonexpert = sorted(
+            key
+            for key in state_dict
+            if ".mlp.experts." not in key and key not in consumed_keys
+        )
+        if unknown_nonexpert:
+            raise ValueError(
+                "Unrecognized KT non-expert LoRA tensors: "
+                + ", ".join(unknown_nonexpert[:8])
+            )
+        logger.info(
+            "Loaded static KT non-expert LoRA from %s: modules=%d tensors=%d "
+            "expert_tensors_skipped=%d rank=%d alpha=%.3f",
+            adapter_path,
+            loaded_modules,
+            len(consumed_keys),
+            expert_tensors,
+            rank,
+            alpha,
+        )
 
     @torch.no_grad()
     def forward(
@@ -1054,6 +1429,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def load_kt_lora(self, adapter_path: str) -> None:
+        self.model.load_kt_lora(adapter_path)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1153,6 +1531,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def load_kt_lora(self, adapter_path: str) -> None:
+        self.model.load_kt_lora(adapter_path)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

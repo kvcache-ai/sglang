@@ -564,6 +564,8 @@ class ServerArgs:
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
     kt_expert_placement_strategy: str = "uniform"
+    kt_lora_path: Optional[str] = None
+    kt_expert_lora_path: Optional[str] = None
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -737,6 +739,32 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+
+        if self.max_running_requests is not None and self.max_running_requests < 2:
+            logger.warning(
+                "max_running_requests=%d leaves no usable request slots in this "
+                "SGLang fork; setting it to 2.",
+                self.max_running_requests,
+            )
+            self.max_running_requests = 2
+
+        if self.kt_lora_path:
+            if (
+                self.kt_expert_lora_path
+                and self.kt_expert_lora_path != self.kt_lora_path
+            ):
+                raise ValueError(
+                    "--kt-lora-path and --kt-expert-lora-path cannot point to "
+                    "different adapters in the static single-adapter implementation."
+                )
+            self.kt_expert_lora_path = self.kt_lora_path
+
+        if (self.kt_lora_path or self.kt_expert_lora_path) and not self.disable_cuda_graph:
+            logger.warning(
+                "Cuda graph is disabled because KT LoRA uses "
+                "KT SFT CPU expert forward with host-side input copies."
+            )
+            self.disable_cuda_graph = True
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -4583,6 +4611,23 @@ class ServerArgs:
                  "front-loading: Fill layers from first MoE layer onwards. "
                  "uniform: Equal experts per layer. "
                  "random: Random placement with fixed seed.",
+        )
+        parser.add_argument(
+            "--kt-lora-path",
+            type=str,
+            default=ServerArgs.kt_lora_path,
+            help="[experimental ktransformers parameter] Single PEFT adapter directory "
+                 "for static full KT LoRA. Expert tensors are served by the KT CPU "
+                 "SFT path and Qwen3.5 non-expert tensors are applied statically in "
+                 "the model forward.",
+        )
+        parser.add_argument(
+            "--kt-expert-lora-path",
+            type=str,
+            default=ServerArgs.kt_expert_lora_path,
+            help="[experimental ktransformers parameter] Single PEFT adapter directory "
+                 "for KT CPU expert LoRA. This bypasses SGLang's normal LoRA manager "
+                 "for expert weights and runs the KT CPU expert path through forward_sft.",
         )
 
         # Diffusion LLM

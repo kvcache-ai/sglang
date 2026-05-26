@@ -499,6 +499,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        if self.server_args.kt_lora_path:
+            if not hasattr(self.model, "load_kt_lora"):
+                raise ValueError(
+                    f"{type(self.model).__name__} does not support --kt-lora-path."
+                )
+            self.model.load_kt_lora(self.server_args.kt_lora_path)
 
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
