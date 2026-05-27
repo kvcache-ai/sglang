@@ -68,6 +68,7 @@ class LoRAMemoryPool:
         self.lora_added_tokens_size: int = lora_added_tokens_size
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
+        self.base_model: torch.nn.Module = base_model
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -395,6 +396,61 @@ class LoRAMemoryPool:
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 buffer_view.copy_(weight, non_blocking=True)
 
+        def get_column_output_sizes(target_module: str) -> Optional[Tuple[int, ...]]:
+            config = self.base_hf_config
+            if target_module == "qkv_proj":
+                hidden_size = config.hidden_size
+                head_dim = getattr(
+                    config, "head_dim", hidden_size // config.num_attention_heads
+                )
+                gate_multiplier = 1 + int(getattr(config, "attn_output_gate", False))
+                q_dim = config.num_attention_heads * head_dim * gate_multiplier
+                kv_dim = config.num_key_value_heads * head_dim
+                return q_dim, kv_dim, kv_dim
+            if target_module == "in_proj_qkv":
+                key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+                value_dim = (
+                    config.linear_num_value_heads * config.linear_value_head_dim
+                )
+                return key_dim, key_dim, value_dim
+            if target_module == "gate_up_proj":
+                _, output_dim = get_hidden_dim(
+                    target_module, self.base_hf_config, self.base_model, 0
+                )
+                return output_dim // 2, output_dim // 2
+            return None
+
+        def slice_column_lora_b_if_needed(
+            target_module: str,
+            weights: Optional[torch.Tensor],
+            expected_shape: torch.Size,
+        ) -> Optional[torch.Tensor]:
+            if weights is None or weights.shape == expected_shape:
+                return weights
+            if weights.ndim != 2 or weights.shape[1] != expected_shape[1]:
+                return weights
+
+            output_sizes = get_column_output_sizes(target_module)
+            if output_sizes is not None and sum(output_sizes) == weights.shape[0]:
+                shards = []
+                offset = 0
+                for output_size in output_sizes:
+                    shard_size = output_size // self.tp_size
+                    start_idx = offset + self.tp_rank * shard_size
+                    end_idx = start_idx + shard_size
+                    shards.append(weights[start_idx:end_idx, :])
+                    offset += output_size
+                sliced = torch.cat(shards, dim=0).contiguous()
+                if sliced.shape == expected_shape:
+                    return sliced
+
+            if weights.shape[0] == expected_shape[0] * self.tp_size:
+                start_idx = self.tp_rank * expected_shape[0]
+                end_idx = start_idx + expected_shape[0]
+                return weights[start_idx:end_idx, :].contiguous()
+
+            return weights
+
         if uid is None:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
@@ -440,6 +496,40 @@ class LoRAMemoryPool:
                     )
                     temp_B_buffer[target_module] = module.slice_lora_b_weights(
                         temp_B_buffer[target_module], self.tp_rank
+                    )
+
+                for target_module in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+                    weights = temp_A_buffer.get(target_module)
+                    if weights is None or target_module not in self.A_buffer:
+                        continue
+
+                    c = get_stacked_multiply(target_module)
+                    expected_shape = self.A_buffer[target_module][layer_id][
+                        buffer_id, : lora_rank * c, :
+                    ].shape
+                    if weights.shape == expected_shape:
+                        continue
+                    if (
+                        weights.ndim == 2
+                        and weights.shape[0] == expected_shape[0]
+                        and weights.shape[1] == expected_shape[1] * self.tp_size
+                    ):
+                        start_idx = self.tp_rank * expected_shape[1]
+                        end_idx = start_idx + expected_shape[1]
+                        temp_A_buffer[target_module] = weights[
+                            :, start_idx:end_idx
+                        ].contiguous()
+
+                for target_module, weights in temp_B_buffer.items():
+                    if weights is None:
+                        continue
+                    expected_shape = self.B_buffer[target_module][layer_id][
+                        buffer_id, :, :lora_rank
+                    ].shape
+                    temp_B_buffer[target_module] = slice_column_lora_b_if_needed(
+                        target_module,
+                        weights,
+                        expected_shape,
                     )
 
             for name, weights in temp_A_buffer.items():

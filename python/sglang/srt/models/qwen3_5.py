@@ -16,6 +16,7 @@
 
 import json
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Set, Tuple, Union
@@ -86,6 +87,12 @@ cached_get_processor = lru_cache(get_processor)
 
 
 _LORA_PREFIXES = ("", "base_model.", "base_model.model.", "base_model.model.model.")
+_QWEN3_5_LORA_PATTERN = re.compile(
+    r"^model(?:\.language_model)?\.layers\.(\d+)\.(?:"
+    r"self_attn\.(?:qkv_proj|o_proj)|"
+    r"linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)"
+    r")$"
+)
 
 
 def _load_kt_lora_config(adapter_path: str) -> Tuple[int, float]:
@@ -1045,6 +1052,58 @@ class Qwen3_5ForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        config = self.config
+        hidden_size = config.hidden_size
+
+        head_dim = getattr(
+            config, "head_dim", hidden_size // config.num_attention_heads
+        )
+        attn_gate_multiplier = 1 + int(getattr(config, "attn_output_gate", True))
+        full_q_dim = config.num_attention_heads * head_dim * attn_gate_multiplier
+        full_kv_dim = config.num_key_value_heads * head_dim
+
+        linear_key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+        linear_value_dim = (
+            config.linear_num_value_heads * config.linear_value_head_dim
+        )
+        intermediate_size = getattr(config, "intermediate_size", None)
+        if intermediate_size is None:
+            intermediate_size = getattr(config, "moe_intermediate_size", None)
+
+        if module_name == "qkv_proj":
+            return hidden_size, full_q_dim + 2 * full_kv_dim
+        elif module_name == "o_proj":
+            return config.num_attention_heads * head_dim, hidden_size
+        elif module_name == "in_proj_qkv":
+            return hidden_size, 2 * linear_key_dim + linear_value_dim
+        elif module_name == "in_proj_z":
+            return hidden_size, linear_value_dim
+        elif module_name in ("in_proj_b", "in_proj_a"):
+            return hidden_size, config.linear_num_value_heads
+        elif module_name == "out_proj":
+            return linear_value_dim, hidden_size
+        elif module_name == "gate_up_proj":
+            if intermediate_size is None:
+                raise NotImplementedError(
+                    "Qwen3.5 config does not define an MLP intermediate size"
+                )
+            return hidden_size, intermediate_size * 2
+        elif module_name == "down_proj":
+            if intermediate_size is None:
+                raise NotImplementedError(
+                    "Qwen3.5 config does not define an MLP intermediate size"
+                )
+            return intermediate_size, hidden_size
+        elif module_name == "embed_tokens":
+            return config.vocab_size, hidden_size
+        elif module_name == "lm_head":
+            return hidden_size, config.vocab_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
     def load_kt_lora(self, adapter_path: str) -> None:
         rank, alpha = _load_kt_lora_config(adapter_path)
         state_dict = _load_kt_lora_state_dict(adapter_path)
@@ -1432,6 +1491,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def load_kt_lora(self, adapter_path: str) -> None:
         self.model.load_kt_lora(adapter_path)
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(_QWEN3_5_LORA_PATTERN.match(module_name))
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1534,6 +1599,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def load_kt_lora(self, adapter_path: str) -> None:
         self.model.load_kt_lora(adapter_path)
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(_QWEN3_5_LORA_PATTERN.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

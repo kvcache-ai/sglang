@@ -132,6 +132,10 @@ def get_normalized_target_modules(
     result = set()
     for name in target_modules:
         base_name = name.split(".")[-1]
+        # Qwen3.5 split GatedDeltaNet modules such as in_proj_qkv,
+        # in_proj_z, in_proj_b, in_proj_a, and out_proj are intentionally
+        # preserved here. Only the legacy checkpoint-side q/k/v and gate/up
+        # names are normalized to SGLang fused module names.
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
@@ -164,7 +168,7 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "out_proj"]
 
 
 def generate_sequence_lengths(
