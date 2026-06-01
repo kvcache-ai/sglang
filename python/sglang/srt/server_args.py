@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -24,6 +25,7 @@ import logging
 import os
 import random
 import tempfile
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import orjson
@@ -72,6 +74,169 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file, get_config
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+KT_EXPERT_LORA_MODULES = {"gate_proj", "up_proj", "down_proj"}
+KT_COMPOSITE_LORA_CACHE_VERSION = "v1"
+
+
+def _infer_lora_target_module_from_key(key: str) -> Optional[str]:
+    if "lora_embedding_A" in key or "lora_embedding_B" in key:
+        if "embed_tokens" in key:
+            return "embed_tokens"
+        if "lm_head" in key or "unembed_tokens" in key:
+            return "lm_head"
+
+    marker = ".lora_"
+    if marker not in key:
+        return None
+    prefix = key.split(marker, 1)[0]
+    if "." not in prefix:
+        return prefix
+    return prefix.rsplit(".", 1)[-1]
+
+
+def _is_kt_expert_lora_key(key: str) -> bool:
+    return ".mlp.experts." in key and any(
+        f".{module}." in key for module in KT_EXPERT_LORA_MODULES
+    )
+
+
+def _ordered_lora_target_modules(modules: set[str]) -> List[str]:
+    preferred = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_b",
+        "in_proj_a",
+        "out_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+    ordered = [name for name in preferred if name in modules]
+    ordered.extend(sorted(modules.difference(ordered)))
+    return ordered
+
+
+def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str, str]]:
+    """Split a merged KT MoE LoRA adapter into runtime expert/non-expert dirs.
+
+    Returns (expert_dir, nonexpert_dir) when adapter_path is a local merged KT
+    adapter. Returns None for ordinary LoRA adapters.
+    """
+    adapter_dir = Path(adapter_path).expanduser().resolve()
+    weight_path = adapter_dir / "adapter_model.safetensors"
+    config_path = adapter_dir / "adapter_config.json"
+    if not adapter_dir.is_dir() or not weight_path.is_file() or not config_path.is_file():
+        return None
+
+    try:
+        from safetensors.torch import load_file, save_file
+    except Exception as exc:
+        raise RuntimeError(
+            "safetensors is required to prepare a merged KT LoRA adapter."
+        ) from exc
+
+    try:
+        tensors = load_file(str(weight_path), device="cpu")
+    except Exception:
+        # Let the normal LoRA loader handle non-safetensors or malformed adapters.
+        return None
+
+    expert_keys = [key for key in tensors if _is_kt_expert_lora_key(key)]
+    if not expert_keys:
+        return None
+
+    nonexpert_keys = [key for key in tensors if key not in expert_keys]
+    if not nonexpert_keys:
+        raise ValueError(
+            f"KT composite LoRA adapter {adapter_dir} contains expert tensors "
+            "but no non-expert tensors for SGLang --lora-paths."
+        )
+
+    digest = hashlib.sha256()
+    digest.update(KT_COMPOSITE_LORA_CACHE_VERSION.encode())
+    digest.update(str(adapter_dir).encode())
+    for path in (weight_path, config_path):
+        stat = path.stat()
+        digest.update(str(stat.st_mtime_ns).encode())
+        digest.update(str(stat.st_size).encode())
+    cache_root = (
+        Path(os.environ.get("SGLANG_KT_LORA_CACHE_DIR", ""))
+        if os.environ.get("SGLANG_KT_LORA_CACHE_DIR")
+        else Path(tempfile.gettempdir()) / "sglang_kt_lora_cache"
+    )
+    cache_dir = cache_root / digest.hexdigest()[:16]
+    expert_dir = cache_dir / "expert"
+    nonexpert_dir = cache_dir / "nonexpert"
+
+    if (
+        (expert_dir / "adapter_model.safetensors").is_file()
+        and (expert_dir / "adapter_config.json").is_file()
+        and (nonexpert_dir / "adapter_model.safetensors").is_file()
+        and (nonexpert_dir / "adapter_config.json").is_file()
+    ):
+        return str(expert_dir), str(nonexpert_dir)
+
+    with config_path.open("r", encoding="utf-8") as f:
+        base_config = json.load(f)
+
+    expert_targets = {
+        target
+        for key in expert_keys
+        if (target := _infer_lora_target_module_from_key(key)) is not None
+    }
+    nonexpert_targets = {
+        target
+        for key in nonexpert_keys
+        if (target := _infer_lora_target_module_from_key(key)) is not None
+    }
+    if not expert_targets:
+        expert_targets = set(KT_EXPERT_LORA_MODULES)
+
+    expert_config = dict(base_config)
+    expert_config["target_modules"] = _ordered_lora_target_modules(expert_targets)
+    expert_config["kt_adapter_format"] = "qwen3_5_moe_expert"
+
+    nonexpert_config = dict(base_config)
+    nonexpert_config["target_modules"] = _ordered_lora_target_modules(nonexpert_targets)
+    nonexpert_config["kt_adapter_format"] = "qwen3_5_moe_nonexpert"
+
+    expert_dir.mkdir(parents=True, exist_ok=True)
+    nonexpert_dir.mkdir(parents=True, exist_ok=True)
+    save_file(
+        {key: tensors[key] for key in expert_keys},
+        str(expert_dir / "adapter_model.safetensors"),
+        metadata={"format": "pt"},
+    )
+    save_file(
+        {key: tensors[key] for key in nonexpert_keys},
+        str(nonexpert_dir / "adapter_model.safetensors"),
+        metadata={"format": "pt"},
+    )
+    for output_dir, config in (
+        (expert_dir, expert_config),
+        (nonexpert_dir, nonexpert_config),
+    ):
+        with (output_dir / "adapter_config.json").open("w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+    logger.info(
+        "Prepared merged KT LoRA adapter %s for runtime: expert=%s (%d tensors), "
+        "nonexpert=%s (%d tensors)",
+        adapter_dir,
+        expert_dir,
+        len(expert_keys),
+        nonexpert_dir,
+        len(nonexpert_keys),
+    )
+    return str(expert_dir), str(nonexpert_dir)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -3937,7 +4102,14 @@ class ServerArgs:
             nargs="*",
             default=None,
             action=LoRAPathAction,
-            help='The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: <PATH> | <NAME>=<PATH> | JSON with schema {"lora_name":str,"lora_path":str,"pinned":bool}',
+            help=(
+                "The list of LoRA adapters to load. Each adapter must be specified "
+                'in one of the following formats: <PATH> | <NAME>=<PATH> | JSON '
+                'with schema {"lora_name":str,"lora_path":str,"pinned":bool}. '
+                "For KT Qwen3.5 MoE, <PATH> may be a merged adapter directory; "
+                "it will be split internally into KT expert and SGLang non-expert "
+                "runtime adapters."
+            ),
         )
         parser.add_argument(
             "--max-loras-per-batch",
@@ -5657,6 +5829,62 @@ class ServerArgs:
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
                     "Expected a list or a dictionary."
                 )
+
+            kt_composite_lora_ref: Optional[LoRARef] = None
+            kt_composite_expert_path: Optional[str] = None
+            rewritten_lora_paths: List[LoRARef] = []
+            for lora_ref in self.lora_paths:
+                prepared = _prepare_kt_composite_lora_adapter(lora_ref.lora_path)
+                if prepared is None:
+                    rewritten_lora_paths.append(lora_ref)
+                    continue
+
+                if kt_composite_lora_ref is not None:
+                    raise ValueError(
+                        "Only one merged KT composite LoRA adapter is supported "
+                        "in the current single-adapter implementation."
+                    )
+                if len(self.lora_paths) != 1:
+                    raise ValueError(
+                        "Merged KT composite LoRA cannot be mixed with other "
+                        "LoRA adapters in the current single-adapter implementation."
+                    )
+                if self.kt_expert_lora_path:
+                    raise ValueError(
+                        "--lora-paths with a merged KT composite adapter cannot be "
+                        "combined with --kt-expert-lora-path. Pass only "
+                        "--lora-paths <name>=<merged_adapter_dir>."
+                    )
+
+                expert_path, nonexpert_path = prepared
+                kt_composite_lora_ref = lora_ref
+                kt_composite_expert_path = expert_path
+                rewritten_lora_paths.append(
+                    LoRARef(
+                        lora_id=lora_ref.lora_id,
+                        lora_name=lora_ref.lora_name,
+                        lora_path=nonexpert_path,
+                        pinned=lora_ref.pinned,
+                    )
+                )
+
+            if kt_composite_lora_ref is not None:
+                self.lora_paths = rewritten_lora_paths
+                self.kt_expert_lora_path = kt_composite_expert_path
+                logger.warning(
+                    "Using merged KT composite LoRA adapter %s as %s. "
+                    "The adapter is internally split into expert/non-expert "
+                    "runtime directories. In this first implementation the KT "
+                    "expert LoRA is loaded statically at server startup.",
+                    kt_composite_lora_ref.lora_path,
+                    kt_composite_lora_ref.lora_name,
+                )
+                if not self.disable_cuda_graph:
+                    logger.warning(
+                        "Cuda graph is disabled because KT expert LoRA uses "
+                        "KT SFT CPU expert forward with host-side input copies."
+                    )
+                    self.disable_cuda_graph = True
 
             # Expand target modules
             if self.lora_target_modules:
