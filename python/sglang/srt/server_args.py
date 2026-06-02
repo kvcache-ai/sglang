@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import getpass
 import hashlib
 import importlib
 import importlib.util
@@ -169,7 +170,8 @@ def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str,
     cache_root = (
         Path(os.environ.get("SGLANG_KT_LORA_CACHE_DIR", ""))
         if os.environ.get("SGLANG_KT_LORA_CACHE_DIR")
-        else Path(tempfile.gettempdir()) / "sglang_kt_lora_cache"
+        else Path(tempfile.gettempdir())
+        / f"sglang_kt_lora_cache_{getpass.getuser()}"
     )
     cache_dir = cache_root / digest.hexdigest()[:16]
     expert_dir = cache_dir / "expert"
@@ -904,14 +906,6 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
-
-        if self.max_running_requests is not None and self.max_running_requests < 2:
-            logger.warning(
-                "max_running_requests=%d leaves no usable request slots in this "
-                "SGLang fork; setting it to 2.",
-                self.max_running_requests,
-            )
-            self.max_running_requests = 2
 
         if self.kt_lora_path:
             if (
@@ -5609,6 +5603,7 @@ class ServerArgs:
 
         # Check LoRA
         self.check_lora_server_args()
+        self._validate_kt_expert_lora_max_running_requests()
 
         # torch 2.9.1 has compatibility issues with cuDNN 9.14 and below,
         # causing extremely slow nn.Conv3d performance.
@@ -5750,6 +5745,17 @@ class ServerArgs:
                     logger.warning(
                         f"{RED}WARNING: Could not determine CuDNN version for torch==2.9.1. Please ensure CuDNN >= 9.15 to avoid nn.Conv3d bugs.{RESET}"
                     )
+
+    def _validate_kt_expert_lora_max_running_requests(self) -> None:
+        if not (self.kt_lora_path or self.kt_expert_lora_path):
+            return
+        if self.max_running_requests is not None and self.max_running_requests < 2:
+            raise ValueError(
+                "KT expert LoRA serving requires --max-running-requests >= 2 "
+                f"(got {self.max_running_requests}). With max_running_requests=1, "
+                "the request pool has no allocatable slots and requests will not "
+                "enter prefill/forward."
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

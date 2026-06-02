@@ -199,6 +199,9 @@ def _get_expert_lora_tensor(
     )
 
 
+_KT_LORA_STATE_DICT_CACHE: Dict[str, Dict[str, torch.Tensor]] = {}
+
+
 def _load_kt_expert_lora_weights(
     adapter_path: str,
     layer_idx: int,
@@ -210,9 +213,14 @@ def _load_kt_expert_lora_weights(
     adapter_dir = Path(adapter_path)
     rank_from_config, alpha = _load_adapter_config(adapter_dir)
     weight_file = _find_adapter_weight_file(adapter_dir)
-    from safetensors.torch import load_file
+    weight_file_str = str(weight_file)
+    if weight_file_str not in _KT_LORA_STATE_DICT_CACHE:
+        from safetensors.torch import load_file
 
-    state_dict = load_file(str(weight_file), device="cpu")
+        _KT_LORA_STATE_DICT_CACHE[weight_file_str] = load_file(
+            weight_file_str, device="cpu"
+        )
+    state_dict = _KT_LORA_STATE_DICT_CACHE[weight_file_str]
     sample = _get_expert_lora_tensor(
         state_dict, layer_idx, 0, "gate_proj", "lora_A"
     )

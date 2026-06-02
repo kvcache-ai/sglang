@@ -880,39 +880,28 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
         if self._kt_lora_scale is not None:
-            qkv_delta_parts = []
-            for pair in (
-                self._kt_lora_q_proj,
-                self._kt_lora_k_proj,
-                self._kt_lora_v_proj,
-            ):
-                if pair is None:
-                    qkv_delta_parts.append(None)
-                else:
-                    qkv_delta_parts.append(
-                        _lora_delta(hidden_states, pair[0], pair[1], self._kt_lora_scale)
-                    )
-            if any(part is not None for part in qkv_delta_parts):
-                q_delta, k_delta, v_delta = qkv_delta_parts
-                if q_delta is None:
-                    q_delta = torch.zeros(
-                        qkv.shape[:-1] + ((self.q_size * (2 if self.attn_output_gate else 1)),),
-                        dtype=qkv.dtype,
-                        device=qkv.device,
-                    )
-                if k_delta is None:
-                    k_delta = torch.zeros(
-                        qkv.shape[:-1] + (self.kv_size,),
-                        dtype=qkv.dtype,
-                        device=qkv.device,
-                    )
-                if v_delta is None:
-                    v_delta = torch.zeros(
-                        qkv.shape[:-1] + (self.kv_size,),
-                        dtype=qkv.dtype,
-                        device=qkv.device,
-                    )
-                qkv = qkv + torch.cat((q_delta, k_delta, v_delta), dim=-1)
+            q_dim = self.q_size * (2 if self.attn_output_gate else 1)
+            if self._kt_lora_q_proj is not None:
+                qkv[..., :q_dim] += _lora_delta(
+                    hidden_states,
+                    self._kt_lora_q_proj[0],
+                    self._kt_lora_q_proj[1],
+                    self._kt_lora_scale,
+                )
+            if self._kt_lora_k_proj is not None:
+                qkv[..., q_dim : q_dim + self.kv_size] += _lora_delta(
+                    hidden_states,
+                    self._kt_lora_k_proj[0],
+                    self._kt_lora_k_proj[1],
+                    self._kt_lora_scale,
+                )
+            if self._kt_lora_v_proj is not None:
+                qkv[..., q_dim + self.kv_size :] += _lora_delta(
+                    hidden_states,
+                    self._kt_lora_v_proj[0],
+                    self._kt_lora_v_proj[1],
+                    self._kt_lora_scale,
+                )
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
