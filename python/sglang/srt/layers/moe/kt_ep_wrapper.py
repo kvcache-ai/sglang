@@ -1176,24 +1176,14 @@ class SharedFullContext:
         outer model loader to have skipped the post-swizzle deletes (gated on
         `kt_gpu_prefill_token_threshold > 0` in `mxfp4_deepseek.py`).
 
-        **Caching**: V4-Flash MXFP4 weights are immutable across requests
-        (no dynamic-expert-update for MXFP4 — see apply()), so the 256-expert
-        load + swizzle is done **once per SharedFullContext** and skipped on
-        every subsequent `load()` invocation. Without caching the per-chunk
-        wall is dominated by ~40ms × 43 layers ≈ 1.7s of CPU→GPU staging,
-        which floors prefill throughput at ~430 tok/s for chunked-prefill
-        regardless of how fast the GPU MoE forward actually is. With caching
-        the per-chunk overhead drops to ~0 and throughput is bound by attention
-        + MoE compute only.
+        **No caching**: SharedFullContext is a global singleton whose single
+        `gpu_layer` holds one layer's swizzled weights at a time. After layer N
+        loads, layer N-1's data is overwritten. A boolean or per-layer-set
+        cache would be stale when a different layer has since loaded into the
+        same gpu_layer. Every load() call must therefore run the full pipeline.
 
-        Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat + perf).
+        Origin: sglang 本身 (V4-Flash full-GPU prefill fallback compat).
         """
-        # Cache hit: weights already loaded + swizzled by a previous load()
-        # call. The triton_kernels apply path reads `_v4_tk_w13` etc., which
-        # `process_weights_after_loading` produced last time. Nothing to do.
-        if getattr(self, "_mxfp4_loaded", False):
-            return
-
         # Phase 1+2: byte-copy via the FP8 path (works for FP4-packed bytes).
         self._prepare_weight_fp8(
             wrapper,
@@ -1208,10 +1198,6 @@ class SharedFullContext:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
-
-        # Mark cached so subsequent gate fires (every chunk in a chunked
-        # prefill) skip the 1.7s reload.
-        self._mxfp4_loaded = True
 
     def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
                                      logical_to_gpu_index=None):

@@ -468,7 +468,8 @@ def apply_v4_triton_kernels_moe(
         gammas=routing_data.gate_scal,
     )
 
-    if routed_scaling_factor != 1.0:
-        output = output * routed_scaling_factor
+    # routed_scaling_factor is NOT applied here; the caller
+    # (mxfp4_deepseek.apply) handles it to stay consistent with the trtllm
+    # path and avoid double-apply when FUSE_RSF_SHARED_ADD is enabled.
 
     return output
