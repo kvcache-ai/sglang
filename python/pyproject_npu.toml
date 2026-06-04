@@ -61,7 +61,7 @@ dependencies = [
   "transformers==4.57.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.2.1",
   "smg-grpc-proto>=0.3.3",
   "grpcio>=1.78.0",
   "grpcio-reflection>=1.78.0",
