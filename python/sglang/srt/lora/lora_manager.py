@@ -47,6 +47,23 @@ from sglang.srt.utils.hf_transformers_utils import AutoConfig
 logger = logging.getLogger(__name__)
 
 
+def _get_lora_hf_config(base_hf_config: AutoConfig) -> AutoConfig:
+    if getattr(base_hf_config, "num_hidden_layers", None) is not None:
+        return base_hf_config
+
+    get_text_config = getattr(base_hf_config, "get_text_config", None)
+    if callable(get_text_config):
+        text_config = get_text_config()
+        if getattr(text_config, "num_hidden_layers", None) is not None:
+            return text_config
+
+    text_config = getattr(base_hf_config, "text_config", None)
+    if getattr(text_config, "num_hidden_layers", None) is not None:
+        return text_config
+
+    return base_hf_config
+
+
 class LoRAManager:
     def __init__(
         self,
@@ -64,7 +81,7 @@ class LoRAManager:
         lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
-        self.base_hf_config: AutoConfig = base_hf_config
+        self.base_hf_config: AutoConfig = _get_lora_hf_config(base_hf_config)
         self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype

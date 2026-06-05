@@ -431,6 +431,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
+        self.use_gate_up_backend = len(self.base_layer.output_sizes) == 2
 
     def set_lora_info(
         self,
@@ -438,21 +439,37 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         B_buffer: torch.Tensor,
     ):
         self.set_lora = True
-        self.A_buffer_gate_up = A_buffer
-        self.B_buffer_gate_up = B_buffer
+        if self.use_gate_up_backend:
+            self.A_buffer_gate_up = A_buffer
+            self.B_buffer_gate_up = B_buffer
 
-        shard_size = self.base_layer.output_partition_sizes[0]
-        self.output_offset = torch.tensor(
-            [
-                0,
-                shard_size,
-                2 * shard_size,
-            ],
-            dtype=torch.int32,
-            device=next(self.base_layer.parameters()).device,
-        )
+            shard_size = self.base_layer.output_partition_sizes[0]
+            self.output_offset = torch.tensor(
+                [
+                    0,
+                    shard_size,
+                    2 * shard_size,
+                ],
+                dtype=torch.int32,
+                device=next(self.base_layer.parameters()).device,
+            )
+        else:
+            self.A_buffer = A_buffer
+            self.B_buffer = B_buffer
+            output_size_per_partition = sum(self.base_layer.output_partition_sizes)
+            self.output_offset = torch.tensor(
+                [
+                    0,
+                    output_size_per_partition,
+                ],
+                dtype=torch.int32,
+                device=next(self.base_layer.parameters()).device,
+            )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_gate_up_backend:
+            return super().apply_lora(base_output, x)
+
         lora_output = self.lora_backend.run_gate_up_lora(
             x=x,
             gate_up_lora_a=self.A_buffer_gate_up,
@@ -466,6 +483,19 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        if not self.use_gate_up_backend:
+            shards = []
+            offset = 0
+            for output_size, shard_size in zip(
+                self.base_layer.output_sizes,
+                self.base_layer.output_partition_sizes,
+            ):
+                start_idx = offset + tp_rank * shard_size
+                end_idx = start_idx + shard_size
+                shards.append(B[start_idx:end_idx, :])
+                offset += output_size
+            return torch.concat(shards, dim=0).contiguous()
+
         # Since the outputs for both gate and up are identical, we use a random one.
         shard_size = self.base_layer.output_partition_sizes[0]
         gate_size = self.base_layer.output_sizes[0]

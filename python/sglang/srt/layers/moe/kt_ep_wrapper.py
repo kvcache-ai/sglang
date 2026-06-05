@@ -29,13 +29,15 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
 
 import copy
 import ctypes
+import json
 import logging
 import os
 import time
 import uuid
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Dict, List, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -90,6 +92,7 @@ class KTConfig:
         num_layers: Total number of layers in the model (optional)
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
+        expert_lora_path: Optional PEFT adapter directory for KT CPU expert LoRA
     """
 
     layer_idx: int
@@ -104,6 +107,172 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    expert_lora_path: Optional[str] = None
+
+
+@dataclass
+class KTExpertLoraWeights:
+    gate_lora_a: torch.Tensor
+    gate_lora_b: torch.Tensor
+    up_lora_a: torch.Tensor
+    up_lora_b: torch.Tensor
+    down_lora_a: torch.Tensor
+    down_lora_b: torch.Tensor
+    rank: int
+    alpha: float
+
+
+_KT_SFT_METHOD_BY_INFERENCE_METHOD = {
+    "AMXBF16": "AMXBF16_SFT",
+    "BF16": "AMXBF16_SFT",
+    "AMXINT8": "AMXINT8_SFT",
+    "AMXINT4": "AMXINT4_SFT",
+}
+
+
+def _map_kt_method_to_sft_method(method: str) -> str:
+    normalized = method.upper()
+    if normalized in _KT_SFT_METHOD_BY_INFERENCE_METHOD:
+        return _KT_SFT_METHOD_BY_INFERENCE_METHOD[normalized]
+    raise ValueError(
+        f"--kt-expert-lora-path currently supports only AMX/BF16 SFT-compatible "
+        f"KT methods {sorted(_KT_SFT_METHOD_BY_INFERENCE_METHOD)}, got {method!r}."
+    )
+
+
+def _load_adapter_config(adapter_path: Path) -> Tuple[Optional[int], float]:
+    config_path = adapter_path / "adapter_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"KT expert LoRA adapter config not found: {config_path}"
+        )
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    rank = config.get("r")
+    if rank is not None:
+        rank = int(rank)
+    alpha = float(config.get("lora_alpha", rank if rank is not None else 1.0))
+    return rank, alpha
+
+
+def _find_adapter_weight_file(adapter_path: Path) -> Path:
+    preferred = adapter_path / "adapter_model.safetensors"
+    if preferred.is_file():
+        return preferred
+    candidates = sorted(adapter_path.glob("*.safetensors"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No safetensors adapter weights found under {adapter_path}"
+        )
+    if len(candidates) > 1:
+        logger.warning(
+            "Multiple safetensors files found under %s; using %s for KT expert LoRA",
+            adapter_path,
+            candidates[0],
+        )
+    return candidates[0]
+
+
+def _get_expert_lora_tensor(
+    state_dict: Dict[str, torch.Tensor],
+    layer_idx: int,
+    expert_idx: int,
+    proj_name: str,
+    lora_name: str,
+) -> torch.Tensor:
+    suffixes = [
+        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj_name}.{lora_name}.weight",
+        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{proj_name}.{lora_name}.default.weight",
+    ]
+    prefixes = ["", "base_model.", "base_model.model.", "base_model.model.model."]
+    for suffix in suffixes:
+        for prefix in prefixes:
+            key = prefix + suffix
+            if key in state_dict:
+                return state_dict[key]
+    for key, tensor in state_dict.items():
+        if any(key.endswith(suffix) for suffix in suffixes):
+            return tensor
+    raise KeyError(
+        f"Missing KT expert LoRA tensor for layer={layer_idx}, expert={expert_idx}, "
+        f"proj={proj_name}, lora={lora_name}. Expected suffix like {suffixes[0]!r}."
+    )
+
+
+_KT_LORA_STATE_DICT_CACHE: Dict[str, Dict[str, torch.Tensor]] = {}
+
+
+def _load_kt_expert_lora_weights(
+    adapter_path: str,
+    layer_idx: int,
+    num_experts: int,
+    hidden_size: int,
+    moe_intermediate_size: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> KTExpertLoraWeights:
+    adapter_dir = Path(adapter_path)
+    rank_from_config, alpha = _load_adapter_config(adapter_dir)
+    weight_file = _find_adapter_weight_file(adapter_dir)
+    weight_file_str = str(weight_file)
+    if weight_file_str not in _KT_LORA_STATE_DICT_CACHE:
+        from safetensors.torch import load_file
+
+        _KT_LORA_STATE_DICT_CACHE[weight_file_str] = load_file(
+            weight_file_str, device="cpu"
+        )
+    state_dict = _KT_LORA_STATE_DICT_CACHE[weight_file_str]
+    sample = _get_expert_lora_tensor(
+        state_dict, layer_idx, 0, "gate_proj", "lora_A"
+    )
+    rank = rank_from_config or int(sample.shape[0])
+    if int(sample.shape[0]) != rank:
+        raise ValueError(
+            f"KT expert LoRA rank mismatch for layer {layer_idx}: "
+            f"adapter_config r={rank}, sample tensor rank={int(sample.shape[0])}"
+        )
+
+    # SGLang may set the default torch device to CUDA during model loading.
+    # KT SFT CPU kernels consume raw host pointers, so these adapter staging
+    # buffers must be explicitly allocated on CPU.
+    device = torch.device("cpu")
+    gate_lora_a = torch.zeros((num_experts, rank, hidden_size), dtype=dtype, device=device)
+    gate_lora_b = torch.zeros((num_experts, moe_intermediate_size, rank), dtype=dtype, device=device)
+    up_lora_a = torch.zeros((num_experts, rank, hidden_size), dtype=dtype, device=device)
+    up_lora_b = torch.zeros((num_experts, moe_intermediate_size, rank), dtype=dtype, device=device)
+    down_lora_a = torch.zeros((num_experts, rank, moe_intermediate_size), dtype=dtype, device=device)
+    down_lora_b = torch.zeros((num_experts, hidden_size, rank), dtype=dtype, device=device)
+
+    targets = [
+        ("gate_proj", "lora_A", gate_lora_a),
+        ("gate_proj", "lora_B", gate_lora_b),
+        ("up_proj", "lora_A", up_lora_a),
+        ("up_proj", "lora_B", up_lora_b),
+        ("down_proj", "lora_A", down_lora_a),
+        ("down_proj", "lora_B", down_lora_b),
+    ]
+    for expert_idx in range(num_experts):
+        for proj_name, lora_name, dst in targets:
+            tensor = _get_expert_lora_tensor(
+                state_dict, layer_idx, expert_idx, proj_name, lora_name
+            )
+            if tuple(tensor.shape) != tuple(dst[expert_idx].shape):
+                raise ValueError(
+                    f"KT expert LoRA shape mismatch for layer={layer_idx}, "
+                    f"expert={expert_idx}, {proj_name}.{lora_name}: expected "
+                    f"{tuple(dst[expert_idx].shape)}, got {tuple(tensor.shape)}"
+                )
+            dst[expert_idx].copy_(tensor.to(dtype=dtype, device=device))
+
+    return KTExpertLoraWeights(
+        gate_lora_a=gate_lora_a.contiguous(),
+        gate_lora_b=gate_lora_b.contiguous(),
+        up_lora_a=up_lora_a.contiguous(),
+        up_lora_b=up_lora_b.contiguous(),
+        down_lora_a=down_lora_a.contiguous(),
+        down_lora_b=down_lora_b.contiguous(),
+        rank=rank,
+        alpha=alpha,
+    )
 
 
 _SHARED_FULL_CONTEXT = None
@@ -1841,6 +2010,7 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
     )
 
 
@@ -2163,9 +2333,31 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.kt_config = kt_config
         self.gpu_experts_mask = kt_config.gpu_experts_mask  # bool tensor [num_experts], on CPU
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
+        self.kt_expert_lora_path = kt_config.expert_lora_path
+        self.kt_expert_lora_enabled = bool(self.kt_expert_lora_path)
+        self.kt_expert_lora_weights: Optional[KTExpertLoraWeights] = None
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
+        if self.kt_expert_lora_enabled:
+            if self.num_gpu_experts != 0:
+                raise ValueError(
+                    "--kt-expert-lora-path first supports CPU experts only. "
+                    "Set --kt-num-gpu-experts 0 and do not enable "
+                    "--kt-gpu-experts-ratio."
+                )
+            if kt_config.gpu_prefill_token_threshold:
+                raise ValueError(
+                    "--kt-expert-lora-path is not compatible with "
+                    "--kt-gpu-prefill-token-threshold in the first single-adapter "
+                    "implementation."
+                )
+            if kt_config.kt_enable_dynamic_expert_update:
+                raise ValueError(
+                    "--kt-expert-lora-path is not compatible with "
+                    "--kt-enable-dynamic-expert-update in the first single-adapter "
+                    "implementation."
+                )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[kt-wrap-init] tp_rank=%d layer_idx=%s num_gpu_experts=%d "
@@ -2294,7 +2486,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_swiglu_limit = (
                 10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
             )
-            self.wrapper = KTMoEWrapper(
+            common_wrapper_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
@@ -2303,13 +2495,39 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
-                swiglu_limit=_kt_swiglu_limit,
                 numa_nodes=self.kt_config.numa_nodes,
                 weight_path=self.kt_config.weight_path,
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
-                method=self.kt_config.method,
-                max_deferred_experts_per_token=layer_max_deferred,
             )
+            if self.kt_expert_lora_enabled:
+                if _kt_swiglu_limit != 0.0:
+                    raise ValueError(
+                        "--kt-expert-lora-path uses KT SFT wrappers, which do not "
+                        "support the V4-2604B swiglu_limit path."
+                    )
+                self.kt_expert_lora_weights = _load_kt_expert_lora_weights(
+                    adapter_path=self.kt_expert_lora_path,
+                    layer_idx=self.kt_config.layer_idx,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    moe_intermediate_size=intermediate_size_full,
+                )
+                self.wrapper = KTMoEWrapper(
+                    **common_wrapper_kwargs,
+                    method=_map_kt_method_to_sft_method(self.kt_config.method),
+                    mode="sft",
+                    num_gpu_experts=0,
+                    lora_rank=self.kt_expert_lora_weights.rank,
+                    lora_alpha=self.kt_expert_lora_weights.alpha,
+                    max_cache_depth=1,
+                )
+            else:
+                self.wrapper = KTMoEWrapper(
+                    **common_wrapper_kwargs,
+                    swiglu_limit=_kt_swiglu_limit,
+                    method=self.kt_config.method,
+                    max_deferred_experts_per_token=layer_max_deferred,
+                )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -2345,6 +2563,52 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     layer.num_experts, dtype=torch.int64, device="cpu"
                 )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+            if self.kt_expert_lora_enabled:
+                if self.kt_expert_lora_weights is None:
+                    raise RuntimeError(
+                        "KT expert LoRA is enabled but adapter weights were not loaded."
+                    )
+                lora = self.kt_expert_lora_weights
+                if os.environ.get("SGLANG_KT_EXPERT_LORA_DEBUG") == "1":
+                    print(
+                        "[KT expert LoRA debug] "
+                        f"layer={self.kt_config.layer_idx} "
+                        f"rank={lora.rank} alpha={lora.alpha} "
+                        f"gate_a={tuple(lora.gate_lora_a.shape)}/{lora.gate_lora_a.dtype}/"
+                        f"{lora.gate_lora_a.device}/ptr={lora.gate_lora_a.data_ptr()} "
+                        f"gate_b={tuple(lora.gate_lora_b.shape)}/{lora.gate_lora_b.dtype}/"
+                        f"{lora.gate_lora_b.device}/ptr={lora.gate_lora_b.data_ptr()} "
+                        f"up_a={tuple(lora.up_lora_a.shape)}/{lora.up_lora_a.dtype}/"
+                        f"{lora.up_lora_a.device}/ptr={lora.up_lora_a.data_ptr()} "
+                        f"up_b={tuple(lora.up_lora_b.shape)}/{lora.up_lora_b.dtype}/"
+                        f"{lora.up_lora_b.device}/ptr={lora.up_lora_b.data_ptr()} "
+                        f"down_a={tuple(lora.down_lora_a.shape)}/{lora.down_lora_a.dtype}/"
+                        f"{lora.down_lora_a.device}/ptr={lora.down_lora_a.data_ptr()} "
+                        f"down_b={tuple(lora.down_lora_b.shape)}/{lora.down_lora_b.dtype}/"
+                        f"{lora.down_lora_b.device}/ptr={lora.down_lora_b.data_ptr()}",
+                        flush=True,
+                    )
+                self.wrapper.init_lora_weights(
+                    lora.gate_lora_a,
+                    lora.gate_lora_b,
+                    lora.up_lora_a,
+                    lora.up_lora_b,
+                    lora.down_lora_a,
+                    lora.down_lora_b,
+                    torch.zeros_like(lora.gate_lora_a),
+                    torch.zeros_like(lora.gate_lora_b),
+                    torch.zeros_like(lora.up_lora_a),
+                    torch.zeros_like(lora.up_lora_b),
+                    torch.zeros_like(lora.down_lora_a),
+                    torch.zeros_like(lora.down_lora_b),
+                )
+                logger.info(
+                    "Loaded KT expert LoRA for layer %d from %s (rank=%d, alpha=%.3f)",
+                    self.kt_config.layer_idx,
+                    self.kt_expert_lora_path,
+                    lora.rank,
+                    lora.alpha,
+                )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
@@ -2373,6 +2637,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Delegate to GPU method to create its runner
         self.gpu_method.create_moe_runner(layer, gpu_runner_config)
 
+    def _submit_cpu_forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        if self.kt_expert_lora_enabled:
+            self.wrapper.submit_forward_inference(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                torch.cuda.current_stream(hidden_states.device).cuda_stream,
+            )
+        else:
+            self.wrapper.submit_forward(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                torch.cuda.current_stream(hidden_states.device).cuda_stream,
+            )
+
+    def _sync_cpu_forward(self, ref_tensor: torch.Tensor) -> torch.Tensor:
+        if self.kt_expert_lora_enabled:
+            return self.wrapper.sync_forward_inference(
+                torch.cuda.current_stream(ref_tensor.device).cuda_stream,
+            )
+        return self.wrapper.sync_forward(
+            ref_tensor,
+            torch.cuda.current_stream(ref_tensor.device).cuda_stream,
+        )
+
     def submit(
         self,
         layer: torch.nn.Module,
@@ -2399,9 +2694,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
 
         # Submit forward task to CPU (non-blocking)
-        self.wrapper.submit_forward(
-            x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-        )
+        self._submit_cpu_forward(x, topk_ids, topk_weights)
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
@@ -2418,9 +2711,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             return torch.zeros_like(x)
 
         # Wait for CPU computation and retrieve results
-        return self.wrapper.sync_forward(
-            x, torch.cuda.current_stream(x.device).cuda_stream
-        )
+        return self._sync_cpu_forward(x)
 
     def _submit_with_staged_input(
         self,
@@ -2446,12 +2737,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
 
         # Submit forward task using staged buffer
-        self.wrapper.submit_forward(
-            staged_hidden_states,
-            topk_ids,
-            topk_weights,
-            torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
-        )
+        self._submit_cpu_forward(staged_hidden_states, topk_ids, topk_weights)
 
     def _sync_with_staged_input(
         self, staged_hidden_states: torch.Tensor
@@ -2467,10 +2753,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(staged_hidden_states)
 
-        return self.wrapper.sync_forward(
-            staged_hidden_states,
-            torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
-        )
+        return self._sync_cpu_forward(staged_hidden_states)
 
     def apply(
         self,
