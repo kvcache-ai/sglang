@@ -275,6 +275,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     top_p_normalized_logprobs: bool = False
     top_p: torch.Tensor = None
 
+    # For NSA/DSA topk_indices reuse across forward calls (e.g., EAGLE draft)
+    topk_indices: Optional[torch.Tensor] = None
+    reuse_mtp_topk_indices: Optional[bool] = False
+
     # Position information
     positions: torch.Tensor = None
 
