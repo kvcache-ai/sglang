@@ -1099,6 +1099,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1171,27 +1172,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_nsa_index_n_heads(config),
-                index_head_dim=get_nsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_nsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-            )
-            # Refer: https://arxiv.org/abs/2603.12201 for more details.
-            # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
-            # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
+            # Decide skip_topk BEFORE instantiating the Indexer: shared layers carry
+            # no indexer weights in the checkpoint, so we skip Indexer creation on
+            # them — else weight loading silently zero-inits and forward produces
+            # out-of-range topk that hangs the NSA gather kernel.
             if is_nextn:
                 self.skip_topk = True
                 self.next_skip_topk = True
@@ -1230,6 +1214,29 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         )
                     else:
                         self.next_skip_topk = False
+            # nextn keeps its own indexer as the fallback computer when no prior
+            # layer's topk has been carried (e.g. first MTP draft step).
+            if (not self.skip_topk) or is_nextn:
+                self.indexer = Indexer(
+                    hidden_size=hidden_size,
+                    index_n_heads=get_nsa_index_n_heads(config),
+                    index_head_dim=get_nsa_index_head_dim(config),
+                    rope_head_dim=qk_rope_head_dim,
+                    index_topk=get_nsa_index_topk(config),
+                    q_lora_rank=q_lora_rank,
+                    max_position_embeddings=max_position_embeddings,
+                    rope_theta=rope_theta,
+                    scale_fmt="ue8m0",
+                    block_size=128,
+                    rope_scaling=rope_scaling,
+                    is_neox_style=is_neox_style,
+                    prefix=add_prefix("indexer", prefix),
+                    quant_config=quant_config,
+                    layer_id=layer_id,
+                    alt_stream=alt_stream,
+                )
+            else:
+                self.indexer = None
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1674,18 +1681,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
+                if (not self.skip_topk) or (
+                    self.is_nextn and forward_batch.topk_indices is None
+                ):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -1693,6 +1691,27 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+                    forward_batch.topk_indices = topk_indices
+                else:
+                    topk_indices = forward_batch.topk_indices
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_lora is not None:
+                    if (not self.skip_topk) or (
+                        self.is_nextn and forward_batch.topk_indices is None
+                    ):
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                        forward_batch.topk_indices = topk_indices
+                    else:
+                        topk_indices = forward_batch.topk_indices
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -2336,6 +2355,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            is_nextn=is_nextn,
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
