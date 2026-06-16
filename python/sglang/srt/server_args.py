@@ -735,8 +735,6 @@ class ServerArgs:
     kt_expert_placement_strategy: str = "uniform"
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
-    kt_swiglu_alpha: float = 0.0
-    kt_swiglu_limit: float = 0.0
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -4898,18 +4896,6 @@ class ServerArgs:
             help="[experimental ktransformers parameter] Single PEFT adapter directory "
                  "for KT CPU expert LoRA. This bypasses SGLang's normal LoRA manager "
                  "for expert weights and runs the KT CPU expert path through forward_sft.",
-        )
-        parser.add_argument(
-            "--kt-swiglu-alpha",
-            type=float,
-            default=ServerArgs.kt_swiglu_alpha,
-            help="[ktransformers parameter] SwiGLU sigmoid alpha for CPU MoE activation. Non-zero triggers gate*sigmoid(gate*alpha)*(up+1). M3 uses 1.702.",
-        )
-        parser.add_argument(
-            "--kt-swiglu-limit",
-            type=float,
-            default=ServerArgs.kt_swiglu_limit,
-            help="[ktransformers parameter] SwiGLU clamp limit for CPU MoE activation. M3 uses 7.0.",
         )
 
         # Diffusion LLM

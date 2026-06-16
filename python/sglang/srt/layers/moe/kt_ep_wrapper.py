@@ -108,8 +108,6 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
-    swiglu_alpha: float = 0.0
-    swiglu_limit: float = 0.0
 
 
 @dataclass
@@ -2009,8 +2007,6 @@ def create_kt_config_from_server_args(
         chunked_prefill_size=server_args.chunked_prefill_size,
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
-        swiglu_alpha=server_args.kt_swiglu_alpha,
-        swiglu_limit=server_args.kt_swiglu_limit,
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
@@ -2478,13 +2474,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
         if self.tp_rank == 0:
-            from sglang.srt.environ import envs as _envs
-            _kt_swiglu_alpha = self.kt_config.swiglu_alpha
-            _kt_swiglu_limit = self.kt_config.swiglu_limit
-            if _kt_swiglu_limit == 0.0:
-                _kt_swiglu_limit = (
-                    10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
-                )
+            # SwiGLU activation params for CPU experts. Source of truth is
+            # MoeRunnerConfig, populated by the model file from HF config:
+            #   - minimax_m3.py forwards config.swiglu_alpha / swiglu_limit
+            #     as gemm1_alpha / gemm1_clamp_limit (swiglu_oai path)
+            #   - deepseek_v2.py forwards config.swiglu_limit into the
+            #     legacy swiglu_limit slot (DSV4 plain-silu clamp path)
+            # kt-kernel C++ accepts a single (alpha, limit) pair and
+            # disambiguates by alpha != 0 (swiglu_oai vs plain silu).
+            _mrc = getattr(layer, "moe_runner_config", None)
+            _cfg_alpha = getattr(_mrc, "gemm1_alpha", None) if _mrc is not None else None
+            _cfg_clamp = getattr(_mrc, "gemm1_clamp_limit", None) if _mrc is not None else None
+            _cfg_swglim = getattr(_mrc, "swiglu_limit", None) if _mrc is not None else None
+            _kt_swiglu_alpha = float(_cfg_alpha) if _cfg_alpha is not None else 0.0
+            _kt_swiglu_limit = float(
+                _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
+            )
             common_wrapper_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
