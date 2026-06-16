@@ -1021,7 +1021,11 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        # `apply_routed_scaling_factor_on_output=True` means "multiply the
+        # topk weights by routed_scaling_factor on the output side". fused_topk
+        # (the non-sqrtsoftplus branch below) does not take the kwarg, so apply
+        # the scaling here after the call. M3 needs this.
+        _apply_rsf_post = apply_routed_scaling_factor_on_output
         if scoring_func == "sqrtsoftplus":
             if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
                 from sglang.srt.layers.moe.deepseek_v4_topk import (
@@ -1052,6 +1056,8 @@ def select_experts(
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
             )
+            if _apply_rsf_post:
+                topk_weights = topk_weights * routed_scaling_factor
     else:
         assert (
             num_token_non_padded is None
