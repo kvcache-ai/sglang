@@ -140,19 +140,36 @@ def _diff_phase(actual: PhaseConfig, baseline: PhaseConfig) -> Dict[str, Any]:
 
 
 def check_cuda_graph_backend(phase: str, backend: str) -> bool:
-    """True if cuda_graph_config[phase].backend == backend on the
-    global server args. Returns False if the global server args have not
-    been initialized yet (e.g. unit tests, early startup)."""
+    """True if `phase` is configured to use `backend`.
+
+    kvcache fork stores CUDA-graph config as flat ServerArgs fields
+    (`disable_cuda_graph`, `enable_piecewise_cuda_graph`, ...) instead
+    of the upstream aggregate `cuda_graph_config`. Translate to the
+    upstream Phase/Backend semantics here so M3 callers don't need to
+    care which fork they're on.
+    """
     from sglang.srt.server_args import get_global_server_args
 
     try:
         server_args = get_global_server_args()
     except ValueError:
         return False
-    cfg = server_args.cuda_graph_config
-    if cfg is None or phase not in Phase.ALL:
+    if phase not in Phase.ALL:
         return False
-    return getattr(cfg, phase).backend == backend
+    cfg = getattr(server_args, "cuda_graph_config", None)
+    if cfg is not None:
+        return getattr(cfg, phase).backend == backend
+
+    # Flat-attrs fallback for kvcache base.
+    if getattr(server_args, "disable_cuda_graph", False):
+        return backend == Backend.DISABLED
+    if phase == Phase.DECODE:
+        return backend == Backend.FULL
+    if phase == Phase.PREFILL:
+        if getattr(server_args, "enable_piecewise_cuda_graph", False):
+            return backend == Backend.TC_PIECEWISE
+        return backend == Backend.DISABLED
+    return False
 
 
 def cuda_graph_fully_disabled() -> bool:

@@ -30,14 +30,19 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import (
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+    get_config_dtype_str,
+    try_get_optimal_moe_config,
+)
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
     act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
 )
-from .moe_align_block_size import moe_align_block_size
+from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+    moe_align_block_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -55,7 +60,12 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    try:
+        from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    except ModuleNotFoundError:
+        # kvcache fork lacks the JIT activation kernel; M3 path only uses
+        # swiglu_no_interleaved_with_alpha_and_limit below, never these.
+        gelu_and_mul = silu_and_mul = None
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:

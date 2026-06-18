@@ -6,9 +6,13 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import (
+    get_minimax_sparse_attention_config,
+    get_minimax_sparse_disable_value_layer_ids,
+    get_minimax_sparse_layer_ids,
     get_nsa_index_head_dim,
     is_deepseek_compressed,
     is_deepseek_nsa,
+    is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
@@ -23,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
@@ -777,6 +782,29 @@ class ModelRunnerKVCacheMixin:
                     enable_kvcache_transpose=False,
                     device=self.device,
                     **kwargs,
+                )
+            elif is_minimax_sparse(self.model_config.hf_config):
+                _hf = self.model_config.hf_config
+                sparse_cfg = get_minimax_sparse_attention_config(_hf)
+                _dense_ids, _sparse_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+                _disable_v_ids = get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
+                self.token_to_kv_pool = MiniMaxSparseKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    index_dtype=self.dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    idx_head_dim=sparse_cfg["sparse_index_dim"],
+                    dense_layer_ids=_dense_ids,
+                    sparse_layer_ids=_sparse_ids,
+                    disable_value_sparse_layer_ids=_disable_v_ids,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                 )
             elif config := self.mambaish_config:
                 extra_args = {}

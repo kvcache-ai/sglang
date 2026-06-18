@@ -177,6 +177,64 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     # Delegation helpers
     # ------------------------------------------------------------------
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # kvcache's base AttentionBackend still marks init_forward_metadata as
+        # abstract; upstream made it a default wrapper. Provide that wrapper
+        # here so the abstract gate passes.
+        self.init_forward_metadata_out_graph(forward_batch)
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    # --- adapters: kvcache cuda_graph_runner still calls the legacy split-API.
+    # Upstream M3 only implements *_out_graph / *_in_graph. Bridge them.
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs,
+        num_tokens,
+        req_pool_indices,
+        seq_lens,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        from types import SimpleNamespace
+        fb = SimpleNamespace(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.cpu() if torch.is_tensor(seq_lens) else seq_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+        )
+        self.init_forward_metadata_out_graph(fb, in_capture=True)
+        self.init_forward_metadata_in_graph(fb)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs,
+        req_pool_indices,
+        seq_lens,
+        seq_lens_sum,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+        seq_lens_cpu=None,
+    ):
+        # Prefer the explicit forward_batch the runner stashes via
+        # `attn_backend._replay_forward_batch = forward_batch` immediately
+        # before calling this method (cuda_graph_runner.py ~line 1040).
+        fb = getattr(self, "_replay_forward_batch", None)
+        if fb is None:
+            from types import SimpleNamespace
+            fb = SimpleNamespace(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu if seq_lens_cpu is not None
+                else (seq_lens.cpu() if torch.is_tensor(seq_lens) else seq_lens),
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+            )
+        self.init_forward_metadata_out_graph(fb, in_capture=False)
+        self.init_forward_metadata_in_graph(fb)
+
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
@@ -557,6 +615,22 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata_in_graph(forward_batch)
         self.dense.init_forward_metadata_in_graph(forward_batch)
+
+    # --- Legacy split-API adapters: kvcache's cuda_graph_runner still calls
+    # capture/replay via the old API. Delegate to both sub-backends; the sparse
+    # child has its own old->new adapter.
+    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
+        self.sparse.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+        self.dense.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
+
+    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
+        # Propagate the runner-stashed forward_batch to the sparse child so its
+        # adapter can prefer it over the SimpleNamespace fallback.
+        self.sparse._replay_forward_batch = getattr(
+            self, "_replay_forward_batch", None
+        )
+        self.sparse.init_forward_metadata_replay_cuda_graph(*args, **kwargs)
+        self.dense.init_forward_metadata_replay_cuda_graph(*args, **kwargs)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.dense.init_cuda_graph_state(max_bs, max_num_tokens)

@@ -2015,7 +2015,6 @@ def create_kt_config_from_server_args(
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
-        swiglu_alpha=getattr(hf_config, "swiglu_alpha", 0.0),
     )
 
 
