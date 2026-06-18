@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import triton
@@ -380,6 +380,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # before dispatching. Typed as Any to avoid importing the DSV4-only class
     # in this base file. See managers/hisparse_coordinator.py.
     hisparse_coordinator: Optional[Any] = None
+
+    # MiniMax-M3 sparse-attention layers whose K/V cache was written by a fused
+    # norm/RoPE/cache-store kernel during this forward pass.
+    minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
     @classmethod
     def init_new(
