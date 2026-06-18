@@ -267,7 +267,21 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        # SM90 (Hopper / H20) native MXFP8 dense linear: weight stays raw
+        # MXFP8 (fp8 e4m3 + uint8 ue8m0 [N, K//32]); apply() routes to
+        # dot_scaled_mxfp8_blockscaled_linear (mxfp8_native.py), which uses
+        # tl.dot_scaled. Skips the lossy block-fp8 [128,128] convert.
+        self.use_mxfp8_native_sm90 = (
+            self.use_mxfp8
+            and _is_cuda
+            and is_sm90_supported()
+            and not is_sm100_supported()
+        )
+        self.convert_mxfp8_to_block = (
+            self.use_mxfp8
+            and _mxfp8_to_block_fp8_required
+            and not self.use_mxfp8_native_sm90
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
         self.is_checkpoint_fp8_serialized = (
@@ -486,6 +500,15 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
 
+    def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
+        # Called by minimax_m3.py's fused qkv+index linear when MXFP8 weights
+        # are kept in their canonical raw layout (no block-fp8 convert). On
+        # SM90 the dot_scaled kernel consumes uint8 ue8m0 [N, K//32] scales
+        # directly, so no swizzle / repack is needed — early return.
+        # (Other backends like flashinfer_trtllm / deep_gemm would swizzle
+        # here, but the default triton path is a no-op.)
+        return
+
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
         qweight, weight_scale = mxfp8_group_quantize(weight)
@@ -633,6 +656,30 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
+            # SM90 native MXFP8 dense linear: route to dot_scaled-based kernel
+            # in mxfp8_native.py (no SM100 swizzle). The default
+            # triton_mxfp8_blockscaled_linear has an SM100+ assert because it
+            # uses a Blackwell-specific packed scale layout — drop down to the
+            # underlying tl.dot_scaled kernel directly on Hopper.
+            if getattr(self, "use_mxfp8_native_sm90", False):
+                from sglang.srt.layers.quantization.mxfp8_native import (
+                    dot_scaled_mxfp8_blockscaled_linear,
+                )
+                if isinstance(x, tuple):
+                    return dot_scaled_mxfp8_blockscaled_linear(
+                        input=x[0],
+                        weight=layer.weight,
+                        weight_scale=layer.weight_scale_inv,
+                        input_scale=x[1],
+                        bias=bias,
+                    )
+                return dot_scaled_mxfp8_blockscaled_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                    bias=bias,
+                )
             if isinstance(x, tuple):
                 return triton_mxfp8_blockscaled_linear(
                     input=x[0],
@@ -710,7 +757,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
+        # SM90 (Hopper / H20) native MXFP8 MoE path: weights stay in raw
+        # MXFP8 layout (fp8 e4m3 + uint8 ue8m0 [1,32] scale) and apply()
+        # routes to fused_experts_mxfp8 via tl.dot_scaled. Skips the lossy
+        # block-fp8 [128,128] convert that destroys 512x of mxfp8 scale
+        # information per [128,128] block. SM100+ uses its own cutlass
+        # native path; gfx95 uses ROCm CDNA4 native; gfx942 still has no
+        # native MX matmul HW (out of scope here).
+        self.use_mxfp8_native_sm90 = (
+            self.use_mxfp8
+            and _is_cuda
+            and is_sm90_supported()
+            and not is_sm100_supported()
+        )
+        self.convert_mxfp8_to_block = (
+            self.use_mxfp8
+            and _mxfp8_to_block_fp8_required
+            and not self.use_mxfp8_native_sm90
+        )
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = (
             envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
@@ -1040,11 +1104,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _is_cpu_amx_available
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-        elif self.convert_mxfp8_to_block:
-            self._convert_mxfp8_moe_to_block_fp8(layer)
-            self.use_mxfp8 = False
-            self.convert_mxfp8_to_block = False
-            self.weight_block_size = [128, 128]
+        elif getattr(self, "use_mxfp8_native_sm90", False):
+            # SM90 native MXFP8: weights stay raw (fp8 e4m3 + uint8 ue8m0
+            # [E, N, K//32]). fused_experts_mxfp8 consumes them directly.
+            assert layer.w13_weight.dtype == torch.float8_e4m3fn
+            assert layer.w2_weight.dtype == torch.float8_e4m3fn
+            assert layer.w13_weight_scale_inv.dtype == torch.uint8
+            assert layer.w2_weight_scale_inv.dtype == torch.uint8
+            E, n13, h13 = layer.w13_weight.shape
+            assert layer.w13_weight_scale_inv.shape == (E, n13, h13 // 32), (
+                f"native MXFP8 expects w13_scale_inv shape (E, 2I, H//32), got "
+                f"{tuple(layer.w13_weight_scale_inv.shape)} vs weight "
+                f"{tuple(layer.w13_weight.shape)}"
+            )
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
@@ -1119,36 +1193,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
-
-    def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
-        from sglang.srt.layers.quantization.mxfp8_block_convert import (
-            convert_mxfp8_weight_to_block_fp8,
-        )
-
-        def convert(w, s):
-            E, N, K = w.shape
-            qw = torch.empty_like(w)
-            sn = (N + 127) // 128
-            sk = (K + 127) // 128
-            scale = torch.empty((E, sn, sk), dtype=torch.float32, device=w.device)
-            for e in range(E):
-                qe, se = convert_mxfp8_weight_to_block_fp8(w[e], s[e], block=128)
-                qw[e] = qe
-                scale[e] = se
-            return qw, scale
-
-        w13_q, w13_s = convert(
-            layer.w13_weight.data, layer.w13_weight_scale_inv.data
-        )
-        w2_q, w2_s = convert(
-            layer.w2_weight.data, layer.w2_weight_scale_inv.data
-        )
-        layer.w13_weight = Parameter(w13_q, requires_grad=False)
-        layer.w2_weight = Parameter(w2_q, requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
-        layer.w2_weight_scale_inv = Parameter(w2_s, requires_grad=False)
-        layer.w13_input_scale = None
-        layer.w2_input_scale = None
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -1515,6 +1559,45 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # TODO(cwan): refactor other backends
             pass
 
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        # Native MXFP8 MoE path (SM90 + use_mxfp8): weights are raw fp8 e4m3
+        # + uint8 ue8m0 [E, N, K//32] scales; fused_experts_mxfp8 consumes them
+        # directly via tl.dot_scaled and quantizes the activation per-call.
+        if getattr(self, "use_mxfp8_native_sm90", False):
+            return TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                use_fp8_w8a8=False,
+                use_mxfp8=True,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                a13_scale=None,
+                a2_scale=None,
+                block_shape=None,
+            )
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+            use_fp8_w8a8=True,
+            w13_scale=(
+                layer.w13_weight_scale_inv
+                if self.block_quant
+                else layer.w13_weight_scale
+            ),
+            w2_scale=(
+                layer.w2_weight_scale_inv
+                if self.block_quant
+                else layer.w2_weight_scale
+            ),
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=self.weight_block_size,
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1684,26 +1767,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
             )
         elif self.runner.runner_backend.is_triton():
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-                use_fp8_w8a8=True,
-                w13_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.weight_block_size,
-            )
+            quant_info = self.get_triton_quant_info(layer)
         else:
             raise NotImplementedError(
                 "Unsupported runner backend: %s" % self.runner.runner_backend

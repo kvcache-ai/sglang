@@ -1048,14 +1048,47 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         else:
+            # M3 path: sigmoid + correction_bias + num_fused_shared_experts=1.
+            # The installed sgl_kernel.topk_sigmoid does NOT handle shared
+            # experts, so we pick top_k routed via fused_topk and then patch
+            # the last slot in Python to point at the fused shared expert id
+            # (mirrors biased_grouped_topk_impl). Without this the shared
+            # expert (id=num_local_experts) is never routed to.
+            picked_topk = top_k if _use_aiter else top_k
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
-                renormalize=renormalize,
+                topk=picked_topk,
+                renormalize=False,  # do renorm below over routed-only slots
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
             )
+            if num_fused_shared_experts > 0 and scoring_func == "sigmoid":
+                num_experts = router_logits.shape[-1]
+                rsf = (
+                    1.0
+                    if routed_scaling_factor is None
+                    else float(routed_scaling_factor)
+                )
+                # Overwrite the LAST k slots with shared-expert ids (only k=1
+                # supported in fused mode for M3; assert keeps it honest).
+                assert num_fused_shared_experts == 1, (
+                    f"only num_fused_shared_experts=1 is supported, got "
+                    f"{num_fused_shared_experts}"
+                )
+                # Routed weights = first (top_k - 1) slots.
+                routed_w = topk_weights[:, :-1]
+                # Shared weight = sum(routed) / rsf (pre-renorm convention).
+                shared_w = routed_w.sum(dim=-1, keepdim=True) / rsf
+                if renormalize:
+                    routed_sum = routed_w.sum(dim=-1, keepdim=True)
+                    routed_w = routed_w / routed_sum
+                    shared_w = shared_w / routed_sum
+                topk_weights = torch.cat([routed_w, shared_w], dim=-1)
+                topk_ids = topk_ids.clone()
+                topk_ids[:, -1] = num_experts
+            elif renormalize:
+                topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             if _apply_rsf_post:
                 topk_weights = topk_weights * routed_scaling_factor
     else:

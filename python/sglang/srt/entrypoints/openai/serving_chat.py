@@ -1262,6 +1262,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
             )
+        if self.reasoning_parser == "minimax-m3":
+            # M3 prefills <mm:think> only for thinking_mode=enabled (start tag
+            # consumed by template -> absent from output -> must force).
+            # disabled/adaptive/unset self-emit the tag so the detector handles
+            # them. Keep in sync with reasoning_parser.py's factory branch.
+            return (request.chat_template_kwargs or {}).get(
+                "thinking_mode"
+            ) == "enabled"
         return True  # default
 
     async def _process_tool_call_stream(
