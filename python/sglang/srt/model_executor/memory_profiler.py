@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.mem_cache.deepseekv4_memory_pool import get_compress_state_ring_size
@@ -47,6 +49,9 @@ class DSv4MemoryCalculator:
         assert c4_shrink_factor >= 1
         self.c4_shrink_factor = c4_shrink_factor
 
+        cc = torch.cuda.get_device_capability()
+        self.use_bf16 = cc < (8, 9)
+
         self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
 
@@ -57,12 +62,15 @@ class DSv4MemoryCalculator:
         self.bytes_per_full_token = self.get_bytes_per_full_token()
 
     def get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
-
-        quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
+        if self.use_bf16:
+            kv_bytes = self.qk_nope_head_dim * 2 + self.qk_rope_head_dim * 2
+            indexer_bytes = self.indexer_head_dim * 2
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+            quant_block_size = 128
+            indexer_bytes = (
+                self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
+            )
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         state_dtype_size = 4
@@ -110,6 +118,7 @@ class DSv4MemoryCalculator:
 
         logger.info(
             f"DSv4 memory calculation: "
+            f"mode={'BF16' if self.use_bf16 else 'FP8'}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"full_token={full_token}"

@@ -36,6 +36,8 @@ from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+    quant_to_nope_bf16_rope_bf16_pack,
+    quant_to_nope_fp8_rope_bf16_pack,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
@@ -989,12 +991,30 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 cache_k=swa_k,
             )
         else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
-            self.token_to_kv_pool.set_swa_key_buffer_radix(
-                layer_id=layer_id,
-                raw_loc=raw_loc,
-                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
+            major, _ = torch.cuda.get_device_capability()
+            if self.token_to_kv_pool.swa_kv_pool.use_bf16_cache:
+                # SM_86 BF16 mode: no FP8 quantization, just pack BF16
+                swa_k_pack = quant_to_nope_bf16_rope_bf16_pack(swa_k)
+                self.token_to_kv_pool.set_swa_key_buffer_radix(
+                    layer_id=layer_id,
+                    raw_loc=raw_loc,
+                    cache_nope_fp8_rope_bf16_pack=None,
+                    cache_bf16_pack=swa_k_pack,
+                )
+            elif major >= 9:
+                swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+                self.token_to_kv_pool.set_swa_key_buffer_radix(
+                    layer_id=layer_id,
+                    raw_loc=raw_loc,
+                    cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+                )
+            else:
+                swa_k_pack = quant_to_nope_fp8_rope_bf16_pack(swa_k)
+                self.token_to_kv_pool.set_swa_key_buffer_radix(
+                    layer_id=layer_id,
+                    raw_loc=raw_loc,
+                    cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+                )
 
     def _maybe_upgrade_forward_metadata(self) -> None:
         # With SGLANG_PREP_IN_CUDA_GRAPH=1, init_forward_metadata_*

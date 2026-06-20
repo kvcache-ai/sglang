@@ -1402,6 +1402,9 @@ class ServerArgs:
                 )
 
             if self.kv_cache_dtype == "auto":
+                # V4 compressed attention needs FP8 KV cache.
+                # SM < 90 GPUs handle the FP8 storage via PyTorch fallbacks
+                # (the Triton FP8 path is gated on SM version in the write code).
                 self.kv_cache_dtype = "fp8_e4m3"
                 logger.warning(
                     f"Setting KV cache dtype to {self.kv_cache_dtype} for {model_arch}."

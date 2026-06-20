@@ -290,21 +290,11 @@ class SetS:
 class SetKAndS:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        if 0:
-            # print("SetK, SetS comparison test")
-            buf_cloned = buf.clone()
+        # Triton's fp8e4nv type is only supported on SM >= 90 (Hopper+).
+        # On older GPUs, fall back to the vanilla (pure-PyTorch) path.
+        cc = torch.cuda.get_device_capability()
+        if cc < (8, 9):
             cls.vanilla(*args, **kwargs, buf=buf)
-            cls.triton(*args, **kwargs, buf=buf_cloned)
-
-            def _clear_token_0(target):
-                target[0, :128] = target[0, 64 * 128 : 64 * 128 + 4] = 0
-
-            _clear_token_0(buf)
-            _clear_token_0(buf_cloned)
-
-            assert torch.all(
-                buf == buf_cloned
-            ), f"{buf=} {buf_cloned=} {kwargs['loc'].to_list()=}"
             return
 
         cls.triton(*args, **kwargs, buf=buf)

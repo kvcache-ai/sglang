@@ -361,6 +361,14 @@ class NanoV3Detector(BaseReasoningFormatDetector):
         )
 
 
+class _DeepSeekV3Detector(Qwen3Detector):
+    """DeepSeek-V3/V4 reuses Qwen3 tokens but requires explicit thinking=True to enable."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = "explicit_thinking"
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -375,7 +383,7 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": Qwen3Detector,
-        "deepseek-v4": Qwen3Detector,
+        "deepseek-v4": _DeepSeekV3Detector,
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,

@@ -52,29 +52,40 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if is_deepseek_compressed(self.model_config.hf_config):
-            from sglang.srt.mem_cache.deepseekv4_memory_pool import (
-                DeepSeekV4IndexerPool,
-            )
+            cc = torch.cuda.get_device_capability()
+            use_bf16 = cc < (8, 9)
 
-            assert kv_size == 1, kv_size  # uint8
-
-            cell_size = (
-                (
-                    self.model_config.qk_nope_head_dim
+            if use_bf16:
+                cell_size = (
+                    self.model_config.qk_nope_head_dim * 2
                     + self.model_config.qk_rope_head_dim * 2
+                ) * num_layers
+                index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                cell_size += index_head_dim * 2 * num_layers
+            else:
+                from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                    DeepSeekV4IndexerPool,
                 )
-                * num_layers
-                * kv_size
-            )
-            index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
-            indexer_size_per_token = (
-                index_head_dim
-                + index_head_dim // DeepSeekV4IndexerPool.quant_block_size * 4
-            )
-            element_size = torch._utils._element_size(
-                DeepSeekV4IndexerPool.index_k_with_scale_buffer_dtype
-            )
-            cell_size += indexer_size_per_token * num_layers * element_size
+
+                assert kv_size == 1, kv_size  # uint8
+
+                cell_size = (
+                    (
+                        self.model_config.qk_nope_head_dim
+                        + self.model_config.qk_rope_head_dim * 2
+                    )
+                    * num_layers
+                    * kv_size
+                )
+                index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
+                indexer_size_per_token = (
+                    index_head_dim
+                    + index_head_dim // DeepSeekV4IndexerPool.quant_block_size * 4
+                )
+                element_size = torch._utils._element_size(
+                    DeepSeekV4IndexerPool.index_k_with_scale_buffer_dtype
+                )
+                cell_size += indexer_size_per_token * num_layers * element_size
         elif self.use_mla_backend:
             cell_size = (
                 (
