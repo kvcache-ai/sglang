@@ -190,8 +190,15 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
+        interleaved: bool = False,
     ):
         super().__init__()
+        # kvcache's triton MoE assumes non-interleaved W13 (gate || up) layout;
+        # accept the upstream kwarg for API parity but reject interleaved=True
+        # so M3 / future callers fail loudly instead of silently scrambling weights.
+        assert not interleaved, (
+            "FusedMoE on kvcache fork only supports interleaved=False"
+        )
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
