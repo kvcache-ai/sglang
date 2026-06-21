@@ -104,6 +104,7 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     use_int8_w8a8: bool = False
     use_int8_w8a16: bool = False
     use_int4_w4a16: bool = False
+    use_mxfp8: bool = False
     per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
@@ -126,6 +127,36 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> TritonRunnerOutput:
 
+        # Native MXFP8 MoE: bypasses the block-fp8 GEMM path and consumes
+        # MXFP8 weights (uint8 ue8m0 [1,32] scale) directly via tl.dot_scaled.
+        # Used on SM90 (Hopper) and gfx95 (CDNA4) for M3.
+        if quant_info.use_mxfp8:
+            from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe import (
+                fused_experts_mxfp8,
+            )
+            out = fused_experts_mxfp8(
+                hidden_states=runner_input.hidden_states,
+                w1=quant_info.w13_weight,
+                w2=quant_info.w2_weight,
+                topk_weights=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                b1=quant_info.b13,
+                b2=quant_info.b2,
+                activation=self.config.activation,
+                is_gated=self.config.is_gated,
+                no_combine=self.config.no_combine,
+                inplace=self.config.inplace,
+                apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+                routed_scaling_factor=self.config.routed_scaling_factor,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_limit=self.config.gemm1_clamp_limit,
+                swiglu_limit=self.config.swiglu_limit,
+                interleaved=False,
+            )
+            return TritonRunnerOutput(hidden_states=out)
+
         # TODO: move these functions to the triton runner
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
             _swiglu_gpt_oss_sigmoid_alpha,
@@ -133,6 +164,14 @@ class TritonRunnerCore(MoeRunnerCore):
             invoke_fused_moe_kernel,
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
+        )
+        # M3 swiglu_oai with non-interleaved gate||up layout. kvcache fork's
+        # FusedMoE hard-asserts interleaved=False (layer.py:199), so the
+        # _swiglu_gpt_oss_sigmoid_alpha variant (which assumes interleaved
+        # x[..., ::2], x[..., 1::2]) was producing scrambled gate/up for M3.
+        # Route to the no-interleaved version that uses x.chunk(2, dim=-1).
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+            swiglu_no_interleaved_with_alpha_and_limit,
         )
 
         hidden_states = runner_input.hidden_states
@@ -215,7 +254,12 @@ class TritonRunnerCore(MoeRunnerCore):
         if activation == "silu":
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
-                intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+                # kvcache fork asserts interleaved=False (FusedMoE layer.py:199),
+                # so w13 output is concatenated gate||up. Use the chunk(2, dim=-1)
+                # variant (not the GPT-OSS interleaved stride-2 variant) so
+                # gate and up don't get scrambled — this was the root cause of
+                # M3 GSM8K accuracy crashing from ~98% to ~19%.
+                intermediate_cache2 = swiglu_no_interleaved_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
                 )
             elif gemm1_limit is not None:
@@ -360,8 +404,37 @@ def fused_experts_none_to_triton(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    if quant_info.use_mxfp8:
+        from sglang.srt.layers.moe.moe_runner.triton_utils.mxfp8_moe import (
+            fused_experts_mxfp8,
+        )
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        output = fused_experts_mxfp8(
+            hidden_states=dispatch_output.hidden_states,
+            w1=quant_info.w13_weight,
+            w2=quant_info.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            b1=quant_info.b13,
+            b2=quant_info.b2,
+            activation=runner_config.activation,
+            is_gated=runner_config.is_gated,
+            no_combine=runner_config.no_combine,
+            inplace=runner_config.inplace,
+            apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
+            routed_scaling_factor=runner_config.routed_scaling_factor,
+            gemm1_alpha=runner_config.gemm1_alpha,
+            gemm1_limit=runner_config.gemm1_clamp_limit,
+            swiglu_limit=runner_config.swiglu_limit,
+            interleaved=False,
+        )
+        return StandardCombineInput(hidden_states=output)
+
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
     output = fused_experts(
         hidden_states=dispatch_output.hidden_states,

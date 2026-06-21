@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
@@ -15,6 +16,26 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+AITER_PADDING_SIZE = 128
+TRITON_PADDING_SIZE = 128
+
+
+def get_moe_padding_size(is_aiter_moe):
+    """Per-kernel padding unit (upstream sgl-project/sglang).
+
+    Note: shadowed name with `sglang.srt.configs.update_config.get_moe_padding_size`
+    (different signature/semantics — that one takes weight_block_size).
+    Callers should import from the module they need.
+    """
+    if is_aiter_moe:
+        return AITER_PADDING_SIZE
+    return (
+        TRITON_PADDING_SIZE
+        if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
+        else 0
+    )
 
 
 class MoeA2ABackend(Enum):

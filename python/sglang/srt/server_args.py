@@ -56,6 +56,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    mxfp8_block_convert_required,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -713,6 +714,7 @@ class ServerArgs:
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
+    hisparse_config: Optional[str] = None
     hierarchical_sparse_attention_extra_config: Optional[str] = None
 
     # LMCache
@@ -924,6 +926,17 @@ class ServerArgs:
                 "KT SFT CPU expert forward with host-side input copies."
             )
             self.disable_cuda_graph = True
+
+        if (
+            self.enable_piecewise_cuda_graph
+            and self.quantization == "mxfp8"
+            and mxfp8_block_convert_required()
+        ):
+            logger.warning(
+                "Piecewise CUDA graph is disabled for MXFP8→block-fp8 conversion "
+                "(aten.mm.dtype unsupported by dynamo)."
+            )
+            self.enable_piecewise_cuda_graph = False
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
@@ -1994,6 +2007,42 @@ class ServerArgs:
         ):
             self.enable_flashinfer_allreduce_fusion = True
 
+        if model_arch in [
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+        ]:
+            quant_method = get_quantization_config(hf_config)
+            if (
+                self.quantization is None
+                and not self._quantization_explicitly_unset
+                and quant_method is not None
+            ):
+                self.quantization = quant_method
+
+            if is_hip():
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "triton"
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "triton"
+            elif is_sm100_supported():
+                if self.is_attention_backend_not_set():
+                    self.attention_backend = "fa4"
+                if self.page_size is None and self.attention_backend == "fa4":
+                    self.page_size = 128
+                if self.moe_runner_backend == "auto" and self.quantization == "mxfp8":
+                    self.moe_runner_backend = "deep_gemm"
+
+            if self.quantization is None and self.moe_runner_backend in (
+                "auto",
+                "deep_gemm",
+            ):
+                if self.moe_runner_backend == "deep_gemm":
+                    logger.warning(
+                        "MiniMax-M3: the deep_gemm MoE runner produces corrupted output "
+                        "on bf16 full weights; overriding --moe-runner-backend to 'triton'."
+                    )
+                self.moe_runner_backend = "triton"
+
     def _handle_mamba_radix_cache(
         self,
         model_arch: str,
@@ -2438,12 +2487,51 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
-            if self.moe_runner_backend not in ["auto", "cutlass"]:
+            if is_hip():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
+                elif self.moe_runner_backend not in [
+                    "triton",
+                    "cutlass",
+                    "deep_gemm",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                ]:
+                    logger.warning(
+                        "mxfp8 quantization on ROCm supports triton, cutlass, "
+                        "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
+                        f"backends. Overriding {self.moe_runner_backend!r}."
+                    )
+                    self.moe_runner_backend = "triton"
+            elif mxfp8_block_convert_required():
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "triton"
+                elif self.moe_runner_backend not in [
+                    "triton",
+                    "cutlass",
+                    "deep_gemm",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_routed",
+                ]:
+                    logger.warning(
+                        "mxfp8 block-fp8 conversion supports triton, cutlass, "
+                        "deep_gemm, flashinfer_trtllm, or flashinfer_trtllm_routed "
+                        f"backends. Overriding {self.moe_runner_backend!r}."
+                    )
+                    self.moe_runner_backend = "triton"
+            elif self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "flashinfer_trtllm"
+            elif self.moe_runner_backend not in [
+                "cutlass",
+                "deep_gemm",
+                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
+            ]:
                 logger.warning(
                     "mxfp8 quantization forces --moe-runner-backend=cutlass. "
                     f"Overriding {self.moe_runner_backend!r}."
                 )
-            self.moe_runner_backend = "cutlass"
+                self.moe_runner_backend = "cutlass"
 
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
@@ -2526,6 +2614,13 @@ class ServerArgs:
             assert self.moe_runner_backend in [
                 "flashinfer_cutlass"
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+
+        if self.kt_weight_path is not None and not self.disable_shared_experts_fusion:
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "KTransformers EP is enabled. --disable-shared-experts-fusion is automatically set "
+                "to prevent shared experts from being offloaded to CPU."
+            )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -4697,6 +4792,13 @@ class ServerArgs:
             "--enable-hisparse",
             action="store_true",
             help="Enable hierarchical sparse attention",
+        )
+        parser.add_argument(
+            "--hisparse-config",
+            type=str,
+            default=ServerArgs.hisparse_config,
+            help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
         )
         # Hierarchical sparse attention
         parser.add_argument(

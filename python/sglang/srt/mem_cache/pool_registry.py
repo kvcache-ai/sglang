@@ -69,3 +69,20 @@ def resolve_host_pool_factory(
         if predicate(model_config, server_args):
             return name, factory
     return None
+
+
+# ---------------------------------------------------------------------------
+# MiniMax M3 sparse-attention pool registration
+# ---------------------------------------------------------------------------
+
+from sglang.srt.configs.model_config import is_minimax_sparse
+from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+
+def _minimax_sparse_pool_predicate(model_config, server_args):
+    return is_minimax_sparse(model_config.hf_config)
+
+
+register_kv_pool_factory(
+    "minimax_m3_sparse", _minimax_sparse_pool_predicate, MiniMaxSparseKVPool
+)
