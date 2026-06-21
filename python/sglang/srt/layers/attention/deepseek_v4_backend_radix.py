@@ -991,7 +991,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 cache_k=swa_k,
             )
         else:
-            major, _ = torch.cuda.get_device_capability()
+            cc = torch.cuda.get_device_capability()
             if self.token_to_kv_pool.swa_kv_pool.use_bf16_cache:
                 # SM_86 BF16 mode: no FP8 quantization, just pack BF16
                 swa_k_pack = quant_to_nope_bf16_rope_bf16_pack(swa_k)
@@ -1001,7 +1001,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     cache_nope_fp8_rope_bf16_pack=None,
                     cache_bf16_pack=swa_k_pack,
                 )
-            elif major >= 9:
+            elif cc >= (8, 9):
                 swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
                 self.token_to_kv_pool.set_swa_key_buffer_radix(
                     layer_id=layer_id,
