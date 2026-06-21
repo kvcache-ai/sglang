@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
 if is_cuda():
-    from sgl_kernel import gptq_marlin_repack
+    from sglang.jit_kernel import gptq_marlin_repack
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
