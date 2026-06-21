@@ -133,7 +133,7 @@ def prepare_swa_ring_buffer_cache(
         device=loc_swa.device,
     )
     # SM version dispatch: BF16 cache on SM_86, FP8 on Hopper+
-    major, _ = torch.cuda.get_device_capability()
+    cc = torch.cuda.get_device_capability()
     if getattr(swa_kv_pool, "use_bf16_cache", False):
         swa_k_pack_bf16 = quant_to_nope_bf16_rope_bf16_pack(swa_k)
         index_buf_accessor_v4.SetBf16KAndS.execute(
@@ -142,7 +142,7 @@ def prepare_swa_ring_buffer_cache(
             loc=loc_newly_gen,
             pack=swa_k_pack_bf16,
         )
-    elif major >= 9:
+    elif cc >= (8, 9):
         swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
         index_buf_accessor_v4.SetKAndS.execute(
             pool=swa_kv_pool,
