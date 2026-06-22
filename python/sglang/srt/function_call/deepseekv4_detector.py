@@ -25,3 +25,6 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         self.bot_token = "<｜DSML｜tool_calls>"
         self.eot_token = "</｜DSML｜tool_calls>"
         self.function_calls_regex = r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>"
+
+    def get_structural_tag_name(self) -> str:
+        return "deepseek_v4"

@@ -13,6 +13,8 @@ from sglang.jit_kernel.deepseek_v4 import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+    quant_to_nope_bf16_rope_bf16_pack,
+    quant_to_nope_fp8_rope_bf16_pack,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
@@ -136,8 +138,20 @@ class CompressorBackend:
                 cache_k=new_compressed_kv,
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+            # Triton fp8e4nv only works on SM >= 90; use torch path on older GPUs
+            import torch
+
+            cc = torch.cuda.get_device_capability()
+            kv_bf16 = new_compressed_kv.bfloat16()
+            if cc < (8, 9):
+                # SM_86: all-bf16 cache, no FP8 quant
+                pack_bf16 = quant_to_nope_bf16_rope_bf16_pack(kv_bf16)
+                token_to_kv_pool.set_extra_key_buffer(
+                    layer_id, out_loc, cache_bf16_pack=pack_bf16,
+                )
+            elif cc >= (8, 9):
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_bf16)
+                token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
         self,
@@ -167,15 +181,24 @@ class CompressorBackend:
                 cache_k=new_compressed_kv,
             )
         else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
-            token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
-                index_k=new_compressed_kv_fp8,
-                index_k_scale=new_compressed_kv_scale,
-            )
+            cc = torch.cuda.get_device_capability()
+            if cc < (8, 9):
+                # SM_86: store BF16 directly, no FP8 quant / no scale
+                token_to_kv_pool.set_index_k_bf16(
+                    layer_id=layer_id,
+                    loc=self.forward_metadata.core_metadata.c4_out_loc,
+                    index_k_bf16=new_compressed_kv.bfloat16(),
+                )
+            else:
+                new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
+                    new_compressed_kv
+                )
+                token_to_kv_pool.set_index_k_scale_buffer(
+                    layer_id=layer_id,
+                    loc=self.forward_metadata.core_metadata.c4_out_loc,
+                    index_k=new_compressed_kv_fp8,
+                    index_k_scale=new_compressed_kv_scale,
+                )
 
 
 def is_overlap_compress(compress_ratio: int) -> bool:
