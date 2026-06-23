@@ -551,6 +551,7 @@ class ServerArgs:
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
+    pagedmoe_storage_root: Optional[str] = None
     kt_method: Optional[str] = None
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
@@ -4435,6 +4436,11 @@ class ServerArgs:
             "--kt-weight-path",
             type=str,
             help="[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
+        )
+        parser.add_argument(
+            "--pagedmoe-storage-root",
+            type=str,
+            help="[pagedmoe parameter] The root directory containing pagedmoe manifest.json and layer storage.",
         )
         parser.add_argument(
             "--kt-method",

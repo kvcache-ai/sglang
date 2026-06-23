@@ -647,6 +647,10 @@ class DeepseekV2Config(PretrainedConfig):
         )
 
 
+class GlmMoeDsaConfig(DeepseekV2Config):
+    model_type = "glm_moe_dsa"
+
+
 class DeepseekVL2Config(PretrainedConfig):
     model_type = "deepseek_vl_v2"
     vision_config: DeepseekVL2VisionEncoderConfig

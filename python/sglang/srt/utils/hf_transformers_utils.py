@@ -53,6 +53,7 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    GlmMoeDsaConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -86,6 +87,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
     DbrxConfig,
     ExaoneConfig,
+    GlmMoeDsaConfig,
     DeepseekVL2Config,
     MultiModalityConfig,
     KimiVLConfig,
@@ -541,9 +543,32 @@ def get_tokenizer(
         )
         raise RuntimeError(err_msg) from e
     except ValueError as e:
+        tokenizer_json = Path(tokenizer_name) / "tokenizer.json"
+        tokenizer_config = Path(tokenizer_name) / "tokenizer_config.json"
+        if "TokenizersBackend" in str(e) and tokenizer_json.exists():
+            tokenizer_kwargs: Dict[str, Any] = {
+                "tokenizer_file": str(tokenizer_json),
+                "clean_up_tokenization_spaces": False,
+            }
+            if tokenizer_config.exists():
+                with tokenizer_config.open() as f:
+                    tokenizer_config_data = json.load(f)
+                for key in (
+                    "bos_token",
+                    "eos_token",
+                    "pad_token",
+                    "unk_token",
+                    "model_max_length",
+                ):
+                    if key in tokenizer_config_data:
+                        tokenizer_kwargs[key] = tokenizer_config_data[key]
+            tokenizer = PreTrainedTokenizerFast(**tokenizer_kwargs)
+            logging.getLogger(tokenizer.__class__.__module__).addFilter(
+                TokenizerWarningsFilter()
+            )
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
-        if not trust_remote_code and (
+        elif not trust_remote_code and (
             "does not exist or is not currently imported." in str(e)
             or "requires you to execute the tokenizer file" in str(e)
         ):

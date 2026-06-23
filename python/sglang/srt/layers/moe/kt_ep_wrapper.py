@@ -1646,7 +1646,14 @@ def create_kt_config_from_server_args(
     if is_kt_ep_wrapper_disabled():
         return None
 
-    if server_args.kt_weight_path is None:
+    kt_method = (server_args.kt_method or "").upper()
+    weight_path = (
+        server_args.pagedmoe_storage_root
+        if kt_method == "PAGEDMOE" and server_args.pagedmoe_storage_root is not None
+        else server_args.kt_weight_path
+    )
+
+    if weight_path is None:
         return None
 
     # Get GPU experts masks (initializes if needed)
@@ -1669,7 +1676,7 @@ def create_kt_config_from_server_args(
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
         numa_nodes=server_args.kt_numa_nodes,
-        weight_path=server_args.kt_weight_path,
+        weight_path=weight_path,
         chunked_prefill_size=server_args.chunked_prefill_size,
         method=server_args.kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
