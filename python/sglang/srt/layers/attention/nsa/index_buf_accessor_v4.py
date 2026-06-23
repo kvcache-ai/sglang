@@ -31,12 +31,131 @@ class NopeFp8RopeBf16Pack:
         )
 
 
+# ---------------------------------------------------------------------------
+# BF16 cache pack (SM_86): nope + rope both stored as bfloat16, no scale.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NopeBf16RopeBf16Pack:
+    k_nope_bf16: torch.Tensor
+    k_rope_bf16: torch.Tensor
+
+    def __post_init__(self):
+        assert self.k_nope_bf16.shape[-1] == 448
+        assert self.k_rope_bf16.shape[-1] == 64
+
+    def slice_pack(self, _slice: Any) -> "NopeBf16RopeBf16Pack":
+        return NopeBf16RopeBf16Pack(
+            k_nope_bf16=self.k_nope_bf16[_slice],
+            k_rope_bf16=self.k_rope_bf16[_slice],
+        )
+
+
+class SetBf16KAndS:
+    """Scatter all-bf16 KV cache (nope + rope) into the page buffer."""
+
+    @classmethod
+    def execute(cls, pool, buf, loc, pack: NopeBf16RopeBf16Pack):
+        _set_bf16_k_and_s_triton(buf, loc, pack, pool.page_size)
+
+    @classmethod
+    def torch(cls, pool, buf, loc, pack: NopeBf16RopeBf16Pack):
+        _set_bf16_k_and_s_torch(buf, loc, pack, pool.page_size)
+
+
+@triton.jit
+def _set_bf16_k_and_s_kernel(
+    buf_bf16_ptr,
+    loc_ptr,
+    nope_ptr,
+    rope_ptr,
+    nope_stride_0,
+    rope_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BF16_PER_PAGE: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    TOKEN_BF16: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+    page = loc // PAGE_SIZE
+    off = loc % PAGE_SIZE
+    base = page * BF16_PER_PAGE + off * TOKEN_BF16
+
+    # Nope
+    nope_offs = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_offs < NOPE_DIM
+    nope_data = tl.load(
+        nope_ptr + token_id * nope_stride_0 + nope_offs,
+        mask=nope_mask, other=0.0,
+    )
+    tl.store(buf_bf16_ptr + base + nope_offs, nope_data, mask=nope_mask)
+
+    # Rope
+    rope_offs = tl.arange(0, BLOCK_ROPE)
+    rope_data = tl.load(rope_ptr + token_id * rope_stride_0 + rope_offs)
+    tl.store(buf_bf16_ptr + base + NOPE_DIM + rope_offs, rope_data)
+
+
+def _set_bf16_k_and_s_triton(buf: torch.Tensor, loc: torch.Tensor,
+                               pack: NopeBf16RopeBf16Pack, page_size: int):
+    (num_tokens,) = loc.shape
+    nope_dim, rope_dim = 448, 64
+    token_bf16 = nope_dim + rope_dim  # 512
+    buf_bf16 = buf.view(torch.bfloat16)
+    bf16_per_page = buf_bf16.shape[1]
+    loc = loc.to(torch.int64)
+
+    _set_bf16_k_and_s_kernel[(num_tokens,)](
+        buf_bf16, loc,
+        pack.k_nope_bf16, pack.k_rope_bf16,
+        pack.k_nope_bf16.stride(0), pack.k_rope_bf16.stride(0),
+        PAGE_SIZE=page_size, BF16_PER_PAGE=bf16_per_page,
+        NOPE_DIM=nope_dim, ROPE_DIM=rope_dim, TOKEN_BF16=token_bf16,
+        BLOCK_NOPE=512, BLOCK_ROPE=64,
+        num_warps=4,
+    )
+
+
+def _set_bf16_k_and_s_torch(buf: torch.Tensor, loc: torch.Tensor,
+                              pack: NopeBf16RopeBf16Pack, page_size: int):
+    """Torch scatter fallback."""
+    (num_tokens,), nope_dim = loc.shape, 448
+    rope_dim, buf_dim = 64, buf.shape[1]
+    device = buf.device
+    loc = loc.to(torch.int64)
+    token_bf16 = nope_dim + rope_dim
+
+    loc_page = loc // page_size
+    loc_off = loc % page_size
+
+    flat_bf16 = buf.view(torch.bfloat16).flatten()
+    bf16_per_page = buf_dim // 2
+
+    nope_base = loc_page * bf16_per_page + loc_off * token_bf16
+    nope_idx = nope_base[:, None] + torch.arange(nope_dim, device=device, dtype=torch.int64)[None, :]
+    nope_idx = nope_idx.reshape(-1)[: num_tokens * nope_dim]
+    flat_bf16[nope_idx] = pack.k_nope_bf16.reshape(-1)
+
+    rope_base = loc_page * bf16_per_page + loc_off * token_bf16 + nope_dim
+    rope_idx = rope_base[:, None] + torch.arange(rope_dim, device=device, dtype=torch.int64)[None, :]
+    rope_idx = rope_idx.reshape(-1)[: num_tokens * rope_dim]
+    flat_bf16[rope_idx] = pack.k_rope_bf16.reshape(-1)
 
 
 class SetKAndS:
     @classmethod
     def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
-        cls.triton(pool, buf, loc, nope_fp8_rope_bf16_pack)
+        # Triton's fp8e4nv type is only supported on SM >= 90 (Hopper+).
+        # SM_86 (Ampere) and older fall back to the Torch implementation.
+        cc = torch.cuda.get_device_capability()
+        if cc < (8, 9):
+            cls.torch(pool, buf, loc, nope_fp8_rope_bf16_pack)
+        else:
+            cls.triton(pool, buf, loc, nope_fp8_rope_bf16_pack)
 
     @classmethod
     def torch(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
@@ -193,6 +312,7 @@ def _set_k_and_s_torch(
     nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     page_size: int,
 ):
+    """Vectorized scatter that is CUDA-graph-capture safe."""
     num_pages, buf_numel_per_page = buf.shape
     (num_tokens_to_write,) = loc.shape
 
@@ -214,46 +334,55 @@ def _set_k_and_s_torch(
     ), f"{num_tokens_to_write=} {num_tokens_to_write_nope=} {num_tokens_to_write_rope=} {num_tokens_to_write_scale=}"
 
     assert buf.dtype == torch.uint8
-    assert loc.dtype in [
-        torch.int64,
-        torch.int32,
-    ], f"{loc.dtype=}"
-
+    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
     assert k_nope.dtype == fp8_dtype
     assert k_rope.dtype == torch.bfloat16
     assert scale_k_nope.dtype == torch.uint8
-
-    assert buf.is_contiguous()
-    assert loc.is_contiguous()
-    assert k_nope.is_contiguous()
-    assert k_rope.is_contiguous()
+    assert buf.is_contiguous() and loc.is_contiguous()
+    assert k_nope.is_contiguous() and k_rope.is_contiguous()
     assert scale_k_nope.is_contiguous()
 
-    buf_fp8 = buf.view(fp8_dtype).flatten()
-    buf_bf16 = buf.view(torch.bfloat16).flatten()
-    buf_scale = buf.view(torch.uint8).flatten()
+    device = buf.device
+    loc = loc.to(torch.int64)
+    loc_page_index = (loc // page_size).to(torch.int64)
+    loc_token_offset_in_page = (loc % page_size).to(torch.int64)
 
-    loc_page_index = loc // page_size
-    loc_token_offset_in_page = loc % page_size
+    nope_rope_bytes = nope_dim + rope_dim * 2
+    s_offset_nbytes_in_page = page_size * nope_rope_bytes
 
-    s_offset_nbytes_in_page = page_size * (nope_dim + rope_dim * 2)
-
-    nope_offset = loc_page_index * buf_numel_per_page + loc_token_offset_in_page * (
-        nope_dim + rope_dim * 2
+    # --- Nope (FP8, 1 byte/el) via uint8 view ---
+    flat_u8 = buf.flatten()
+    nope_base = (
+        loc_page_index * buf_numel_per_page
+        + loc_token_offset_in_page * nope_rope_bytes
     )
+    nope_idx = nope_base[:, None] + torch.arange(
+        nope_dim, device=device, dtype=torch.int64
+    )[None, :]
+    nope_idx = nope_idx.reshape(-1)[: num_tokens_to_write * nope_dim]
+    flat_u8[nope_idx] = k_nope.view(torch.uint8).reshape(-1)
 
-    rope_offset = (
-        loc_page_index * buf_numel_per_page // 2
-        + (loc_token_offset_in_page * (nope_dim + rope_dim * 2) + nope_dim) // 2
+    # --- Rope (BF16, 2 bytes/el) via bf16 view ---
+    flat_bf16 = buf.view(torch.bfloat16).flatten()
+    rope_base = (
+        loc_page_index * (buf_numel_per_page // 2)
+        + (loc_token_offset_in_page * nope_rope_bytes + nope_dim) // 2
     )
+    rope_idx = rope_base[:, None] + torch.arange(
+        rope_dim, device=device, dtype=torch.int64
+    )[None, :]
+    rope_idx = rope_idx.reshape(-1)[: num_tokens_to_write * rope_dim]
+    flat_bf16[rope_idx] = k_rope.reshape(-1)
 
-    s_offset = (
+    # --- Scale (uint8, 1 byte/padded el) via uint8 view ---
+    padded_scale_dim = scale_dim + 1
+    scale_base = (
         loc_page_index * buf_numel_per_page
         + s_offset_nbytes_in_page
-        + loc_token_offset_in_page * (scale_dim + 1)
+        + loc_token_offset_in_page * padded_scale_dim
     )
-
-    for i in range(num_tokens_to_write):
-        buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
-        buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
-        buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
+    scale_idx = scale_base[:, None] + torch.arange(
+        scale_dim, device=device, dtype=torch.int64
+    )[None, :]
+    scale_idx = scale_idx.reshape(-1)[: num_tokens_to_write * scale_dim]
+    flat_u8[scale_idx] = scale_k_nope.reshape(-1)

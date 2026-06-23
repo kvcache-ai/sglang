@@ -5,6 +5,8 @@ from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.deepseek_v4 import fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -43,6 +45,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         is_swa_pool: Optional[bool] = False,
+        use_bf16_cache: bool = False,
     ):
         super().__init__(
             size,
@@ -57,8 +60,15 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
 
-        self.scale_pad = 1
-        self.quantize_block_size = 64
+        self.use_bf16_cache = use_bf16_cache
+        if use_bf16_cache:
+            # BF16 mode: nope stored as bf16 (2B/el), rope as bf16 (2B/el),
+            # no per-tile scale section needed.
+            self.scale_pad = 0
+            self.quantize_block_size = 0
+        else:
+            self.scale_pad = 1
+            self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
         self.is_swa_pool = is_swa_pool
@@ -90,6 +100,11 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        if self.use_bf16_cache:
+            # nope (bf16, 2B/el) + rope (bf16, 2B/el) = all-bf16, no scale
+            nope_bytes = self.qk_nope_head_dim * 2   # 896
+            rope_bytes = self.qk_rope_head_dim * 2    # 128
+            return nope_bytes + rope_bytes             # 1024
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -104,7 +119,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
-        assert bytes_per_token == 448 + 64 * 2 + 8
+        if self.use_bf16_cache:
+            assert bytes_per_token == 448 * 2 + 64 * 2  # 1024
+        else:
+            assert bytes_per_token == 448 + 64 * 2 + 8
         assert self.store_dtype == torch.uint8
 
         return torch.zeros(
@@ -119,13 +137,22 @@ class DeepSeekV4SingleKVPool(KVCache):
         layer_id: int,
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        cache_bf16_pack: Any = None,
     ):
-        index_buf_accessor_v4.SetKAndS.execute(
-            pool=self,
-            buf=self.kv_buffer[layer_id],
-            loc=loc,
-            nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
-        )
+        if self.use_bf16_cache and cache_bf16_pack is not None:
+            index_buf_accessor_v4.SetBf16KAndS.execute(
+                pool=self,
+                buf=self.kv_buffer[layer_id],
+                loc=loc,
+                pack=cache_bf16_pack,
+            )
+        elif cache_nope_fp8_rope_bf16_pack is not None:
+            index_buf_accessor_v4.SetKAndS.execute(
+                pool=self,
+                buf=self.kv_buffer[layer_id],
+                loc=loc,
+                nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
+            )
 
     def set_key_buffer_fused(
         self,
@@ -142,6 +169,9 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
+        if self.use_bf16_cache:
+            # Return raw uint8 buffer — the dispatch will view as bf16.
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -259,6 +289,7 @@ class DeepSeekV4IndexerPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        use_bf16_cache: bool = False,
     ):
         super().__init__(
             size,
@@ -271,28 +302,40 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
+        self.use_bf16_cache = use_bf16_cache
 
         self._create_buffer()
 
     def _create_buffer(self):
-        num_scales_per_token = self.index_head_dim // self.quant_block_size
-        page_bytes = self.page_size * self.index_head_dim
-        page_bytes += self.page_size * num_scales_per_token * 4
+        num_pages = (self.size + self.page_size + 1) // self.page_size
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                self.index_k_with_scale_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size + 1) // self.page_size,
-                        page_bytes,
-                        dtype=self.index_k_with_scale_buffer_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                if self.use_bf16_cache:
+                    # BF16: (num_pages, page_size, head_dim) — no scales
+                    self.index_k_bf16_buffer = [
+                        torch.zeros(
+                            (num_pages, self.page_size, self.index_head_dim),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                else:
+                    num_scales_per_token = self.index_head_dim // self.quant_block_size
+                    page_bytes = self.page_size * self.index_head_dim
+                    page_bytes += self.page_size * num_scales_per_token * 4
+                    self.index_k_with_scale_buffer = [
+                        torch.zeros(
+                            (num_pages, page_bytes),
+                            dtype=self.index_k_with_scale_buffer_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError()
@@ -345,6 +388,46 @@ class DeepSeekV4IndexerPool(KVCache):
             page_size=self.page_size,
             type="indexer",
         )
+
+    def get_index_k_bf16_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.index_k_bf16_buffer[layer_id]
+
+    def set_index_k_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k_bf16: torch.Tensor,
+    ) -> None:
+        buf = self.index_k_bf16_buffer[layer_id - self.start_layer]
+        _scatter_index_k_bf16_kernel[(loc.shape[0],)](
+            buf, loc, index_k_bf16,
+            self.page_size, self.index_head_dim,
+            index_k_bf16.stride(0),
+            BLOCK_D=min(128, triton.next_power_of_2(self.index_head_dim)),
+        )
+
+
+@triton.jit
+def _scatter_index_k_bf16_kernel(
+    buf_ptr,
+    loc_ptr,
+    data_ptr,
+    page_size,
+    head_dim,
+    stride_data_t,
+    BLOCK_D: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+    page = loc // page_size
+    off = loc % page_size
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < head_dim
+    data = tl.load(
+        data_ptr + token_id * stride_data_t + offs_d, mask=mask_d, other=0.0,
+    )
+    buf_off = page * page_size * head_dim + off * head_dim + offs_d
+    tl.store(buf_ptr + buf_off, data, mask=mask_d)
 
 
 class DeepSeekV4LayerItem(NamedTuple):
@@ -409,10 +492,16 @@ class DeepSeekV4TokenToKVPool(KVCache):
 
         assert page_size % swa_page_size == 0
 
+        # SM_80/SM_86/SM_87 (Ampere) lack native FP8 support — store nope
+        # as bf16 instead of fp8. SM_89+ (Ada Lovelace and later) have FP8
+        # and use the quantized path. Cache grows from 584→1024 B/token.
+        cc = torch.cuda.get_device_capability()
+        _bf16 = cc < (8, 9)
+
         self.swa_size = swa_size
         self.swa_window_size = swa_page_size
         self.swa_page_size = swa_page_size
-        self.scale_pad = 1
+        self.scale_pad = 1 if not _bf16 else 0
 
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -432,6 +521,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
             device,
             enable_memory_saver,
             is_swa_pool=True,
+            use_bf16_cache=_bf16,
         )
 
         c4_kv_pool_type = DeepSeekV4SingleKVPool
@@ -446,6 +536,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
             c4_layer_num,
             device,
             enable_memory_saver,
+            use_bf16_cache=_bf16,
         )
 
         self.c128_kv_pool = DeepSeekV4SingleKVPool(
@@ -457,6 +548,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
             c128_layer_num,
             device,
             enable_memory_saver,
+            use_bf16_cache=_bf16,
         )
 
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
@@ -467,6 +559,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
             c4_layer_num,
             device,
             enable_memory_saver,
+            use_bf16_cache=_bf16,
         )
 
         self._init_compressed_layer_mapping()
@@ -520,7 +613,10 @@ class DeepSeekV4TokenToKVPool(KVCache):
         total_all += sum_bufs("c4_kv_pool", self.c4_kv_pool.kv_buffer)
         total_all += sum_bufs("c128_kv_pool", self.c128_kv_pool.kv_buffer)
         total_all += sum_bufs(
-            "c4_indexer_kv_pool", self.c4_indexer_kv_pool.index_k_with_scale_buffer
+            "c4_indexer_kv_pool",
+            self.c4_indexer_kv_pool.index_k_bf16_buffer
+            if self.c4_indexer_kv_pool.use_bf16_cache
+            else self.c4_indexer_kv_pool.index_k_with_scale_buffer,
         )
         if hasattr(self, "compress_state_pools"):
             c4_state_bufs = []
@@ -567,7 +663,9 @@ class DeepSeekV4TokenToKVPool(KVCache):
 
         for bufs in [
             self.c4_kv_pool.kv_buffer,
-            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+            self.c4_indexer_kv_pool.index_k_bf16_buffer
+            if self.c4_indexer_kv_pool.use_bf16_cache
+            else self.c4_indexer_kv_pool.index_k_with_scale_buffer,
             self.c128_kv_pool.kv_buffer,
         ]:
             for buf in bufs:
@@ -714,12 +812,14 @@ class DeepSeekV4TokenToKVPool(KVCache):
         self,
         layer_id: int,
         loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack = None,
+        cache_bf16_pack: Any = None,
     ) -> None:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         compress_kv_pool.set_key_buffer(
-            compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
+            compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack,
+            cache_bf16_pack=cache_bf16_pack,
         )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
@@ -752,6 +852,23 @@ class DeepSeekV4TokenToKVPool(KVCache):
             compress_layer_id, loc, index_k, index_k_scale
         )
 
+    def get_index_k_bf16_buffer(self, layer_id: int) -> torch.Tensor:
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        return self.c4_indexer_kv_pool.get_index_k_bf16_buffer(compress_layer_id)
+
+    def set_index_k_bf16(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k_bf16: torch.Tensor,
+    ) -> None:
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+        self.c4_indexer_kv_pool.set_index_k_bf16(
+            compress_layer_id, loc, index_k_bf16
+        )
+
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
 
@@ -768,11 +885,13 @@ class DeepSeekV4TokenToKVPool(KVCache):
         self,
         layer_id: int,
         raw_loc: torch.Tensor,
-        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
+        cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack = None,
+        cache_bf16_pack: Any = None,
     ) -> None:
         swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         self.swa_kv_pool.set_key_buffer(
-            layer_id, swa_loc, cache_nope_fp8_rope_bf16_pack
+            layer_id, swa_loc, cache_nope_fp8_rope_bf16_pack,
+            cache_bf16_pack=cache_bf16_pack,
         )
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:

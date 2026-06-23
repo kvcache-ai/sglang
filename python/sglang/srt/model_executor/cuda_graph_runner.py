@@ -494,7 +494,10 @@ class CudaGraphRunner:
         )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+            # KExpertsCPUBuffer.get_buffer() receives num_tokens (not num_seqs),
+            # so register the effective num_tokens per batch size.
+            num_tokens_bs = [bs * self.num_tokens_per_bs for bs in self.capture_bs]
+            KTMoEWrapper.set_capture_batch_sizes(num_tokens_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:

@@ -3601,6 +3601,31 @@ def mxfp_supported():
 
 
 @lru_cache(maxsize=1)
+
+
+def mxfp8_block_convert_required():
+    """Whether MXFP8 weights must be converted to block-fp8 [128,128] at load.
+
+    SM90 (Hopper H20/H100) lacks MX matmul HW; convert to block-fp8.
+    gfx942 (CDNA3) also lacks MX matmul HW. gfx95 keeps native MX path.
+    """
+    import torch
+    if not torch.version.hip:
+        cap = torch.cuda.get_device_capability()
+        if cap[0] < 10:
+            return True
+        return False
+    return is_gfx942_supported() and not is_gfx95_supported()
+
+
+def is_gfx942_supported():
+    import torch
+    if not torch.version.hip:
+        return False
+    props = torch.cuda.get_device_properties(0)
+    gcn_arch = getattr(props, "gcnArchName", "")
+    return "gfx942" in gcn_arch
+
 def is_gfx95_supported():
     """
     Returns whether the current platform supports MX types.

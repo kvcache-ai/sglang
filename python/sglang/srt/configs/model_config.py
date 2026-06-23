@@ -89,6 +89,50 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+
+
+def is_minimax_sparse(config: PretrainedConfig) -> bool:
+    arch = (config.architectures or [None])[0]
+    return arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    )
+
+
+def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
+    text_cfg = getattr(config, "text_config", None)
+    cfg = (
+        getattr(text_cfg, "sparse_attention_config", None)
+        if text_cfg is not None
+        else None
+    )
+    if cfg is None:
+        cfg = getattr(config, "sparse_attention_config", None)
+    if cfg is None:
+        raise ValueError("Could not find sparse config. Is it MiniMax M3 Sparse model?")
+    return cfg
+
+
+def get_minimax_sparse_layer_ids(sparse_cfg: dict) -> tuple[list[int], list[int]]:
+    sparse_freq = sparse_cfg["sparse_attention_freq"]
+    dense_layer_ids = [i for i, f in enumerate(sparse_freq) if f == 0]
+    sparse_layer_ids = [i for i, f in enumerate(sparse_freq) if f != 0]
+    return dense_layer_ids, sparse_layer_ids
+
+
+def get_minimax_sparse_disable_value_layer_ids(sparse_cfg: dict) -> list[int]:
+    flags = sparse_cfg.get("sparse_disable_index_value")
+    if flags is None:
+        return []
+    return [i for i, f in enumerate(flags) if f != 0]
+
+
+def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
+    score_type = sparse_cfg.get("sparse_score_type", "max")
+    assert score_type in ("max", "lse"), f"sparse_score_type must be max or lse, got {score_type!r}"
+    return score_type
+
+
 class ModelConfig:
     def __init__(
         self,

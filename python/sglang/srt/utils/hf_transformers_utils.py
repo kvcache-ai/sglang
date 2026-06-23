@@ -810,3 +810,12 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+
+def get_rope_config(config):
+    """Get (rope_theta, rope_params) from config, supporting both v4 and v5."""
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is not None:
+        return rope_params["rope_theta"], rope_params
+    return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
+

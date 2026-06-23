@@ -112,6 +112,12 @@ def act_quant(
         x.size(-1) % block_size == 0
     ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
 
+    # Triton's fp8e4nv is only supported on SM >= 90. On older GPUs
+    # (SM_86 Ampere etc), use a pure-PyTorch fallback instead.
+    cc = torch.cuda.get_device_capability()
+    if cc < (8, 9):
+        return _act_quant_torch(x, block_size)
+
     # Flatten all dims except last
     N = x.size(-1)
     x_flat = x.view(-1, N)
@@ -146,5 +152,31 @@ def act_quant(
         BLOCK_N=BLOCK_N,
         num_stages=num_stages,
     )
+
+    return y, s
+
+
+def _act_quant_torch(
+    x: torch.Tensor, block_size: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch fallback for act_quant on GPUs without hardware FP8."""
+    N = x.size(-1)
+    x_flat = x.view(-1, N)
+    M, N_dim = x_flat.shape
+
+    # Reshape for block-wise quantization
+    x_reshaped = x_flat.view(M, N_dim // block_size, block_size)
+
+    # Per-block max-abs → scale
+    amax = x_reshaped.abs().amax(dim=-1, keepdim=True)
+    scale = (amax / 448.0).clamp(min=1e-12)
+
+    # Scale, clamp, and convert to FP8 E4M3
+    x_scaled = x_reshaped.float() / scale.float()
+    x_clamped = x_scaled.clamp(-448.0, 448.0)
+    y = x_clamped.to(fp8_dtype).view(M, N_dim).view_as(x)
+
+    s = scale.squeeze(-1).to(torch.float32)
+    s = s.view(*x.size()[:-1], N_dim // block_size)
 
     return y, s

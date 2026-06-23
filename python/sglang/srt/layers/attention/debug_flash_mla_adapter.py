@@ -112,18 +112,39 @@ def _v4_triton_decode_dispatch(
     if num_tokens == 0:
         return (out.unsqueeze(1), None)
 
-    decode_sparse_attention_triton(
-        q=q_2d if q_2d.dtype == torch.bfloat16 else q_2d.to(torch.bfloat16),
-        swa_cache=swa_cache,
-        swa_indices=indices,
-        swa_lens=swa_lens,
-        scale=float(softmax_scale),
-        attn_sink=attn_sink,
-        out=out,
-        extra_cache=extra_cache,
-        extra_indices=extra_indices_in_kvcache,
-        extra_lens=extra_lens,
+    # SM_86 BF16 mode: cache is all-bf16 (1024 B/token), no FP8.
+    from sglang.srt.layers.attention.nsa.v4_triton_kernel import (
+        decode_sparse_attention_bf16,
+        decode_sparse_attention_triton,
     )
+
+    if swa_cache.shape[-1] == 1024:
+        # BF16 cache (nope 448×2 + rope 64×2 = 1024 bytes)
+        decode_sparse_attention_bf16(
+            q=q_2d if q_2d.dtype == torch.bfloat16 else q_2d.to(torch.bfloat16),
+            swa_cache=swa_cache,
+            swa_indices=indices,
+            swa_lens=swa_lens,
+            scale=float(softmax_scale),
+            attn_sink=attn_sink,
+            out=out,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices_in_kvcache,
+            extra_lens=extra_lens,
+        )
+    else:
+        decode_sparse_attention_triton(
+            q=q_2d if q_2d.dtype == torch.bfloat16 else q_2d.to(torch.bfloat16),
+            swa_cache=swa_cache,
+            swa_indices=indices,
+            swa_lens=swa_lens,
+            scale=float(softmax_scale),
+            attn_sink=attn_sink,
+            out=out,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices_in_kvcache,
+            extra_lens=extra_lens,
+        )
     return (out.unsqueeze(1), None)
 
 

@@ -355,6 +355,24 @@ class SharedFullContext:
         # Create CPU buffers once for weight loading (shared across layers)
         self._create_cpu_buffers()
 
+        # For M3 MXFP8 layerwise prefill, cache the canonical uint8 ue8m0
+        # scale Parameter objects so `_prepare_weight_mxfp8` can rebind to
+        # them before each byte-copy. Native MXFP8 path keeps the scale in
+        # this layout throughout (no convert to block-fp8).
+        if getattr(self, "is_mxfp8_quant", False):
+            self._init_mxfp8_aux()
+
+    def _init_mxfp8_aux(self) -> None:
+        """Cache the canonical uint8 ue8m0 [E, N, K//32] scale Parameters.
+
+        Fp8MoEMethod.create_weights (use_mxfp8=True) allocated them; we just
+        save references so the shadow gpu_layer can rebind back to the same
+        objects across rounds of layerwise prefill.
+        """
+        layer = self.gpu_layer
+        self._w13_scale_mxfp8_param = layer.w13_weight_scale_inv
+        self._w2_scale_mxfp8_param = layer.w2_weight_scale_inv
+
     def _build_layers(self, layer, init_args, global_num_experts, moe_runner_config):
         from sglang.srt.layers.moe.fused_moe_triton.layer import (
             UnquantizedFusedMoEMethod,
@@ -493,6 +511,7 @@ class SharedFullContext:
         # prefill fallback compat).
         if self.gpu_method.__class__.__name__ == "DeepSeekMxfp4MoEMethod":
             self.is_mxfp4_quant = True
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -501,6 +520,25 @@ class SharedFullContext:
         # INT4 Marlin
         if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
+            return
+
+        # M3 MXFP8 block (must come before FP8 block — both register
+        # `w13_weight_scale_inv`, but MXFP8 stores uint8 ue8m0 scales with
+        # block_size=[1,32] while FP8 block uses fp32 scales with [128,128]).
+        # The `format_ue8m0` attribute set by Fp8MoEMethod.create_weights
+        # when use_mxfp8=True (fp8.py:914) is the canonical discriminator.
+        # Origin: kt-sglang 耦合 (M3 MXFP8 layerwise prefill).
+        if (
+            hasattr(layer, "w13_weight_scale_inv")
+            and hasattr(layer, "w2_weight_scale_inv")
+            and getattr(layer.w13_weight_scale_inv, "format_ue8m0", False)
+        ):
+            self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = True
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -509,6 +547,7 @@ class SharedFullContext:
         # FP8 block
         if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = True
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = False
@@ -517,6 +556,7 @@ class SharedFullContext:
         # FP8 per-channel
         if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = True
             self.is_bf16_quant = False
@@ -525,6 +565,7 @@ class SharedFullContext:
         # BF16 / unquantized
         if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
             self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
             self.is_fp8_quant = False
             self.is_fp8_channel_quant = False
             self.is_bf16_quant = True
@@ -532,6 +573,7 @@ class SharedFullContext:
 
         # Fallback to class-based detection for unknown layouts.
         self.is_mxfp4_quant = False
+        self.is_mxfp8_quant = False
         self.is_fp8_quant = self._detect_fp8_quant()
         self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
         self.is_bf16_quant = self._detect_bf16_quant()
@@ -649,6 +691,13 @@ class SharedFullContext:
             # w13_weight_scale_inv, w2_weight, w2_weight_scale_inv); the
             # underlying byte payload differs (FP4 nibble + ue8m0 scale) but
             # the staging buffers don't care about content.
+            return self.WEIGHT_NAMES_FP8
+        if getattr(self, "is_mxfp8_quant", False):
+            # M3 MXFP8 reuses the FP8 block flat names. Byte payload is
+            # MXFP8 (fp8 + uint8 ue8m0 [1,32]) — staging buffer dtype/shape
+            # follow gpu_layer.w13_weight_scale_inv (uint8) so byte-copy
+            # transports the canonical layout. fused_experts_mxfp8 consumes
+            # it directly; no convert step.
             return self.WEIGHT_NAMES_FP8
         if self.is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
@@ -1155,6 +1204,38 @@ class SharedFullContext:
     # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
     # The conversion is handled separately in the normal weight loading path.
 
+    def _prepare_weight_mxfp8(self, wrapper, original_layer=None, gpu_experts_mask=None,
+                              logical_to_gpu_index=None):
+        """Byte-copy M3 MXFP8 weights from CPU staging buffer to GPU for the
+        full-GPU layerwise prefill fallback.
+
+        Shadow ``gpu_method`` stays in the MXFP8 view (``use_mxfp8=True``,
+        ``weight_block_size=[1, 32]``). ``Fp8MoEMethod.apply`` then routes
+        through ``get_triton_quant_info`` -> ``fused_experts_mxfp8``, which
+        consumes the uint8 ue8m0 scale directly via ``tl.dot_scaled`` — no
+        block-FP8 conversion, no precision loss.
+
+        Origin: kt-sglang 耦合 (M3 MXFP8 layerwise prefill, native MXFP8).
+        """
+        # Reset shadow to MXFP8 view (idempotent; ensures the Parameter slot
+        # points at the canonical uint8 ue8m0 tensor before byte-copy).
+        self.gpu_method.use_mxfp8 = True
+        self.gpu_method.weight_block_size = [1, 32]
+        self.gpu_layer.w13_weight_scale_inv = self._w13_scale_mxfp8_param
+        self.gpu_layer.w2_weight_scale_inv = self._w2_scale_mxfp8_param
+
+        # Byte-copy via the FP8 pipeline (uint8 ue8m0 scale + fp8 weight
+        # both copied bytewise from kt-kernel CPU staging buffer).
+        # original_layer=None disables the GPU shortcut: the real layer's
+        # scale slot may have been mutated by Fp8MoEMethod's post-load step
+        # on other paths; force the CPU staging route for canonical bytes.
+        self._prepare_weight_fp8(
+            wrapper,
+            original_layer=None,
+            gpu_experts_mask=None,
+            logical_to_gpu_index=None,
+        )
+
     def _prepare_weight_mxfp4(self, wrapper, original_layer=None, gpu_experts_mask=None,
                               logical_to_gpu_index=None):
         """Prepare V4-Flash MXFP4 weights for the full-GPU prefill fallback.
@@ -1548,6 +1629,13 @@ class SharedFullContext:
             # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
             # triton_kernels form. Origin: sglang 本身.
             self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
+                                       logical_to_gpu_index)
+        elif getattr(self, "is_mxfp8_quant", False):
+            # M3 MXFP8: byte-copy via FP8 path with original_layer=None
+            # (Phase 1 shortcut disabled) + Triton MXFP8->block-FP8 convert
+            # on shadow gpu_layer so apply() runs the standard block-FP8
+            # deep_gemm path. Origin: kt-sglang 耦合 (v2 bridge).
+            self._prepare_weight_mxfp8(wrapper, original_layer, gpu_experts_mask,
                                        logical_to_gpu_index)
         elif self.is_fp8_quant:
             self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
@@ -2474,17 +2562,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
         if self.tp_rank == 0:
-            # V4-Flash 2604B SwiGLU clamp on routed experts. The full
-            # moe_runner_config (which carries swiglu_limit) does not arrive
-            # until create_moe_runner(), but the value is fully determined
-            # by the DSV4 submode env (fixed at process start), so we read
-            # it here without waiting. Matches the assert
-            # `swiglu_limit == 10` in moe_runner/deep_gemm.py:_apply_swiglu_limit
-            # and the default 10.0 set for 2604B in mxfp4_deepseek.py.
-            # Origin: kt-sglang 耦合 (carries V4-2604B limit into kt-kernel).
-            from sglang.srt.environ import envs as _envs
-            _kt_swiglu_limit = (
-                10.0 if _envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" else 0.0
+            # SwiGLU activation params for CPU experts. Source of truth is
+            # MoeRunnerConfig, populated by the model file from HF config:
+            #   - minimax_m3.py forwards config.swiglu_alpha / swiglu_limit
+            #     as gemm1_alpha / gemm1_clamp_limit (swiglu_oai path)
+            #   - deepseek_v2.py forwards config.swiglu_limit into the
+            #     legacy swiglu_limit slot (DSV4 plain-silu clamp path)
+            # kt-kernel C++ accepts a single (alpha, limit) pair and
+            # disambiguates by alpha != 0 (swiglu_oai vs plain silu).
+            _mrc = getattr(layer, "moe_runner_config", None)
+            _cfg_alpha = getattr(_mrc, "gemm1_alpha", None) if _mrc is not None else None
+            _cfg_clamp = getattr(_mrc, "gemm1_clamp_limit", None) if _mrc is not None else None
+            _cfg_swglim = getattr(_mrc, "swiglu_limit", None) if _mrc is not None else None
+            _kt_swiglu_alpha = float(_cfg_alpha) if _cfg_alpha is not None else 0.0
+            _kt_swiglu_limit = float(
+                _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
             )
             common_wrapper_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
@@ -2525,6 +2617,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
                     swiglu_limit=_kt_swiglu_limit,
+                    swiglu_alpha=_kt_swiglu_alpha,
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
                 )
@@ -2682,10 +2775,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
         if self.tp_rank != 0 or self.wrapper is None:
             return
 

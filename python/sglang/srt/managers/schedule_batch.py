@@ -335,6 +335,46 @@ class MultimodalDataItem:
 
 
 @dataclasses.dataclass
+class MultimodalProcessorOutput:
+    """Raw output from multimodal processors before scheduler-side prep.
+
+    Ported from upstream sgl-project/sglang (see Justin's minimax-m3-upstream).
+    M3 VL processor returns this from `process()`.
+    """
+
+    mm_items: List[MultimodalDataItem]
+    input_ids: Optional[List[int]] = None
+    padded_input_ids: Optional[List[int]] = None
+
+    # image
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+
+    # video
+    video_token_id: Optional[int] = None
+
+    # audio
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
+
+    # Qwen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
+
+    # Moss-VL related
+    vision_position_ids: Optional[torch.Tensor] = None
+    media_nums_per_sample: Optional[List[int]] = None
+    visible_frame_counts: Optional[torch.Tensor] = None
+
+    # transformers-compatibility
+    token_type_ids: Optional[torch.Tensor] = None
+
+
+@dataclasses.dataclass
 class MultimodalInputs:
     """The multimodal data related inputs."""
 

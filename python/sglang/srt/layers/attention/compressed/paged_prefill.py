@@ -8,6 +8,8 @@ from sglang.jit_kernel.deepseek_v4 import tilelang_make_swa_prefill_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor_v4
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+    quant_to_nope_bf16_rope_bf16_pack,
+    quant_to_nope_fp8_rope_bf16_pack,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.utils import ceil_align
@@ -125,19 +127,37 @@ def prepare_swa_ring_buffer_cache(
         effective_swa_k_cache.dtype
     )
 
-    swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
     offset = num_pool_pages * swa_page_size
     loc_newly_gen = torch.arange(
-        offset,
-        offset + num_newly_gen_tokens,
+        offset, offset + num_newly_gen_tokens,
         device=loc_swa.device,
     )
-    index_buf_accessor_v4.SetKAndS.execute(
-        pool=swa_kv_pool,
-        buf=effective_swa_k_cache,
-        loc=loc_newly_gen,
-        nope_fp8_rope_bf16_pack=swa_k_pack,
-    )
+    # SM version dispatch: BF16 cache on SM_86, FP8 on Hopper+
+    cc = torch.cuda.get_device_capability()
+    if getattr(swa_kv_pool, "use_bf16_cache", False):
+        swa_k_pack_bf16 = quant_to_nope_bf16_rope_bf16_pack(swa_k)
+        index_buf_accessor_v4.SetBf16KAndS.execute(
+            pool=swa_kv_pool,
+            buf=effective_swa_k_cache,
+            loc=loc_newly_gen,
+            pack=swa_k_pack_bf16,
+        )
+    elif cc >= (8, 9):
+        swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+        index_buf_accessor_v4.SetKAndS.execute(
+            pool=swa_kv_pool,
+            buf=effective_swa_k_cache,
+            loc=loc_newly_gen,
+            nope_fp8_rope_bf16_pack=swa_k_pack,
+        )
+    else:
+        swa_k_pack = quant_to_nope_fp8_rope_bf16_pack(swa_k)
+        index_buf_accessor_v4.SetKAndS.execute(
+            pool=swa_kv_pool,
+            buf=effective_swa_k_cache,
+            loc=loc_newly_gen,
+            nope_fp8_rope_bf16_pack=swa_k_pack,
+        )
 
     if h := debug_dump_hook:
         h(
