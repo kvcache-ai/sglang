@@ -380,6 +380,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # KVCache Sparsity Engine controller (set when KSE is enabled)
+    kse_controller: Optional[Any] = None
+
     # DSV4 HiSparse coordinator handle, attached by ModelRunner.forward_*
     # before dispatching. Typed as Any to avoid importing the DSV4-only class
     # in this base file. See managers/hisparse_coordinator.py.
@@ -435,6 +438,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
         )
+        # Propagate KSE controller so attention backends can call hooks
+        ret.kse_controller = getattr(model_runner, "kse_controller", None)
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:

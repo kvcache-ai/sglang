@@ -93,7 +93,17 @@ class AttentionBackend(ABC):
         if forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
-            return self.forward_decode(
+            kse = getattr(forward_batch, "kse_controller", None)
+            if kse is not None:
+                # Reshape q to [bs, num_q_heads, head_dim] for the KSE policy
+                q_kse = q.view(forward_batch.batch_size, -1, layer.qk_head_dim)
+                forward_metadata = getattr(self, "forward_metadata", None)
+                forward_metadata = kse.before_attention(
+                    q_kse, layer.layer_id, forward_batch, forward_metadata
+                )
+                if forward_metadata is not None:
+                    self.forward_metadata = forward_metadata
+            output = self.forward_decode(
                 q,
                 k,
                 v,
@@ -102,6 +112,9 @@ class AttentionBackend(ABC):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+            if kse is not None:
+                kse.after_attention(layer.layer_id, forward_batch)
+            return output
         elif forward_batch.forward_mode.is_mixed() and is_npu():
             return self.forward_mixed(
                 q,
