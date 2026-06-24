@@ -107,6 +107,7 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    kt_skip_gpu_expert_cpu_copy: bool = False
     expert_lora_path: Optional[str] = None
 
 
@@ -2136,6 +2137,7 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        kt_skip_gpu_expert_cpu_copy=server_args.kt_skip_gpu_expert_cpu_copy,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
     )
 
@@ -2658,12 +2660,29 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     max_cache_depth=1,
                 )
             else:
+                _method = (self.kt_config.method or "").upper()
+                _dyn = self.kt_config.kt_enable_dynamic_expert_update
+                _mask_static = _method == "MXFP4" or (_method == "MXFP8" and not _dyn)
+                _kt_skip_cpu_copy = self.kt_config.kt_skip_gpu_expert_cpu_copy and _mask_static
+                if (
+                    self.kt_config.kt_skip_gpu_expert_cpu_copy
+                    and not _kt_skip_cpu_copy
+                    and self.kt_config.layer_idx == 0
+                ):
+                    logger.warning(
+                        "--kt-skip-gpu-expert-cpu-copy ignored: requires MXFP4, or "
+                        "MXFP8 with dynamic expert update disabled "
+                        "(method=%s, kt_enable_dynamic_expert_update=%s).",
+                        _method,
+                        _dyn,
+                    )
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
                     swiglu_limit=_kt_swiglu_limit,
                     swiglu_alpha=_kt_swiglu_alpha,
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
+                    skip_gpu_expert_cpu_copy=_kt_skip_cpu_copy,
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
