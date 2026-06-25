@@ -1440,6 +1440,13 @@ class ServerArgs:
 
             if self.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
                 self.swa_full_tokens_ratio = 0.1
+                # Bump default just enough to fit `chunks_in_flight × chunked_prefill_size`
+                # in the SWA pool. Otherwise long prompts (input >= 0.1 × max_total_tokens)
+                # silently hang on NO_TOKEN. Only acts when both knobs are explicit.
+                if self.chunked_prefill_size and self.max_total_tokens:
+                    chunks_in_flight = 1 if self.disable_overlap_schedule else 2
+                    needed = chunks_in_flight * self.chunked_prefill_size * 1.05
+                    self.swa_full_tokens_ratio = min(0.9, max(0.1, needed / self.max_total_tokens))
                 logger.info(
                     f"Setting swa_full_tokens_ratio to {self.swa_full_tokens_ratio} for {model_arch}."
                 )
