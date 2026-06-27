@@ -1,12 +1,9 @@
 import functools
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 
 from sglang.srt.utils import is_cuda
-
-if TYPE_CHECKING:
-    from sgl_kernel.scalar_type import ScalarType
 
 _is_cuda = is_cuda()
 
@@ -49,7 +46,7 @@ def fused_marlin_moe(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: float = None,
-    b_q_type: Optional["ScalarType"] = None,
+    b_q_type: Optional[torch.Tensor] = None,  # really ScalarType; Tensor for infer_schema compat
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -268,7 +265,7 @@ def fused_marlin_moe_fake(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: float = None,
-    b_q_type: Optional["ScalarType"] = None,
+    b_q_type: Optional[torch.Tensor] = None,  # really ScalarType; Tensor for infer_schema compat
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 

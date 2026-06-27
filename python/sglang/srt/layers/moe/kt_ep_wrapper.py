@@ -460,19 +460,18 @@ class SharedFullContext:
             if hasattr(self, _attr):
                 setattr(self, f"_{_attr}", getattr(self, _attr))
 
+        # Move all parameters to target device
+        for param in self.gpu_layer.parameters():
+            if param.device != target_device:
+                param.data = param.data.to(target_device)
 
-        # Save weight/scale shapes before any repack so we can re-create
-        # the raw (pre-repack) attributes during layerwise prefill loading.
+        # Save weight/scale shapes after device move so _restore_raw_attrs
+        # can re-create tensors on the correct device later.
         self._raw_weight_shapes = {}
         for _sn in self.weight_names:
             if hasattr(self.gpu_layer, _sn):
                 _t = getattr(self.gpu_layer, _sn)
                 self._raw_weight_shapes[_sn] = (tuple(_t.shape), _t.dtype, _t.device)
-
-        # Move all parameters to target device
-        for param in self.gpu_layer.parameters():
-            if param.device != target_device:
-                param.data = param.data.to(target_device)
 
         # Create runner config - update both num_experts and num_local_experts for full GPU fallback
         # Set routed_scaling_factor=None to avoid double scaling:
