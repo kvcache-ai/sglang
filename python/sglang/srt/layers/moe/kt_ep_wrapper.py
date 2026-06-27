@@ -2578,6 +2578,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_swiglu_limit = float(
                 _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
             )
+            # kt-kernel guards swiglu_limit to MXFP4/MXFP8 only.
+            # Zero it out for other methods (AMXINT4, BF16, etc.)
+            # so V4-Flash + non-MXFP runs don't crash at init.
+            if (self.kt_config.method or "").upper() not in ("MXFP4", "MXFP8"):
+                _kt_swiglu_limit = 0.0
+                _kt_swiglu_alpha = 0.0
             common_wrapper_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
