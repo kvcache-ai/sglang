@@ -71,6 +71,10 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
 
     # Optional
     expert_map: Optional[torch.Tensor] = None
+    # Explicit scalar type override — when set, fused_marlin_moe uses it
+    # directly instead of inferring from weight_bits.  Needed for FP8
+    # Marlin (float8_e4m3fn) vs INT8 Marlin (uint8b128).
+    b_q_type: Optional[torch.Tensor] = None
 
 
 @register_fused_func("none", "marlin")
@@ -118,6 +122,7 @@ def fused_experts_none_to_marlin(
         is_k_full=quant_info.is_k_full,
         inplace=runner_config.inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,
+        b_q_type=quant_info.b_q_type,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

@@ -144,6 +144,8 @@ class Fp8MarlinMoEMethod:
                 f"Unsupported topk output format: {topk_output.format}"
             )
 
+        from sgl_kernel.scalar_type import scalar_types
+
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_weight,
             w2_qweight=layer.w2_weight,
@@ -153,6 +155,7 @@ class Fp8MarlinMoEMethod:
             w2_g_idx_sort_indices=None,
             weight_bits=8,
             is_k_full=True,
+            b_q_type=scalar_types.float8_e4m3fn,
         )
 
         runner_output = self.runner.run(dispatch_output, quant_info=quant_info)
