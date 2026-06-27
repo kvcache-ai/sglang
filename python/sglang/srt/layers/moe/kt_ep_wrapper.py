@@ -3216,7 +3216,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 2: Copy selected expert weights from ctx.gpu_layer to layer.
         # Both are already in inference format: apply() already called
         # process_weights_after_loading() which handles Marlin repack.
-        if ctx.is_fp8_quant:
+        if ctx._is_fp8_quant:
             # Ampere Marlin vs native FP8 block quant: Marlin repack renames
             # w13_weight_scale_inv → w13_weight_scale and changes w13_weight
             # dtype fp8→int32.  Use gpu_method class name (invariant) to pick
@@ -3231,13 +3231,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     src_layer=ctx.gpu_layer, dst_layer=layer,
                     selected_experts=selected_experts,
                 )
-        elif ctx.is_fp8_channel_quant:
+        elif ctx._is_fp8_channel_quant:
             copy_experts_weights_fp8_channel(
                 src_layer=ctx.gpu_layer,
                 dst_layer=layer,
                 selected_experts=selected_experts,
             )
-        elif ctx.is_bf16_quant:
+        elif ctx._is_bf16_quant:
             copy_experts_weights_bf16(
                 src_layer=ctx.gpu_layer,
                 dst_layer=layer,
