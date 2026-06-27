@@ -21,7 +21,7 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         assert num_bits == 4
         return scalar_types.uint4
     else:
-        return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+        return scalar_types.uint4b8 if num_bits == 4 else scalar_types.float8_e4m3fn
 
 
 def fused_marlin_moe(
