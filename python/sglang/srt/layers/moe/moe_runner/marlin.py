@@ -15,6 +15,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
+    from sgl_kernel.scalar_type import ScalarType
+
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -74,7 +76,7 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     # Explicit scalar type override — when set, fused_marlin_moe uses it
     # directly instead of inferring from weight_bits.  Needed for FP8
     # Marlin (float8_e4m3fn) vs INT8 Marlin (uint8b128).
-    b_q_type: Optional[torch.Tensor] = None
+    b_q_type: Optional["ScalarType"] = None
 
 
 @register_fused_func("none", "marlin")

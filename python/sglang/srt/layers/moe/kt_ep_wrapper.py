@@ -1624,16 +1624,15 @@ class SharedFullContext:
         and _weight_scale_inv is renamed to _weight_scale.  This helper
         reverts those changes so downstream code always sees raw format.
         """
-        _target_device = self.gpu_layer.w13_weight.device
         for _stale in ("w13_weight_scale", "w2_weight_scale"):
             if hasattr(self.gpu_layer, _stale):
                 delattr(self.gpu_layer, _stale)
-        for _sn, (_shape, _dtype, _) in self._raw_weight_shapes.items():
+        for _sn, (_shape, _dtype, _device) in self._raw_weight_shapes.items():
             _cur = getattr(self.gpu_layer, _sn, None)
             if _cur is None or _cur.shape != _shape or _cur.dtype != _dtype:
                 setattr(self.gpu_layer, _sn,
                         torch.nn.Parameter(
-                            torch.empty(_shape, dtype=_dtype, device=_target_device)))
+                            torch.empty(_shape, dtype=_dtype, device=_device)))
     def load(self, layer_idx, wrapper, original_layer=None, gpu_experts_mask=None,
              logical_to_gpu_index=None):
         """Load weights from disk to GPU via shared memory.
