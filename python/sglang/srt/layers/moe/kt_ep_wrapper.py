@@ -359,7 +359,7 @@ class SharedFullContext:
         # scale Parameter objects so `_prepare_weight_mxfp8` can rebind to
         # them before each byte-copy. Native MXFP8 path keeps the scale in
         # this layout throughout (no convert to block-fp8).
-        if getattr(self, "is_mxfp8_quant", False):
+        if getattr(self, "_is_mxfp8_quant", False):
             self._init_mxfp8_aux()
 
     def _init_mxfp8_aux(self) -> None:
@@ -451,18 +451,14 @@ class SharedFullContext:
         # Detect quantization type for weight loading based on actually created weights.
         # This is more robust than class-based detection when quant methods are wrapped
         # (e.g., KT wrapper -> compressed-tensors scheme), especially in layerwise prefill.
+        # Run once at init.  Freeze the result into _is_* so downstream
+        # always sees the original quant type even if a Marlin repack
+        # later renames attributes (e.g. _inv → _weight_scale).
         self._detect_quant_type_from_created_weights()
-
-        # The detection writes internal state into _is_fp8_quant /
-        # _is_fp8_channel_quant.  Copy to the public attributes and freeze
-        # them — downstream code (weight_names, load(),
-        # _update_gpu_experts_from_batch) reads the public names and must
-        # never see Marlin-repack state flips.
         for _attr in ("is_mxfp4_quant", "is_mxfp8_quant", "is_fp8_quant",
                        "is_fp8_channel_quant", "is_bf16_quant"):
-            _priv = f"_{_attr}"
-            if hasattr(self, _priv):
-                setattr(self, _attr, getattr(self, _priv))
+            if hasattr(self, _attr):
+                setattr(self, f"_{_attr}", getattr(self, _attr))
 
         # Save weight/scale shapes before any repack so we can re-create
         # the raw (pre-repack) attributes during layerwise prefill loading.
@@ -530,19 +526,19 @@ class SharedFullContext:
         # prefill fallback compat).
         if self.gpu_method.__class__.__name__ == "DeepSeekMxfp4MoEMethod":
             self.is_mxfp4_quant = True
-            self._is_mxfp8_quant = False
-            self._is_fp8_quant = False
-            self._is_fp8_channel_quant = False
-            self._is_bf16_quant = False
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
             return
 
         # INT4 Marlin
         if hasattr(layer, "w13_weight_packed") and hasattr(layer, "w2_weight_packed"):
-            self._is_mxfp4_quant = False
-            self._is_mxfp8_quant = False
-            self._is_fp8_quant = False
-            self._is_fp8_channel_quant = False
-            self._is_bf16_quant = False
+            self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
             return
 
         # M3 MXFP8 block (must come before FP8 block — both register
@@ -556,46 +552,46 @@ class SharedFullContext:
             and hasattr(layer, "w2_weight_scale_inv")
             and getattr(layer.w13_weight_scale_inv, "format_ue8m0", False)
         ):
-            self._is_mxfp4_quant = False
-            self._is_mxfp8_quant = True
-            self._is_fp8_quant = False
-            self._is_fp8_channel_quant = False
-            self._is_bf16_quant = False
+            self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = True
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
             return
 
         # FP8 block
         if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
-            self._is_mxfp4_quant = False
-            self._is_mxfp8_quant = False
-            self._is_fp8_quant = True
-            self._is_fp8_channel_quant = False
-            self._is_bf16_quant = False
+            self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = True
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = False
             return
 
         # FP8 per-channel
         if hasattr(layer, "w13_weight_scale") and hasattr(layer, "w2_weight_scale"):
-            self._is_mxfp4_quant = False
-            self._is_mxfp8_quant = False
-            self._is_fp8_quant = False
-            self._is_fp8_channel_quant = True
-            self._is_bf16_quant = False
+            self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = True
+            self.is_bf16_quant = False
             return
 
         # BF16 / unquantized
         if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
-            self._is_mxfp4_quant = False
-            self._is_mxfp8_quant = False
-            self._is_fp8_quant = False
-            self._is_fp8_channel_quant = False
-            self._is_bf16_quant = True
+            self.is_mxfp4_quant = False
+            self.is_mxfp8_quant = False
+            self.is_fp8_quant = False
+            self.is_fp8_channel_quant = False
+            self.is_bf16_quant = True
             return
 
         # Fallback to class-based detection for unknown layouts.
-        self._is_mxfp4_quant = False
-        self._is_mxfp8_quant = False
-        self._is_fp8_quant = self._detect_fp8_quant()
-        self._is_fp8_channel_quant = self._detect_fp8_channel_quant()
-        self._is_bf16_quant = self._detect_bf16_quant()
+        self.is_mxfp4_quant = False
+        self.is_mxfp8_quant = False
+        self.is_fp8_quant = self._detect_fp8_quant()
+        self.is_fp8_channel_quant = self._detect_fp8_channel_quant()
+        self.is_bf16_quant = self._detect_bf16_quant()
 
     def _detect_fp8_quant(self) -> bool:
         """Detect if the quantization method is FP8 block quant.
@@ -705,24 +701,24 @@ class SharedFullContext:
     @property
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
-        if getattr(self, "is_mxfp4_quant", False):
+        if getattr(self, "_is_mxfp4_quant", False):
             # V4-Flash MXFP4 uses the same flat names as FP8 block (w13_weight,
             # w13_weight_scale_inv, w2_weight, w2_weight_scale_inv); the
             # underlying byte payload differs (FP4 nibble + ue8m0 scale) but
             # the staging buffers don't care about content.
             return self.WEIGHT_NAMES_FP8
-        if getattr(self, "is_mxfp8_quant", False):
+        if getattr(self, "_is_mxfp8_quant", False):
             # M3 MXFP8 reuses the FP8 block flat names. Byte payload is
             # MXFP8 (fp8 + uint8 ue8m0 [1,32]) — staging buffer dtype/shape
             # follow gpu_layer.w13_weight_scale_inv (uint8) so byte-copy
             # transports the canonical layout. fused_experts_mxfp8 consumes
             # it directly; no convert step.
             return self.WEIGHT_NAMES_FP8
-        if self.is_fp8_quant:
+        if self._is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
-        elif self.is_fp8_channel_quant:
+        elif self._is_fp8_channel_quant:
             return self.WEIGHT_NAMES_FP8_CHANNEL
-        elif self.is_bf16_quant:
+        elif self._is_bf16_quant:
             return self.WEIGHT_NAMES_BF16
         else:
             return self.WEIGHT_NAMES_INT4
@@ -794,7 +790,7 @@ class SharedFullContext:
             # Only allocate 2 experts worth of buffer (double buffering)
             expert_shape = gpu_tensor.shape[1:]  # Shape per expert
             if (
-                getattr(self, "is_mxfp4_quant", False)
+                getattr(self, "_is_mxfp4_quant", False)
                 and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
             ):
                 buf_dtype = torch.bfloat16
@@ -1665,28 +1661,28 @@ class SharedFullContext:
 
         # Select appropriate prepare_weight method based on quantization type
         # FP8/BF16 methods support GPU expert optimization; INT4 uses full CPU pipeline
-        if getattr(self, "is_mxfp4_quant", False):
+        if getattr(self, "_is_mxfp4_quant", False):
             # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
             # triton_kernels form. Origin: sglang 本身.
             self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
                                        logical_to_gpu_index)
-        elif getattr(self, "is_mxfp8_quant", False):
+        elif getattr(self, "_is_mxfp8_quant", False):
             # M3 MXFP8: byte-copy via FP8 path with original_layer=None
             # (Phase 1 shortcut disabled) + Triton MXFP8->block-FP8 convert
             # on shadow gpu_layer so apply() runs the standard block-FP8
             # deep_gemm path. Origin: kt-sglang 耦合 (v2 bridge).
             self._prepare_weight_mxfp8(wrapper, original_layer, gpu_experts_mask,
                                        logical_to_gpu_index)
-        elif self.is_fp8_quant:
+        elif self._is_fp8_quant:
             # When the inference layer is Marlin-repacked (int32), the
             # raw fp8 context layer can't share GPU→GPU copies.
             # Disable Phase 1 shortcut by passing original_layer=None.
             self._prepare_weight_fp8(wrapper, None, gpu_experts_mask,
                                      logical_to_gpu_index)
-        elif self.is_fp8_channel_quant:
+        elif self._is_fp8_channel_quant:
             self._prepare_weight_fp8_channel(wrapper, None, gpu_experts_mask,
                                              logical_to_gpu_index)
-        elif self.is_bf16_quant:
+        elif self._is_bf16_quant:
             self._prepare_weight_bf16(wrapper, original_layer, gpu_experts_mask,
                                       logical_to_gpu_index)
         else:
