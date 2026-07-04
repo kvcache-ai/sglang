@@ -190,6 +190,18 @@ def prepare_moe_fp8_layer_for_marlin(
     n = layer.intermediate_size_per_partition
     weight_block_size = getattr(layer, "weight_block_size", None)
 
+    # When wrapped by kt_ep_wrapper, the layer only holds num_gpu_experts
+    # weights while layer.num_experts still reports the global total.
+    # Derive the actual expert count from the weight tensor itself.
+    actual_e = layer.w13_weight.shape[0]
+    if actual_e != e:
+        logger.debug(
+            "layer.num_experts=%d but w13_weight.shape[0]=%d — using the "
+            "latter (kt_ep_wrapper GPU-expert subset).",
+            e, actual_e,
+        )
+        e = actual_e
+
     # WORKSPACE
     device = layer.w13_weight.device
     layer.workspace = marlin_make_workspace(device, 4)

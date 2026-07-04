@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -211,6 +212,31 @@ class Fp8Config(QuantizationConfig):
             from sglang.srt.environ import envs
 
             fp8_method = Fp8MoEMethod(self)
+
+            # --- Ampere / pre-Ada Marlin routing (standard FP8 only) ---
+            # On SM 80-88 (Ampere), native fp8_e4m3fn tensors are
+            # unsupported on GPU.  Route to Marlin weight-only backend
+            # which packs weights to int32 on CPU before GPU transfer.
+            #
+            # NOTE: DeepSeek V4 Flash MXFP4 is handled by the existing
+            # DeepSeekMxfp4MoEMethod (mxfp4_deepseek.py) which creates
+            # int8 tensors and works on Ampere out of the box — do NOT
+            # intercept its path.
+            if (
+                _is_cuda and not _is_hip
+                and not (
+                    envs.SGLANG_DSV4_MODE.get() == "2604"
+                    and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+                )
+            ):
+                major, minor = get_device_capability()
+                sm = major * 10 + minor
+                if sm < 89:  # Ampere / pre-Ada: no native FP8 hardware
+                    from sglang.srt.layers.quantization.fp8_marlin_moe import (
+                        Fp8MarlinMoEMethod,
+                    )
+                    return Fp8MarlinMoEMethod(fp8_method, prefix=prefix)
+            # --- End Ampere Marlin routing ---
 
             if (
                 envs.SGLANG_DSV4_MODE.get() == "2604"

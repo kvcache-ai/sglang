@@ -46,6 +46,7 @@ def fused_marlin_moe(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: float = None,
+    b_q_type: Optional[torch.Tensor] = None,  # really ScalarType; Tensor for infer_schema compat
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -144,8 +145,8 @@ def fused_marlin_moe(
             max_workspace_size, dtype=torch.int, device=device, requires_grad=False
         )
 
-    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
-    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
+    scalar_type1 = b_q_type if b_q_type is not None else get_scalar_type(num_bits, w1_zeros is not None)
+    scalar_type2 = b_q_type if b_q_type is not None else get_scalar_type(num_bits, w2_zeros is not None)
 
     intermediate_cache2 = torch.empty(
         (M * topk_ids.shape[1], N),
@@ -264,6 +265,7 @@ def fused_marlin_moe_fake(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: float = None,
+    b_q_type: Optional[torch.Tensor] = None,  # really ScalarType; Tensor for infer_schema compat
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 

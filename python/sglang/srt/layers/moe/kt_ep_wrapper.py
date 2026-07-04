@@ -359,7 +359,7 @@ class SharedFullContext:
         # scale Parameter objects so `_prepare_weight_mxfp8` can rebind to
         # them before each byte-copy. Native MXFP8 path keeps the scale in
         # this layout throughout (no convert to block-fp8).
-        if getattr(self, "is_mxfp8_quant", False):
+        if getattr(self, "_is_mxfp8_quant", False):
             self._init_mxfp8_aux()
 
     def _init_mxfp8_aux(self) -> None:
@@ -451,12 +451,27 @@ class SharedFullContext:
         # Detect quantization type for weight loading based on actually created weights.
         # This is more robust than class-based detection when quant methods are wrapped
         # (e.g., KT wrapper -> compressed-tensors scheme), especially in layerwise prefill.
+        # Run once at init.  Freeze the result into _is_* so downstream
+        # always sees the original quant type even if a Marlin repack
+        # later renames attributes (e.g. _inv → _weight_scale).
         self._detect_quant_type_from_created_weights()
+        for _attr in ("is_mxfp4_quant", "is_mxfp8_quant", "is_fp8_quant",
+                       "is_fp8_channel_quant", "is_bf16_quant"):
+            if hasattr(self, _attr):
+                setattr(self, f"_{_attr}", getattr(self, _attr))
 
         # Move all parameters to target device
         for param in self.gpu_layer.parameters():
             if param.device != target_device:
                 param.data = param.data.to(target_device)
+
+        # Save weight/scale shapes after device move so _restore_raw_attrs
+        # can re-create tensors on the correct device later.
+        self._raw_weight_shapes = {}
+        for _sn in self.weight_names:
+            if hasattr(self.gpu_layer, _sn):
+                _t = getattr(self.gpu_layer, _sn)
+                self._raw_weight_shapes[_sn] = (tuple(_t.shape), _t.dtype, _t.device)
 
         # Create runner config - update both num_experts and num_local_experts for full GPU fallback
         # Set routed_scaling_factor=None to avoid double scaling:
@@ -686,24 +701,24 @@ class SharedFullContext:
     @property
     def weight_names(self) -> list:
         """Get weight names based on quantization type."""
-        if getattr(self, "is_mxfp4_quant", False):
+        if getattr(self, "_is_mxfp4_quant", False):
             # V4-Flash MXFP4 uses the same flat names as FP8 block (w13_weight,
             # w13_weight_scale_inv, w2_weight, w2_weight_scale_inv); the
             # underlying byte payload differs (FP4 nibble + ue8m0 scale) but
             # the staging buffers don't care about content.
             return self.WEIGHT_NAMES_FP8
-        if getattr(self, "is_mxfp8_quant", False):
+        if getattr(self, "_is_mxfp8_quant", False):
             # M3 MXFP8 reuses the FP8 block flat names. Byte payload is
             # MXFP8 (fp8 + uint8 ue8m0 [1,32]) — staging buffer dtype/shape
             # follow gpu_layer.w13_weight_scale_inv (uint8) so byte-copy
             # transports the canonical layout. fused_experts_mxfp8 consumes
             # it directly; no convert step.
             return self.WEIGHT_NAMES_FP8
-        if self.is_fp8_quant:
+        if self._is_fp8_quant:
             return self.WEIGHT_NAMES_FP8
-        elif self.is_fp8_channel_quant:
+        elif self._is_fp8_channel_quant:
             return self.WEIGHT_NAMES_FP8_CHANNEL
-        elif self.is_bf16_quant:
+        elif self._is_bf16_quant:
             return self.WEIGHT_NAMES_BF16
         else:
             return self.WEIGHT_NAMES_INT4
@@ -775,7 +790,7 @@ class SharedFullContext:
             # Only allocate 2 experts worth of buffer (double buffering)
             expert_shape = gpu_tensor.shape[1:]  # Shape per expert
             if (
-                getattr(self, "is_mxfp4_quant", False)
+                getattr(self, "_is_mxfp4_quant", False)
                 and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
             ):
                 buf_dtype = torch.bfloat16
@@ -1601,6 +1616,22 @@ class SharedFullContext:
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
+    def _restore_raw_attrs(self):
+        """Restore ctx.gpu_layer weight/scale attributes to raw (pre-repack) format.
+
+        After Marlin repack, attribute shapes and dtypes change (fp8→int32)
+        and _weight_scale_inv is renamed to _weight_scale.  This helper
+        reverts those changes so downstream code always sees raw format.
+        """
+        for _stale in ("w13_weight_scale", "w2_weight_scale"):
+            if hasattr(self.gpu_layer, _stale):
+                delattr(self.gpu_layer, _stale)
+        for _sn, (_shape, _dtype, _device) in self._raw_weight_shapes.items():
+            _cur = getattr(self.gpu_layer, _sn, None)
+            if _cur is None or _cur.shape != _shape or _cur.dtype != _dtype:
+                setattr(self.gpu_layer, _sn,
+                        torch.nn.Parameter(
+                            torch.empty(_shape, dtype=_dtype, device=_device)))
     def load(self, layer_idx, wrapper, original_layer=None, gpu_experts_mask=None,
              logical_to_gpu_index=None):
         """Load weights from disk to GPU via shared memory.
@@ -1623,27 +1654,33 @@ class SharedFullContext:
         tp_rank = get_tensor_model_parallel_rank()
         t0 = time.perf_counter()
 
+        # Restore raw format before loading new layer's weights
+        self._restore_raw_attrs()
+
         # Select appropriate prepare_weight method based on quantization type
         # FP8/BF16 methods support GPU expert optimization; INT4 uses full CPU pipeline
-        if getattr(self, "is_mxfp4_quant", False):
+        if getattr(self, "_is_mxfp4_quant", False):
             # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
             # triton_kernels form. Origin: sglang 本身.
             self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
                                        logical_to_gpu_index)
-        elif getattr(self, "is_mxfp8_quant", False):
+        elif getattr(self, "_is_mxfp8_quant", False):
             # M3 MXFP8: byte-copy via FP8 path with original_layer=None
             # (Phase 1 shortcut disabled) + Triton MXFP8->block-FP8 convert
             # on shadow gpu_layer so apply() runs the standard block-FP8
             # deep_gemm path. Origin: kt-sglang 耦合 (v2 bridge).
             self._prepare_weight_mxfp8(wrapper, original_layer, gpu_experts_mask,
                                        logical_to_gpu_index)
-        elif self.is_fp8_quant:
-            self._prepare_weight_fp8(wrapper, original_layer, gpu_experts_mask,
+        elif self._is_fp8_quant:
+            # When the inference layer is Marlin-repacked (int32), the
+            # raw fp8 context layer can't share GPU→GPU copies.
+            # Disable Phase 1 shortcut by passing original_layer=None.
+            self._prepare_weight_fp8(wrapper, None, gpu_experts_mask,
                                      logical_to_gpu_index)
-        elif self.is_fp8_channel_quant:
-            self._prepare_weight_fp8_channel(wrapper, original_layer, gpu_experts_mask,
+        elif self._is_fp8_channel_quant:
+            self._prepare_weight_fp8_channel(wrapper, None, gpu_experts_mask,
                                              logical_to_gpu_index)
-        elif self.is_bf16_quant:
+        elif self._is_bf16_quant:
             self._prepare_weight_bf16(wrapper, original_layer, gpu_experts_mask,
                                       logical_to_gpu_index)
         else:
@@ -1652,6 +1689,7 @@ class SharedFullContext:
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
         total_time = (time.perf_counter() - t0) * 1000.0
 
         if tp_rank == 0:
@@ -2920,6 +2958,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         ):
             ctx = self._build_full_context(layer)
 
+            # Re-run quant post-processing on the full-expert gpu_layer
+            # if supported (e.g. Marlin repack for Fp8MarlinMoEMethod).
+            # The ctx.load() call writes raw fp8 weights; downstream apply()
+            # expects repacked format.
+            _needs_repack = hasattr(ctx.gpu_method, "process_weights_after_loading")
+            if _needs_repack:
+                ctx.gpu_method.process_weights_after_loading(ctx.gpu_layer)
+
             t_compute = time.perf_counter()
             result = ctx.gpu_method.apply(ctx.gpu_layer, dispatch_output)
             if torch.cuda.is_available():
@@ -2927,14 +2973,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             compute_time = (time.perf_counter() - t_compute) * 1000.0
 
             # Dynamic expert update: analyze batch and update GPU experts.
+            # MUST run BEFORE _restore_raw_attrs() because on Ampere FP8 the
+            # Marlin repack changes weight shapes/dtypes, and
+            # _restore_raw_attrs() creates empty tensors (torch.empty) to
+            # restore the raw fp8 format, destroying the weight data.
             # Skip for V4-Flash MXFP4 — `_update_gpu_experts_from_batch` →
             # `copy_experts_weights_int4` hardcodes int4 weight names
             # (`w13_weight_packed` etc.) and crashes on MXFP4 layouts. The
             # full-GPU fallback re-loads all 256 experts on every fire anyway,
             # so the dynamic-promote optimization is a no-op for MXFP4. Origin:
             # sglang 本身 (V4-Flash full-GPU prefill fallback compat).
-            _mxfp4_skip_dyn_update = getattr(ctx, "is_mxfp4_quant", False)
-            if self.kt_config.kt_enable_dynamic_expert_update and not _mxfp4_skip_dyn_update:
+            _mxfp4_skip_dyn_update = getattr(ctx, "_is_mxfp4_quant", False)
+            if (self.kt_config.kt_enable_dynamic_expert_update
+                    and not _mxfp4_skip_dyn_update):
                 t_update = time.perf_counter()
                 self._update_gpu_experts_from_batch(
                     layer=layer,
@@ -2959,6 +3010,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         self.kt_config.layer_idx,
                         compute_time,
                     )
+
+            # Restore raw format AFTER dynamic update so the context is
+            # clean for the next layer's load() call.
+            if _needs_repack:
+                ctx._restore_raw_attrs()
 
             return result
 
@@ -3161,20 +3217,31 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if dist.is_initialized():
             dist.broadcast(selected_experts, src=0, group=get_tp_group().device_group)
 
-        # Step 2: Copy weights from temporary layer to original layer
-        if ctx.is_fp8_quant:
-            copy_experts_weights_fp8(
-                src_layer=ctx.gpu_layer,
-                dst_layer=layer,
-                selected_experts=selected_experts,
-            )
-        elif ctx.is_fp8_channel_quant:
+        # Step 2: Copy selected expert weights from ctx.gpu_layer to layer.
+        # Both are already in inference format: apply() already called
+        # process_weights_after_loading() which handles Marlin repack.
+        if ctx._is_fp8_quant:
+            # Ampere Marlin vs native FP8 block quant: Marlin repack renames
+            # w13_weight_scale_inv → w13_weight_scale and changes w13_weight
+            # dtype fp8→int32.  Use gpu_method class name (invariant) to pick
+            # the right attribute-name list.
+            if ctx.gpu_method.__class__.__name__.endswith("MarlinMoEMethod"):
+                copy_experts_weights_fp8_channel(
+                    src_layer=ctx.gpu_layer, dst_layer=layer,
+                    selected_experts=selected_experts,
+                )
+            else:
+                copy_experts_weights_fp8(
+                    src_layer=ctx.gpu_layer, dst_layer=layer,
+                    selected_experts=selected_experts,
+                )
+        elif ctx._is_fp8_channel_quant:
             copy_experts_weights_fp8_channel(
                 src_layer=ctx.gpu_layer,
                 dst_layer=layer,
                 selected_experts=selected_experts,
             )
-        elif ctx.is_bf16_quant:
+        elif ctx._is_bf16_quant:
             copy_experts_weights_bf16(
                 src_layer=ctx.gpu_layer,
                 dst_layer=layer,
