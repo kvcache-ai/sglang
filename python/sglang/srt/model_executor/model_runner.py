@@ -132,6 +132,7 @@ from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
+from sglang.srt.layers.kse import KSEConfig, KSEController, create_kse_controller
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
@@ -644,6 +645,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
+
+        # Init KVCache Sparsity Engine (KSE) — must run after init_memory_pool
+        # and init_attention_backend so that token_to_kv_pool and
+        # server_args.attention_backend are both available.
+        self.kse_controller: Optional[KSEController] = None
+        if server_args.enable_kse:
+            self.init_kse_controller(server_args)
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
@@ -1876,6 +1884,56 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 .cuda()
             )
 
+    def init_kse_controller(self, server_args) -> None:
+        """Initialize the KVCache Sparsity Engine controller from ServerArgs.
+
+        The KSE backend is derived automatically from the active attention
+        backend so users do not need to configure it separately.
+        """
+        # Derive KSE backend from the active attention backend.
+        # sglang backend names map 1-to-1 to KSE adapter names.
+        attn_backend = server_args.attention_backend or "triton"
+        # Normalise flashattention variants (e.g. "fa3", "fa4") to "flashattention"
+        if attn_backend.startswith("fa") and attn_backend not in ("fa", "flashattention"):
+            kse_backend = "flashattention"
+        else:
+            kse_backend = attn_backend
+
+        policy_kwargs = {}
+        if server_args.kse_policy == "quest":
+            policy_kwargs = {
+                "token_budget_ratio": server_args.kse_token_budget_ratio,
+                "num_recent_pages": server_args.kse_num_recent_pages,
+            }
+        elif server_args.kse_policy == "streaming_llm":
+            policy_kwargs = {
+                "num_sink_tokens": server_args.kse_num_sink_tokens,
+                "window_size": server_args.kse_window_size,
+            }
+
+        kse_config = KSEConfig(
+            policy_name=server_args.kse_policy,
+            backend_name=kse_backend,
+            page_size=server_args.kse_page_size,
+            min_seq_len=server_args.kse_min_seq_len,
+            start_layer=server_args.kse_start_layer,
+            end_layer=server_args.kse_end_layer,
+            policy_kwargs=policy_kwargs,
+        )
+        self.kse_controller = create_kse_controller(
+            config=kse_config,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            device=torch.device(self.device),
+        )
+        logger.info(
+            "KSE enabled: policy=%s backend=%s page_size=%d min_seq_len=%d",
+            server_args.kse_policy,
+            kse_backend,
+            server_args.kse_page_size,
+            server_args.kse_min_seq_len,
+        )
+
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
@@ -2354,6 +2412,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.attn_backend = self.decode_attn_backend
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
+
+        # KSE: notify start of a new decode step
+        if self.kse_controller is not None:
+            self.kse_controller.before_forward(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -2588,6 +2650,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            # KSE: build KV representations and optionally evict after prefill
+            if self.kse_controller is not None:
+                self.kse_controller.after_prefill(forward_batch)
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:

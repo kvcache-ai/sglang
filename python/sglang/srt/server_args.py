@@ -748,6 +748,18 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # KVCache Sparsity Engine (KSE)
+    enable_kse: bool = False
+    kse_policy: str = "quest"
+    kse_page_size: int = 64
+    kse_min_seq_len: int = 2048
+    kse_start_layer: int = 0
+    kse_end_layer: int = -1
+    kse_token_budget_ratio: float = 0.3
+    kse_num_recent_pages: int = 4
+    kse_num_sink_tokens: int = 4
+    kse_window_size: int = 1024
+
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -4971,6 +4983,67 @@ class ServerArgs:
             type=int,
             default=ServerArgs.ds_sparse_decode_threshold,
             help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
+        )
+
+        # KVCache Sparsity Engine (KSE)
+        parser.add_argument(
+            "--enable-kse",
+            action="store_true",
+            help="Enable the KVCache Sparsity Engine (KSE) for sparse attention during decode.",
+        )
+        parser.add_argument(
+            "--kse-policy",
+            type=str,
+            default=ServerArgs.kse_policy,
+            help="KSE sparsity policy name. Built-in options: 'quest', 'streaming_llm'.",
+        )
+        parser.add_argument(
+            "--kse-page-size",
+            type=int,
+            default=ServerArgs.kse_page_size,
+            help="KSE sparse page size in tokens. Used by page-granularity policies such as 'quest'.",
+        )
+        parser.add_argument(
+            "--kse-min-seq-len",
+            type=int,
+            default=ServerArgs.kse_min_seq_len,
+            help="Minimum sequence length (tokens) before KSE applies sparse attention.",
+        )
+        parser.add_argument(
+            "--kse-start-layer",
+            type=int,
+            default=ServerArgs.kse_start_layer,
+            help="First transformer layer index (inclusive) on which KSE is applied.",
+        )
+        parser.add_argument(
+            "--kse-end-layer",
+            type=int,
+            default=ServerArgs.kse_end_layer,
+            help="Last transformer layer index (exclusive) on which KSE is applied. -1 means all layers.",
+        )
+        parser.add_argument(
+            "--kse-token-budget-ratio",
+            type=float,
+            default=ServerArgs.kse_token_budget_ratio,
+            help="(Quest) Fraction of KV pages to retain per layer. E.g. 0.3 keeps 30%% of pages.",
+        )
+        parser.add_argument(
+            "--kse-num-recent-pages",
+            type=int,
+            default=ServerArgs.kse_num_recent_pages,
+            help="(Quest) Number of most-recent pages always included regardless of score.",
+        )
+        parser.add_argument(
+            "--kse-num-sink-tokens",
+            type=int,
+            default=ServerArgs.kse_num_sink_tokens,
+            help="(StreamingLLM) Number of initial 'sink' tokens to retain permanently.",
+        )
+        parser.add_argument(
+            "--kse-window-size",
+            type=int,
+            default=ServerArgs.kse_window_size,
+            help="(StreamingLLM) Sliding window size: number of most-recent tokens to retain.",
         )
 
         # Offloading
