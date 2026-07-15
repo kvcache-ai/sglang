@@ -232,6 +232,8 @@ def test_fused_rope_store(
     atol = rtol = 1e-2
     # q should match RoPE-only result
     triton.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
+    # k is consumed by attention after this fused operation and must be rotated too
+    triton.testing.assert_close(k_ref, k_fused, atol=atol, rtol=rtol)
     # k_cache should contain the rotated k
     triton.testing.assert_close(
         k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
