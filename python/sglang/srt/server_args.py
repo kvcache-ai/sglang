@@ -732,6 +732,7 @@ class ServerArgs:
     kt_gpu_prefill_token_threshold: Optional[int] = None
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
+    kt_skip_gpu_expert_cpu_copy: bool = False
     kt_expert_placement_strategy: str = "uniform"
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
@@ -4892,6 +4893,15 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.kt_enable_dynamic_expert_update,
             help="[ktransformers parameter] Enable dynamic GPU expert updates based on runtime statistics. After full GPU fallback computation, updates original layer's GPU experts to match the most frequently activated experts in the current batch.",
+        )
+        parser.add_argument(
+            "--kt-skip-gpu-expert-cpu-copy",
+            action="store_true",
+            default=ServerArgs.kt_skip_gpu_expert_cpu_copy,
+            help="[ktransformers parameter] Skip allocating/loading the CPU copies of "
+                 "GPU-resident experts (placed on GPU via --kt-num-gpu-experts), reclaiming "
+                 "host RAM. Auto-ignored unless the path is mask-aware (MXFP4/MXFP8) and "
+                 "dynamic expert update is disabled.",
         )
         parser.add_argument(
             "--kt-expert-placement-strategy",
