@@ -568,13 +568,26 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
 
-    # can optimize (e.g. fuse / compile)
+    # yiqiliu2 / 2026-05-08: V4-Flash-safe + CUDA-graph-capture-safe
+    # rewrite. The original `scatter_add_` on `self._data[layer_idx, :]`
+    # crashed with "Index tensor must have the same number of dimensions
+    # as self tensor" on V4-Flash routing tensors. The intermediate
+    # rewrite (with `bool(valid_mask.any())` + `flat_ids[valid_mask]`)
+    # synced device→host (.item() / nonzero) which is forbidden during
+    # cuda graph capture (the recorder hook fires during capture too,
+    # see `_on_hook`'s `is_current_stream_capturing()` clause). This
+    # version uses pure GPU ops only:
+    #   - clamp(-1 → 0) so all indices are in-range
+    #   - src = (id >= 0) so invalid entries contribute 0 (no-op writes)
+    # No host sync, no boolean indexing, no nonzero.
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        topk_ids = topk_ids.flatten()
-        mask = topk_ids != -1
-        self._data[layer_idx, :].scatter_add_(
-            dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
-        )
+        if topk_ids is None:
+            return
+        flat_ids = topk_ids.reshape(-1).to(torch.int64)
+        target = self._data[layer_idx].reshape(-1)
+        valid = (flat_ids >= 0).to(target.dtype)
+        safe_ids = flat_ids.clamp(min=0)
+        target.scatter_add_(0, safe_ids, valid)
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
