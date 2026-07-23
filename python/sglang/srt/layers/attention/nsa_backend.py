@@ -74,6 +74,72 @@ global_workspace_buffer = None
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
 
+
+def _torch_fast_topk_v2(score, lengths, topk, row_starts=None):
+    """Pure-torch replacement for sgl_kernel.fast_topk_v2.
+
+    The sgl_kernel fast_topk family fails set_up_kernel_once on architectures
+    it was not built for (e.g. sm_120). Semantics: per row i, take topk over
+    score[i, row_starts[i] : row_starts[i] + lengths[i]], pad missing slots
+    with -1 (matches the fused kernels' invalid-index convention).
+    """
+    B, L = score.shape
+    pos = torch.arange(L, device=score.device).unsqueeze(0)
+    lengths = lengths.to(device=score.device)
+    if row_starts is not None:
+        rs = row_starts.to(device=score.device).unsqueeze(1)
+        valid = (pos >= rs) & (pos < rs + lengths.unsqueeze(1))
+    else:
+        valid = pos < lengths.unsqueeze(1)
+    # Rank invalid positions below everything else WITHOUT relying on the
+    # score values themselves: callers pass uninitialized "dummy" logits on
+    # short-sequence paths, which may contain NaN/inf. A NaN at a valid
+    # position must still be selectable, so judge validity by position only.
+    masked = torch.where(valid, score.nan_to_num(0.0), torch.full_like(score, float("-inf")))
+    k = min(topk, L)
+    _, idx = masked.topk(k, dim=-1)
+    selected_valid = torch.gather(valid, 1, idx)
+    idx = torch.where(selected_valid, idx.to(torch.int32), idx.new_full((), -1, dtype=torch.int32))
+    if k < topk:
+        idx = torch.nn.functional.pad(idx, (0, topk - k), value=-1)
+    return idx
+
+
+_fast_topk_v2_impl = None
+
+
+def _fast_topk_v2_compat(score, lengths, topk, row_starts=None):
+    """Use sgl_kernel fast_topk_v2 when it works on this GPU, else torch fallback."""
+    global _fast_topk_v2_impl
+    if _fast_topk_v2_impl is None:
+        import logging
+
+        # sgl_kernel's fast_topk family is not built for Blackwell workstation
+        # (sm_120) and fails set_up_kernel_once, leaving a stale CUDA lastError
+        # that poisons the next launch. Do not even try it there.
+        if torch.cuda.get_device_capability(score.device)[0] >= 12:
+            logging.getLogger(__name__).warning(
+                "Using torch.topk NSA fallback on sm_%d%d GPU.",
+                *torch.cuda.get_device_capability(score.device),
+            )
+            _fast_topk_v2_impl = _torch_fast_topk_v2
+        else:
+            from sgl_kernel import fast_topk_v2
+
+            try:
+                out = fast_topk_v2(score, lengths, topk, row_starts=row_starts)
+                _fast_topk_v2_impl = fast_topk_v2
+                return out
+            except RuntimeError as e:
+                logging.getLogger(__name__).warning(
+                    "sgl_kernel fast_topk_v2 unavailable on this GPU (%s); "
+                    "falling back to torch.topk implementation.", e
+                )
+                # clear the stale CUDA error left by the failed launch
+                torch.cuda.cudart().cudaGetLastError()
+                _fast_topk_v2_impl = _torch_fast_topk_v2
+    return _fast_topk_v2_impl(score, lengths, topk, row_starts=row_starts)
+
 # Control whether to verify fused metadata copy against individual copies (default: disabled)
 # Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification
 # This will crash with detailed error message if any inconsistency is detected
@@ -250,7 +316,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             page_table_size_1 = self.attn_metadata.page_table_1
 
         if not envs.SGLANG_NSA_FUSE_TOPK.get():
-            return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
+            return _fast_topk_v2_compat(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
             return fast_topk_transform_fused(
@@ -631,7 +697,8 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                from sglang.srt.layers.attention.nsa.nsa_indexer import _use_torch_mqa_logits as _utml
+                paged_mqa_schedule_metadata = None if _utml() else deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
@@ -913,7 +980,8 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
-                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                from sglang.srt.layers.attention.nsa.nsa_indexer import _use_torch_mqa_logits as _utml
+                paged_mqa_schedule_metadata = None if _utml() else deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
@@ -1082,11 +1150,16 @@ class NativeSparseAttnBackend(
                     )
                     else metadata.cache_seqlens_int32
                 )
-                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                from sglang.srt.layers.attention.nsa.nsa_indexer import _use_torch_mqa_logits as _utml
+                new_schedule = None if _utml() else deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
-                if metadata.paged_mqa_schedule_metadata is None:
-                    metadata.paged_mqa_schedule_metadata = new_schedule
+                if new_schedule is None:
+                    pass  # torch/Triton mqa-logits path needs no schedule
+                elif metadata.paged_mqa_schedule_metadata is None:
+                    object.__setattr__(
+                        metadata, "paged_mqa_schedule_metadata", new_schedule
+                    )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
             except (ImportError, ModuleNotFoundError):
@@ -1551,8 +1624,23 @@ class NativeSparseAttnBackend(
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
+            src_page_table = metadata.page_table_1
+            if src_page_table.shape[0] != topk_indices.shape[0]:
+                # Extend/verify path: page_table_1 is per-request but
+                # topk_indices is per-q-token. The fused kernel does this
+                # mapping internally via cu_seqlens_q. Use searchsorted +
+                # index_select (shape-static, value-dynamic) instead of
+                # repeat_interleave so the op stays CUDA-graph-capturable:
+                # repeat_interleave derives its output SHAPE from tensor data,
+                # which freezes stale values into a captured graph.
+                n = topk_indices.shape[0]
+                pos = torch.arange(n, device=src_page_table.device)
+                req_idx = torch.searchsorted(
+                    metadata.cu_seqlens_q[1:].to(torch.long), pos, right=True
+                ).clamp_(max=src_page_table.shape[0] - 1)
+                src_page_table = src_page_table.index_select(0, req_idx)
             page_table_1 = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
+                page_table=src_page_table,
                 topk_indices=topk_indices,
                 page_size=1,
             )
@@ -1829,6 +1917,31 @@ class NativeSparseAttnBackend(
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.tilelang_kernel import tilelang_sparse_fwd
 
+        if kv_cache.dtype == torch.float8_e4m3fn:
+            from sglang.srt.layers.attention.nsa.dequant_k_cache import (
+                dequantize_k_cache,
+            )
+
+            if q_all.shape[0] <= 64:
+                # Decode/verify: dequantize ONLY the gathered top-k rows
+                # (q_rows x 2048 x 656B, ~1-100MB) instead of the whole pool
+                # (which costs ~0.5GB per layer per token).
+                nq = q_all.shape[0]
+                flat_rows = page_table_1.reshape(-1).clamp_min(0).long()
+                gathered = kv_cache[flat_rows]
+                deq = dequantize_k_cache(gathered)
+                kv_cache = deq
+                topk = page_table_1.shape[-1]
+                local = (
+                    torch.arange(nq * topk, device=page_table_1.device, dtype=page_table_1.dtype)
+                    .view(nq, topk)
+                )
+                # preserve -1 padding (kernel masks those slots)
+                page_table_1 = torch.where(page_table_1 >= 0, local, page_table_1)
+            else:
+                # Prefill chunk: full-pool dequant amortizes over thousands of tokens.
+                kv_cache = dequantize_k_cache(kv_cache)
+
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
@@ -1954,8 +2067,23 @@ class NativeSparseAttnBackend(
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
+            src_page_table = metadata.page_table_1
+            if src_page_table.shape[0] != topk_indices.shape[0]:
+                # Extend/verify path: page_table_1 is per-request but
+                # topk_indices is per-q-token. The fused kernel does this
+                # mapping internally via cu_seqlens_q. Use searchsorted +
+                # index_select (shape-static, value-dynamic) instead of
+                # repeat_interleave so the op stays CUDA-graph-capturable:
+                # repeat_interleave derives its output SHAPE from tensor data,
+                # which freezes stale values into a captured graph.
+                n = topk_indices.shape[0]
+                pos = torch.arange(n, device=src_page_table.device)
+                req_idx = torch.searchsorted(
+                    metadata.cu_seqlens_q[1:].to(torch.long), pos, right=True
+                ).clamp_(max=src_page_table.shape[0] - 1)
+                src_page_table = src_page_table.index_select(0, req_idx)
             page_table_1 = transform_index_page_table_decode(
-                page_table=metadata.page_table_1,
+                page_table=src_page_table,
                 topk_indices=topk_indices,
                 page_size=1,
             )
