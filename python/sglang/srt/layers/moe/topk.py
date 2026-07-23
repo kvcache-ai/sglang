@@ -472,13 +472,23 @@ def fused_topk(
             renormalize,
         )
     elif scoring_func == "sigmoid":
-        topk_sigmoid(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-            correction_bias,
-        )
+        # Pure-torch sigmoid routing. sgl_kernel.topk_sigmoid (0.3.21) only
+        # writes topk_weights for the first 1408 rows on sm_120 (topk_ids are
+        # fully written), leaving the tail as stale device memory — reproduced
+        # deterministically from captured production tensors
+        # (logs/topk_nan_repro.pt). Routing cost is negligible relative to the
+        # MoE itself, so compute it in torch with eps-safe renormalization.
+        scores = gating_output.float().sigmoid()
+        if correction_bias is not None:
+            select_scores = scores + correction_bias.float().unsqueeze(0)
+        else:
+            select_scores = scores
+        sel_ids = torch.topk(select_scores, k=topk, dim=-1, sorted=False).indices
+        w = scores.gather(1, sel_ids)
+        if renormalize:
+            w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights.copy_(w)
+        topk_ids.copy_(sel_ids.to(torch.int32))
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
@@ -542,7 +552,7 @@ def grouped_topk_gpu(
             if num_fused_shared_experts == 0
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + 1e-20)  # eps: avoid 0/0 NaN on saturated routers
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -607,7 +617,7 @@ def kimi_k2_biased_topk_impl(
 
     if renormalize:
         topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + 1e-20)  # eps: avoid 0/0 NaN on saturated routers
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
@@ -679,7 +689,7 @@ def biased_grouped_topk_impl(
             if num_fused_shared_experts == 0
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
-        topk_weights = topk_weights / topk_weights_sum
+        topk_weights = topk_weights / (topk_weights_sum + 1e-20)  # eps: avoid 0/0 NaN on saturated routers
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor
 
