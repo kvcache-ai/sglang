@@ -779,11 +779,7 @@ class SharedFullContext:
         else:
             self.shm_unique_id = None
         if dist.is_initialized():
-            unique_id_list = [self.shm_unique_id]
-            dist.broadcast_object_list(
-                unique_id_list, src=0, group=get_tp_group().cpu_group
-            )
-            self.shm_unique_id = unique_id_list[0]
+            self.shm_unique_id = get_tp_group().broadcast_object(self.shm_unique_id)
 
         for name in self.weight_names:
             gpu_tensor = getattr(self.gpu_layer, name)
@@ -820,14 +816,14 @@ class SharedFullContext:
             self.cpu_buffers[name] = cpu_buffer
 
         if dist.is_initialized():
-            dist.barrier(group=get_tp_group().device_group)
+            get_tp_group().barrier()
 
         self.all_rank_buffer_ptrs = self._collect_all_rank_buffer_pointers()
 
         # Unlink shared memory after all ranks have collected pointers.
         # The memory remains accessible as long as we hold references via mmap.
         if dist.is_initialized():
-            dist.barrier(group=get_tp_group().device_group)
+            get_tp_group().barrier()
         for shm in self.shm_handles.values():
             shm.unlink()
 
@@ -1027,7 +1023,7 @@ class SharedFullContext:
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
+                get_tp_group().barrier()
 
             with torch.cuda.stream(copy_stream):
                 slot = e % 2  # Double buffering
@@ -1195,7 +1191,7 @@ class SharedFullContext:
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
+                get_tp_group().barrier()
 
             with torch.cuda.stream(copy_stream):
                 for _, cpu_buf, gpu_t in weight_infos:
@@ -1443,7 +1439,7 @@ class SharedFullContext:
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
+                get_tp_group().barrier()
 
             with torch.cuda.stream(copy_stream):
                 for _, cpu_buf, gpu_t in weight_infos:
@@ -1595,7 +1591,7 @@ class SharedFullContext:
 
             # Barrier to ensure all ranks see the written data
             if dist.is_initialized():
-                dist.barrier(group=get_tp_group().device_group)
+                get_tp_group().barrier()
 
             with torch.cuda.stream(copy_stream):
                 for _, cpu_buf, gpu_t in weight_infos:
