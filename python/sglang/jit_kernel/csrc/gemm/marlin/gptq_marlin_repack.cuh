@@ -30,7 +30,7 @@
 namespace device::marlin {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-template <int const num_threads, int const num_bits, bool const has_perm>
+template <int const num_threads, int const num_bits, bool const has_perm, bool const input_n_major = false>
 __global__ void gptq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr,
     uint32_t const* __restrict__ perm_ptr,
@@ -40,7 +40,7 @@ __global__ void gptq_marlin_repack_kernel(
   return;
 }
 #else
-template <int const num_threads, int const num_bits, bool const has_perm>
+template <int const num_threads, int const num_bits, bool const has_perm, bool const input_n_major = false>
 __global__ void gptq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr,
     uint32_t const* __restrict__ perm_ptr,
@@ -48,6 +48,14 @@ __global__ void gptq_marlin_repack_kernel(
     int size_k,
     int size_n) {
   constexpr int pack_factor = 32 / num_bits;
+
+  if constexpr (input_n_major) {
+    // One grid-y slice owns one expert.  Expert payload size is identical in
+    // native and Marlin layouts, so both offsets use N*K/pack_factor words.
+    int64_t expert_stride = static_cast<int64_t>(size_n) * size_k / pack_factor;
+    b_q_weight_ptr += blockIdx.y * expert_stride;
+    out_ptr += blockIdx.y * expert_stride;
+  }
 
   int k_tiles = size_k / tile_k_size;
   int n_tiles = size_n / tile_n_size;
@@ -130,9 +138,25 @@ __global__ void gptq_marlin_repack_kernel(
         int first_k = k_tile_id * tile_k_size;
         int first_k_packed = first_k / pack_factor;
 
-        cp_async4(
-            &sh_ptr[k_id * stage_n_threads + n_id],
-            reinterpret_cast<int4 const*>(&(b_q_weight_ptr[(first_k_packed + k_id) * size_n + first_n + (n_id * 4)])));
+        if constexpr (input_n_major) {
+          // DeepSeek V4 stores packed MXFP4 as [N, K / 8] int32.  Populate
+          // the same K-major shared-memory tile consumed by the Marlin
+          // repacker directly, avoiding a full [K / 8, N] transpose.
+          int4 values;
+          int src_n = first_n + n_id * 4;
+          int src_k = first_k_packed + k_id;
+          int src_stride = size_k / pack_factor;
+          values.x = b_q_weight_ptr[(src_n + 0) * src_stride + src_k];
+          values.y = b_q_weight_ptr[(src_n + 1) * src_stride + src_k];
+          values.z = b_q_weight_ptr[(src_n + 2) * src_stride + src_k];
+          values.w = b_q_weight_ptr[(src_n + 3) * src_stride + src_k];
+          sh_ptr[k_id * stage_n_threads + n_id] = values;
+        } else {
+          cp_async4(
+              &sh_ptr[k_id * stage_n_threads + n_id],
+              reinterpret_cast<int4 const*>(
+                  &(b_q_weight_ptr[(first_k_packed + k_id) * size_n + first_n + (n_id * 4)])));
+        }
       }
     }
 
@@ -286,6 +310,22 @@ __global__ void gptq_marlin_repack_kernel(
         size_n);                                                                                                  \
   }
 
+#define CALL_IF_N_MAJOR_REPACK(NUM_BITS)                                                                              \
+  else if (num_bits == NUM_BITS) {                                                                                    \
+    host::RuntimeDeviceCheck(cudaFuncSetAttribute(                                                                    \
+        device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, false, true>,             \
+        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                                  \
+        max_shared_mem));                                                                                             \
+    host::LaunchKernel(                                                                                               \
+        dim3(blocks, num_experts), device::marlin::repack_threads, stream, static_cast<std::size_t>(max_shared_mem))( \
+        device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, false, true>,             \
+        b_q_weight_ptr,                                                                                               \
+        nullptr,                                                                                                      \
+        out_ptr,                                                                                                      \
+        size_k,                                                                                                       \
+        size_n);                                                                                                      \
+  }
+
 void gptq_marlin_repack(
     tvm::ffi::TensorView b_q_weight,
     tvm::ffi::TensorView perm,
@@ -359,4 +399,52 @@ void gptq_marlin_repack(
   }
 }
 
+// Repack DeepSeek V4's native [N, K / 2] byte layout without materializing
+// the legacy GPTQ [K / 8, N] int32 transpose.  Input and output are both
+// caller-owned so layerwise prefill can prepare into either resident buffer.
+void mxfp4_marlin_repack(tvm::ffi::TensorView b_q_weight, tvm::ffi::TensorView out, int64_t size_k, int64_t size_n) {
+  using namespace host;
+  constexpr int num_bits = 4;
+  constexpr int pack_factor = 32 / num_bits;
+  int64_t num_experts = b_q_weight.dim() == 3 ? b_q_weight.size(0) : 1;
+
+  RuntimeCheck(size_k % device::marlin::tile_k_size == 0, "size_k must be divisible by Marlin tile_k_size");
+  RuntimeCheck(size_n % device::marlin::tile_n_size == 0, "size_n must be divisible by Marlin tile_n_size");
+
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLCUDA>();
+  if (b_q_weight.dim() == 3) {
+    TensorMatcher({num_experts, size_n, size_k / 2}).with_dtype<uint8_t>().with_device(device_).verify(b_q_weight);
+    TensorMatcher({num_experts, size_k / device::marlin::tile_size, size_n * device::marlin::tile_size / pack_factor})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(out);
+  } else {
+    TensorMatcher({size_n, size_k / 2}).with_dtype<uint8_t>().with_device(device_).verify(b_q_weight);
+    TensorMatcher({size_k / device::marlin::tile_size, size_n * device::marlin::tile_size / pack_factor})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(out);
+  }
+
+  auto const* b_q_weight_ptr = reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr());
+  auto* out_ptr = reinterpret_cast<uint32_t*>(out.data_ptr());
+  DLDevice dl_device = device_.unwrap();
+  int dev = dl_device.device_id;
+  cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
+  int blocks;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, dev));
+  int max_shared_mem = 0;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  RuntimeCheck(max_shared_mem > 0, "max_shared_mem must be > 0");
+
+  if (false) {
+  }
+  CALL_IF_N_MAJOR_REPACK(4)
+  else {
+    Panic("Unsupported direct MXFP4 repack config");
+  }
+}
+
 #undef CALL_IF_REPACK
+#undef CALL_IF_N_MAJOR_REPACK
