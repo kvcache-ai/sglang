@@ -134,6 +134,9 @@ class DSv4MemoryCalculator:
             mem_fraction_static=mr.mem_fraction_static,
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
+            reservation_bytes=getattr(
+                mr, "mxfp4_layerwise_prefill_reservation_bytes", 0
+            ),
         )
 
         if self.is_speculative:
@@ -156,13 +159,20 @@ def profile_available_bytes(
     mem_fraction_static: float,
     distributed: bool = False,
     cpu_group=None,
+    reservation_bytes: int = 0,
 ) -> int:
     from sglang.srt.utils.common import get_available_gpu_memory
 
     available_gpu_memory = get_available_gpu_memory(
         device, gpu_id, distributed=distributed, cpu_group=cpu_group
     )
-    rest_memory = available_gpu_memory - total_gpu_memory * (1 - mem_fraction_static)
+    reservation_bytes = max(0, int(reservation_bytes))
+    reservation_gib = reservation_bytes / (1 << 30)
+    rest_memory = (
+        available_gpu_memory
+        - total_gpu_memory * (1 - mem_fraction_static)
+        - reservation_gib
+    )
 
     available_bytes = int(rest_memory * (1 << 30))
 
@@ -170,6 +180,7 @@ def profile_available_bytes(
         f"Memory profiling: available_gpu_memory={available_gpu_memory:.2f} GB, "
         f"total_gpu_memory={total_gpu_memory:.2f} GB, "
         f"mem_fraction_static={mem_fraction_static:.2f}, "
+        f"lazy_mxfp4_slot_reservation={reservation_gib:.2f} GB, "
         f"rest_memory={rest_memory:.2f} GB"
     )
 

@@ -2459,6 +2459,78 @@ def _mxfp4_pipeline_runtime_supported(method, layer: torch.nn.Module) -> bool:
     )
 
 
+def _mxfp4_raw_slot_storage_nbytes(
+    *, num_experts: int, hidden_size: int, intermediate_size: int
+) -> int:
+    """Return the bytes in one full-expert raw MXFP4 slot.
+
+    This mirrors ``DeepSeekMxfp4MoEMethod.create_weights`` without creating
+    any tensors.  The resulting value is used only to limit KV-cache sizing;
+    the actual full-expert slot remains lazy.
+    """
+    int8_size = torch.tensor([], dtype=torch.int8).element_size()
+    float32_size = torch.tensor([], dtype=torch.float32).element_size()
+    return (
+        num_experts * (2 * intermediate_size) * (hidden_size // 2) * int8_size
+        + num_experts * hidden_size * (intermediate_size // 2) * int8_size
+        + num_experts
+        * (2 * intermediate_size)
+        * (hidden_size // 32)
+        * float32_size
+        + num_experts
+        * hidden_size
+        * (intermediate_size // 32)
+        * float32_size
+    )
+
+
+def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
+    """Return the unallocated MXFP4 slot capacity needed after a long request.
+
+    KV-cache profiling normally consumes all currently free VRAM.  With
+    layerwise slots allocated lazily, that would leave no capacity when the
+    first threshold-qualified request arrives.  Account for two raw and two
+    prepared slots here, but do not materialize them until that request.
+    """
+    total_bytes = 0
+    for signature, registry in _MXFP4_PREFILL_LAYER_REGISTRY.items():
+        if (
+            not registry
+            or signature in _MXFP4_LAYERWISE_MANAGERS
+            or signature in _MXFP4_LAYERWISE_DISABLED_REASONS
+        ):
+            continue
+
+        first_layer_idx = min(registry)
+        method, layer = registry[first_layer_idx]
+        if not _mxfp4_pipeline_runtime_supported(method, layer):
+            continue
+
+        init_args = getattr(method, "_full_init_args", None)
+        num_experts = getattr(method, "global_num_experts", None)
+        if init_args is None or num_experts is None:
+            continue
+        hidden_size, intermediate_size, _ = init_args
+
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            get_v4_mxfp4_marlin_storage_nbytes,
+        )
+
+        raw_slot_bytes = _mxfp4_raw_slot_storage_nbytes(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        prepared_slot_bytes = get_v4_mxfp4_marlin_storage_nbytes(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        total_bytes += 2 * (raw_slot_bytes + prepared_slot_bytes)
+
+    return total_bytes
+
+
 def _register_mxfp4_prefill_layer(method, layer: torch.nn.Module) -> None:
     if not _mxfp4_pipeline_requested(method):
         return
@@ -2552,6 +2624,7 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
     signature = getattr(method, "_mxfp4_pipeline_signature", None)
     if signature is None:
         signature = _mxfp4_pipeline_signature(method, layer)
+        method._mxfp4_pipeline_signature = signature
     if signature in _MXFP4_LAYERWISE_MANAGERS:
         return
     if signature in _MXFP4_LAYERWISE_DISABLED_REASONS:
@@ -2655,7 +2728,7 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
             )
         )
         logger.info(
-            "KT MXFP4 layerwise prefill initialized two raw + two Marlin "
+            "KT MXFP4 layerwise prefill lazily initialized two raw + two Marlin "
             "prepared full-layer slots on %s (raw=%.2f GiB, "
             "prepared=%.2f GiB, total=%.2f GiB)",
             manager.device,
@@ -2665,17 +2738,29 @@ def _initialize_mxfp4_layerwise_pipeline(method, layer: torch.nn.Module) -> None
         )
 
 
-def finalize_mxfp4_layerwise_prefill() -> None:
-    """Reserve pipeline slots after model setup and before KV-cache profiling."""
+def _get_or_initialize_mxfp4_layerwise_manager(
+    method, layer: torch.nn.Module
+) -> Optional[_Mxfp4LayerwisePrefillManager]:
+    """Return the persistent manager, allocating its slots on first use.
 
-    for signature, registry in list(_MXFP4_PREFILL_LAYER_REGISTRY.items()):
-        if not registry:
-            continue
-        first_layer_idx = min(registry)
-        method, layer = registry[first_layer_idx]
-        if getattr(method, "_mxfp4_pipeline_signature", None) != signature:
-            raise RuntimeError("MXFP4 layerwise prefill registry signature mismatch")
-        _initialize_mxfp4_layerwise_pipeline(method, layer)
+    This function is called only from a threshold-qualified prefill forward.
+    Each TP rank executes it before the manager enters its transport
+    collectives, and `_initialize_mxfp4_layerwise_pipeline` keeps allocation
+    failures consistent across ranks.  An OOM records a disabled reason and
+    returns ``None`` so the triggering request can use hybrid CPU/GPU MoE.
+    """
+
+    signature = getattr(method, "_mxfp4_pipeline_signature", None)
+    if signature is None:
+        signature = _mxfp4_pipeline_signature(method, layer)
+        method._mxfp4_pipeline_signature = signature
+
+    manager = _MXFP4_LAYERWISE_MANAGERS.get(signature)
+    if manager is not None or signature in _MXFP4_LAYERWISE_DISABLED_REASONS:
+        return manager
+
+    _initialize_mxfp4_layerwise_pipeline(method, layer)
+    return _MXFP4_LAYERWISE_MANAGERS.get(signature)
 
 
 def generate_front_loading_masks(
@@ -3954,6 +4039,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if _mxfp4_manager is not None and not _full_gpu_gate:
             _mxfp4_manager.abort_round()
 
+        # Allocate the persistent full-layer slots only when a request actually
+        # enters the MXFP4 layerwise path.  Startup reserves only their
+        # KV-cache budget, not the tensors themselves; an allocation OOM still
+        # records a disabled reason and this same request falls through to the
+        # existing hybrid CPU/GPU path below.
+        if (
+            _full_gpu_gate
+            and _mxfp4_requested
+            and not _mxfp4_disabled_after_oom
+            and _mxfp4_manager is None
+            and _mxfp4_pipeline_runtime_supported(self, layer)
+        ):
+            _mxfp4_manager = _get_or_initialize_mxfp4_layerwise_manager(
+                self, layer
+            )
+            _mxfp4_signature = getattr(self, "_mxfp4_pipeline_signature", None)
+            _mxfp4_disabled_after_oom = (
+                _mxfp4_signature in _MXFP4_LAYERWISE_DISABLED_REASONS
+                if _mxfp4_signature is not None
+                else False
+            )
+
         if _full_gpu_gate and not (
             _mxfp4_requested and _mxfp4_disabled_after_oom
         ):
@@ -3961,7 +4068,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if _mxfp4_manager is None:
                     raise RuntimeError(
                         "MXFP4 layerwise prefill is supported but was not "
-                        "initialized during model finalization"
+                        "initialized during lazy slot allocation"
                     )
                 return _mxfp4_manager.apply(self, layer, dispatch_output)
 
