@@ -585,27 +585,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
-        # Reserve MXFP4's two layerwise-prefill slots only after all model
-        # loading and adaptation work is complete.  This keeps a recoverable
-        # slot-allocation OOM from starving model construction while still
-        # accounting for the slots during KV-cache profiling below.
+        # Do not allocate the MXFP4 layerwise slots at startup.  Still account
+        # for their future capacity before KV-cache profiling, otherwise the
+        # pool can consume the VRAM needed by the first long prefill request.
+        self.mxfp4_layerwise_prefill_reservation_bytes = 0
         if (
             (server_args.kt_method or "").upper() == "MXFP4"
             and (server_args.kt_gpu_prefill_token_threshold or 0) > 0
         ):
             from sglang.srt.layers.moe.kt_ep_wrapper import (
-                finalize_mxfp4_layerwise_prefill,
+                get_mxfp4_layerwise_prefill_reservation_bytes,
             )
 
-            enable_cpu_backup = server_args.enable_weights_cpu_backup or (
-                self.is_draft_worker
-                and server_args.enable_draft_weights_cpu_backup
+            self.mxfp4_layerwise_prefill_reservation_bytes = (
+                get_mxfp4_layerwise_prefill_reservation_bytes()
             )
-            with self.memory_saver_adapter.region(
-                GPU_MEMORY_TYPE_WEIGHTS,
-                enable_cpu_backup=enable_cpu_backup,
-            ):
-                finalize_mxfp4_layerwise_prefill()
 
         # Init memory pool and attention backends
         self.init_memory_pool()

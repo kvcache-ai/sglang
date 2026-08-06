@@ -10,6 +10,7 @@ contains no allocator, transpose, concat, or routing conversion traffic.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -118,6 +119,36 @@ def _prepared_shapes(num_experts: int, hidden_size: int, intermediate_size: int)
         (num_experts, hidden_size // V4_FP4_GROUP_SIZE, 2 * intermediate_size),
         (num_experts, intermediate_size // _MARLIN_TILE, 2 * hidden_size),
         (num_experts, intermediate_size // V4_FP4_GROUP_SIZE, hidden_size),
+    )
+
+
+def get_v4_mxfp4_marlin_storage_nbytes(
+    *, num_experts: int, hidden_size: int, intermediate_size: int
+) -> int:
+    """Return the bytes required for one prepared V4 MXFP4 layer image.
+
+    Keeping this calculation next to ``allocate_v4_mxfp4_marlin`` lets the
+    lazy layerwise-prefill path reserve KV-cache budget without allocating the
+    prepared tensors during server startup.
+    """
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    if hidden_size % 64 or intermediate_size % 64:
+        raise ValueError(
+            "Marlin requires hidden/intermediate multiples of 64, got "
+            f"{hidden_size}/{intermediate_size}"
+        )
+
+    w13, w13_scale, w2, w2_scale = _prepared_shapes(
+        num_experts, hidden_size, intermediate_size
+    )
+    return (
+        math.prod(w13) * torch.tensor([], dtype=torch.int32).element_size()
+        + math.prod(w13_scale)
+        * torch.tensor([], dtype=torch.float8_e8m0fnu).element_size()
+        + math.prod(w2) * torch.tensor([], dtype=torch.int32).element_size()
+        + math.prod(w2_scale)
+        * torch.tensor([], dtype=torch.float8_e8m0fnu).element_size()
     )
 
 

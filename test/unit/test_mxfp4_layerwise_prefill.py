@@ -185,7 +185,10 @@ def _stream_context(stream, log):
 
 
 def _runtime_stubs(
-    standard_combine_input=None, prepare_marlin=None, allocate_marlin=None
+    standard_combine_input=None,
+    prepare_marlin=None,
+    allocate_marlin=None,
+    marlin_storage_nbytes=None,
 ):
     stubs = {
         "sglang": _package("sglang"),
@@ -208,6 +211,9 @@ def _runtime_stubs(
         "sglang.srt.layers.quantization.v4_marlin_moe",
         prepare_v4_mxfp4_marlin=prepare_marlin or (lambda *_args, **_kwargs: None),
         allocate_v4_mxfp4_marlin=allocate_marlin or (lambda **_kwargs: object()),
+        get_v4_mxfp4_marlin_storage_nbytes=(
+            marlin_storage_nbytes or (lambda **_kwargs: 0)
+        ),
     )
     return stubs
 
@@ -215,6 +221,8 @@ def _runtime_stubs(
 class TestMxfp4LayerwiseStateMachine(unittest.TestCase):
     def setUp(self):
         kt_ep_wrapper._MXFP4_PREFILL_LAYER_REGISTRY.clear()
+        kt_ep_wrapper._MXFP4_LAYERWISE_MANAGERS.clear()
+        kt_ep_wrapper._MXFP4_LAYERWISE_DISABLED_REASONS.clear()
 
     def test_sparse_successors_are_sorted_by_registered_layer_id(self):
         signature = ("cuda:0", "sparse")
@@ -338,63 +346,77 @@ class TestMxfp4LayerwiseStateMachine(unittest.TestCase):
         self.assertIn("self.control_stream", manager_source)
         self.assertIn("get_tp_group().device_group", manager_source)
 
-    def test_slot_reservation_runs_after_model_setup_before_memory_pool(self):
+    def test_model_runner_defers_slot_allocation_until_threshold_request(self):
         target_path = (
             Path(__file__).resolve().parents[2]
             / "python/sglang/srt/model_executor/model_runner.py"
         )
         model_runner_source = target_path.read_text(encoding="utf-8")
-        runner_source = inspect.getsource(
-            kt_ep_wrapper.KTEPWrapperMethod.create_moe_runner
-        )
+        apply_source = inspect.getsource(kt_ep_wrapper.KTEPWrapperMethod.apply)
 
-        finalize_pos = model_runner_source.index("finalize_mxfp4_layerwise_prefill()")
-        memory_pool_pos = model_runner_source.index("self.init_memory_pool()")
-        weights_region_pos = model_runner_source.rfind(
-            "with self.memory_saver_adapter.region(", 0, finalize_pos
-        )
-        self.assertLess(finalize_pos, memory_pool_pos)
-        self.assertGreater(weights_region_pos, 0)
+        self.assertNotIn("finalize_mxfp4_layerwise_prefill", model_runner_source)
+        self.assertIn("self.init_memory_pool()", model_runner_source)
         self.assertIn(
-            "GPU_MEMORY_TYPE_WEIGHTS",
-            model_runner_source[weights_region_pos:finalize_pos],
+            "get_mxfp4_layerwise_prefill_reservation_bytes", model_runner_source
         )
-        self.assertNotIn("finalize_mxfp4_layerwise_prefill", runner_source)
+        self.assertIn("_get_or_initialize_mxfp4_layerwise_manager", apply_source)
 
-    def test_finalize_initializes_each_registered_signature_once(self):
-        signatures = (("cuda:0", "model-a"), ("cuda:0", "model-b"))
-        methods = {
-            signature: {
-                layer_idx: SimpleNamespace(
-                    kt_config=SimpleNamespace(layer_idx=layer_idx),
-                    _mxfp4_pipeline_signature=signature,
-                )
-                for layer_idx in layer_indices
-            }
-            for signature, layer_indices in zip(signatures, ((17, 3), (41, 9)))
-        }
-        layers = {
-            signature: {layer_idx: object() for layer_idx in signature_methods}
-            for signature, signature_methods in methods.items()
-        }
-        for signature in signatures:
-            kt_ep_wrapper._MXFP4_PREFILL_LAYER_REGISTRY[signature] = {
-                layer_idx: (methods[signature][layer_idx], layers[signature][layer_idx])
-                for layer_idx in methods[signature]
-            }
+    def test_lazy_slots_reserve_kv_budget_without_creating_a_manager(self):
+        signature = ("cuda:0", "model-a")
+        method = SimpleNamespace(
+            _full_init_args=(64, 32, torch.bfloat16), global_num_experts=2
+        )
+        layer = object()
+        kt_ep_wrapper._MXFP4_PREFILL_LAYER_REGISTRY[signature] = {0: (method, layer)}
+
+        with (
+            mock.patch.object(
+                kt_ep_wrapper, "_mxfp4_pipeline_runtime_supported", return_value=True
+            ),
+            mock.patch.dict(
+                sys.modules,
+                _runtime_stubs(marlin_storage_nbytes=lambda **_kwargs: 123),
+            ),
+        ):
+            # Per raw slot: 4096 + 2048 + 1024 + 512 bytes.  The pipeline
+            # has two raw slots plus two 123-byte prepared slots.
+            self.assertEqual(
+                kt_ep_wrapper.get_mxfp4_layerwise_prefill_reservation_bytes(),
+                2 * (4096 + 2048 + 1024 + 512 + 123),
+            )
+
+        self.assertNotIn(signature, kt_ep_wrapper._MXFP4_LAYERWISE_MANAGERS)
+
+    def test_lazy_manager_initialization_runs_once_per_signature(self):
+        signature = ("cuda:0", "model-a")
+        method = SimpleNamespace(_mxfp4_pipeline_signature=signature)
+        layer = object()
+        manager = object()
+
+        def initialize(initialized_method, initialized_layer):
+            self.assertIs(initialized_method, method)
+            self.assertIs(initialized_layer, layer)
+            kt_ep_wrapper._MXFP4_LAYERWISE_MANAGERS[signature] = manager
 
         with mock.patch.object(
-            kt_ep_wrapper, "_initialize_mxfp4_layerwise_pipeline"
-        ) as initialize:
-            kt_ep_wrapper.finalize_mxfp4_layerwise_prefill()
+            kt_ep_wrapper,
+            "_initialize_mxfp4_layerwise_pipeline",
+            side_effect=initialize,
+        ) as initialize_mock:
+            self.assertIs(
+                kt_ep_wrapper._get_or_initialize_mxfp4_layerwise_manager(
+                    method, layer
+                ),
+                manager,
+            )
+            self.assertIs(
+                kt_ep_wrapper._get_or_initialize_mxfp4_layerwise_manager(
+                    method, layer
+                ),
+                manager,
+            )
 
-        self.assertEqual(
-            initialize.call_args_list,
-            [
-                mock.call(methods[signatures[0]][3], layers[signatures[0]][3]),
-                mock.call(methods[signatures[1]][9], layers[signatures[1]][9]),
-            ],
-        )
+        initialize_mock.assert_called_once_with(method, layer)
 
     def test_compute_exception_records_consumed_fence_before_consensus(self):
         log = []
@@ -972,6 +994,43 @@ class TestMxfp4ApplyFallbacks(unittest.TestCase):
         manager.abort_round.assert_called_once_with()
         self.assertTrue(torch.equal(result.hidden_states, torch.full((8, 2), 9.0)))
 
+    def test_first_threshold_request_lazily_initializes_and_uses_manager(self):
+        wrapper = self._make_wrapper()
+        layer = self._layer()
+        manager = mock.Mock()
+        manager.apply.return_value = "pipeline-result"
+        signature = wrapper._mxfp4_pipeline_signature
+
+        def initialize(initialized_method, initialized_layer):
+            self.assertIs(initialized_method, wrapper)
+            self.assertIs(initialized_layer, layer)
+            kt_ep_wrapper._MXFP4_LAYERWISE_MANAGERS[signature] = manager
+
+        with mock.patch.object(
+            kt_ep_wrapper,
+            "_initialize_mxfp4_layerwise_pipeline",
+            side_effect=initialize,
+        ) as initialize_mock:
+            first = self._apply(wrapper, layer, self._dispatch(4), True)
+            second = self._apply(wrapper, layer, self._dispatch(4), True)
+
+        self.assertEqual(first, "pipeline-result")
+        self.assertEqual(second, "pipeline-result")
+        initialize_mock.assert_called_once_with(wrapper, layer)
+        self.assertEqual(manager.apply.call_count, 2)
+
+    def test_below_threshold_request_does_not_initialize_slots(self):
+        wrapper = self._make_wrapper()
+        layer = self._layer()
+
+        with mock.patch.object(
+            kt_ep_wrapper, "_initialize_mxfp4_layerwise_pipeline"
+        ) as initialize_mock:
+            result = self._apply(wrapper, layer, self._dispatch(3), True)
+
+        initialize_mock.assert_not_called()
+        self.assertTrue(torch.equal(result.hidden_states, torch.full((8, 2), 9.0)))
+
     def test_unsupported_backend_keeps_serial_full_gpu_fallback(self):
         wrapper = self._make_wrapper()
         layer = self._layer()
@@ -1000,6 +1059,28 @@ class TestMxfp4ApplyFallbacks(unittest.TestCase):
 
         result = self._apply(wrapper, layer, self._dispatch(4), True)
 
+        wrapper._build_full_context.assert_not_called()
+        self.assertTrue(torch.equal(result.hidden_states, torch.full((8, 2), 9.0)))
+        self.assertEqual(len(wrapper.gpu_method.calls), 1)
+
+    def test_lazy_slot_oom_falls_through_to_hybrid_for_triggering_request(self):
+        wrapper = self._make_wrapper()
+        layer = self._layer()
+        signature = wrapper._mxfp4_pipeline_signature
+        wrapper._build_full_context = mock.Mock()
+
+        def initialize(_method, _layer):
+            kt_ep_wrapper._MXFP4_LAYERWISE_DISABLED_REASONS[signature] = "slot OOM"
+
+        with mock.patch.object(
+            kt_ep_wrapper,
+            "_initialize_mxfp4_layerwise_pipeline",
+            side_effect=initialize,
+        ) as initialize_mock:
+            result = self._apply(wrapper, layer, self._dispatch(4), True)
+
+        initialize_mock.assert_called_once_with(wrapper, layer)
+        self.assertIn(signature, kt_ep_wrapper._MXFP4_LAYERWISE_DISABLED_REASONS)
         wrapper._build_full_context.assert_not_called()
         self.assertTrue(torch.equal(result.hidden_states, torch.full((8, 2), 9.0)))
         self.assertEqual(len(wrapper.gpu_method.calls), 1)
