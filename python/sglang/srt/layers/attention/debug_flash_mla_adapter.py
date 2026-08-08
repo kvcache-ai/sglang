@@ -1,23 +1,22 @@
 # DeepSeek V4 Flash attention dispatcher.
 #
 # Two backends:
-#   "kernel"  -> upstream `flash_mla` PyPI package. The installed wheel's
-#                cuda*.so contains only `.target sm_90a` (Hopper); any other
-#                capability raises "Unsupported architecture" the first time
-#                the CUDA op runs. Capabilities outside the whitelist are
-#                transparently routed to the Triton fallback.
+#   "kernel"  -> Hopper uses the upstream `flash_mla` PyPI package; SM120 uses
+#                FlashInfer's DSV4 sparse MLA kernel; other capabilities use
+#                the portable Triton fallback.
 #   "triton"  -> portable Triton kernel ported from vLLM PR #40929. Works on
 #                any arch Triton supports (>= SM_80).
 #
 # This is a sglang-side change (sglang 本身), not kt-sglang coupling: the V4
-# quantizer that produces the FP8/RoPE/ue8m0-packed KV layout already lives
-# in sglang main (PR #23600), and no upstream FlashMLA build understands that
-# layout on non-Hopper arches, so the fallback has to live next to the
-# entrypoint.
+# quantizer that produces the FP8/RoPE/ue8m0-packed KV layout already lives in
+# sglang main (PR #23600), so architecture dispatch belongs at this entrypoint.
 import functools
+import logging
 from typing import Any, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # Capabilities for which the upstream flash_mla wheel ships a CUDA binary.
@@ -34,15 +33,23 @@ def _device_capability() -> Tuple[int, int]:
 
 
 def should_use_triton_fallback() -> bool:
-    # Non-whitelist capability -> route to Triton. Used by the V4 metadata
-    # factories to skip flash_mla.get_mla_metadata() on arches the wheel
-    # cannot run on, and by flash_mla_with_kvcache_entrypoint below to
-    # transparently swap the kernel implementation.
+    # Used by the V4 metadata factories to skip the Hopper-only flash_mla
+    # metadata.  SM120's FlashInfer path does not consume this metadata either.
     return _device_capability() not in _FLASHMLA_CUDA_CAPS
 
 
 # Backward-compat alias (was private until consumed by metadata factories).
 _should_use_triton_fallback = should_use_triton_fallback
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_sm120_flashinfer_unavailable() -> None:
+    logger.warning(
+        "FlashInfer does not expose the SM120 DeepSeek V4 sparse MLA API; "
+        "falling back to the portable Triton decode kernel. The optimized "
+        "path requires matching flashinfer-python and flashinfer-cubin "
+        "0.6.15.post1 or newer."
+    )
 
 
 def _v4_triton_decode_dispatch(
@@ -67,10 +74,6 @@ def _v4_triton_decode_dispatch(
     so we must return a tuple whose first element has shape
     [batch, 1, num_heads, head_dim_v].
     """
-    from sglang.srt.layers.attention.nsa.v4_triton_kernel import (
-        decode_sparse_attention_triton,
-    )
-
     assert is_fp8_kvcache, "Triton V4 fallback only handles FP8 KV cache"
     assert head_dim_v == 512, f"V4 head_dim_v must be 512, got {head_dim_v}"
 
@@ -150,18 +153,26 @@ def _v4_triton_decode_dispatch(
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if backend == "kernel":
-        # Auto-fall back on architectures the upstream CUDA kernel does not
-        # cover. Set SGLANG_FLASHMLA_BACKEND_OVERRIDE=triton to force-bypass even
-        # on supported arches (useful for numerical comparison).
-        if _should_use_triton_fallback():
-            return _v4_triton_decode_dispatch(**kwargs)
-        import flash_mla
+        capability = _device_capability()
+        if capability == (12, 0):
+            from sglang.srt.layers.attention.flash_mla_sm120 import (
+                flash_mla_with_kvcache_sm120,
+                is_flashinfer_dsv4_available,
+            )
 
-        return flash_mla.flash_mla_with_kvcache(**kwargs)
+            if is_flashinfer_dsv4_available():
+                return flash_mla_with_kvcache_sm120(**kwargs)
+            _warn_sm120_flashinfer_unavailable()
+            return _v4_triton_decode_dispatch(**kwargs)
+
+        if capability in _FLASHMLA_CUDA_CAPS:
+            import flash_mla
+
+            return flash_mla.flash_mla_with_kvcache(**kwargs)
+
+        return _v4_triton_decode_dispatch(**kwargs)
 
     if backend == "triton":
         return _v4_triton_decode_dispatch(**kwargs)
 
-    raise ValueError(
-        f"unsupported backend {backend!r}; expected 'kernel' or 'triton'"
-    )
+    raise ValueError(f"unsupported backend {backend!r}; expected 'kernel' or 'triton'")

@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     offloader,
 )
 
@@ -63,7 +64,12 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    from sgl_kernel import fp8_scaled_mm
+
+    if is_sm120_supported():
+        from sglang.jit_kernel.fp8_blockwise_gemm import fp8_blockwise_scaled_mm
+    else:
+        from sgl_kernel import fp8_blockwise_scaled_mm
 
     @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
@@ -175,11 +181,8 @@ FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
 def _check_cutlass_block_fp8_hardware_support() -> bool:
-    """Return True if CUTLASS block FP8 is supported. Hopper (SM_90) and DC
-    Blackwell (SM_100) ship working binaries; consumer Blackwell (SM_120) and
-    Ada/Ampere fall back to triton. Origin: sglang 本身 (was
-    `is_blackwell_supported()` which incorrectly included SM_120)."""
-    return is_sm90_supported() or is_sm100_supported()
+    """Return True when a block-FP8 CUTLASS implementation is available."""
+    return is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
 
 
 if is_blackwell_supported() and is_flashinfer_available():
@@ -268,12 +271,9 @@ def _dispatch_auto_backend() -> Callable:
     # 1. DeepGEMM (if enabled and available — gated by DEEPGEMM_CAPS)
     # 2. FlashInfer TRTLLM (if SM_100 DC Blackwell + FlashInfer; the wheel
     #    only ships sm100f, so consumer Blackwell SM_120 must skip).
-    # 3. CUTLASS (if Hopper SM_90 or DC Blackwell SM_100 + CUDA 12.0+)
+    # 3. CUTLASS (including the JIT SwapAB kernel on SM_120)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback — used on SM_120 / SM_89 / SM_8x)
-    # Origin: sglang 本身 (was `is_blackwell_supported()` for trtllm/cutlass,
-    # which incorrectly routed consumer Blackwell SM_120 to sm100f-only
-    # binaries that crash with "Unsupported architecture").
+    # 5. Triton fallback
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
