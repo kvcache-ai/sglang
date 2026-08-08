@@ -19,14 +19,12 @@ from pathlib import Path
 
 import torch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from sglang.srt.layers.quantization.fp8_kernel import (  # noqa: E402
     _w8a8_block_fp8_matmul,
 )
-
 
 DEFAULT_SHAPES = (
     (512, 4096),

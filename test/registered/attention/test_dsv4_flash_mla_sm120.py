@@ -9,7 +9,6 @@ from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     _v4_triton_decode_dispatch,
 )
 
-
 _IS_SM120 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)
 
 

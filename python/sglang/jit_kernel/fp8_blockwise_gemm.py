@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import importlib.util
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 

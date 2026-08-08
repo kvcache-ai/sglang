@@ -16,7 +16,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 _PBS_DST = 64
 _NOPE_ROPE_STRIDE = 576
 _SCALE_STRIDE = 8

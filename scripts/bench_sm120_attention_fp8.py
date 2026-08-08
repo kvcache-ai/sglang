@@ -14,7 +14,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     triton_w8a8_block_fp8_linear,
 )
 
-
 SHAPES = (
     (512, 4096, 43),
     (1024, 4096, 43),
