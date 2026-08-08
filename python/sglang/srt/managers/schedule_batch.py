@@ -597,6 +597,10 @@ class Req(ReqDllmMixin):
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
+        # The prefix length at the start of the most recently scheduled extend
+        # batch. The overlap scheduler uses this as the safe eviction boundary
+        # while that batch may still be running.
+        self.last_extend_prefix_len = 0
         self.decode_batch_idx = 0
 
         # For multi-http worker
@@ -1151,6 +1155,7 @@ class Req(ReqDllmMixin):
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
+        self.last_extend_prefix_len = 0
         self.decode_batch_idx = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
@@ -1545,6 +1550,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            req.last_extend_prefix_len = pre_len
             req.extend_batch_idx += 1
 
             # update req-level memory management fields
@@ -2330,12 +2336,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            pre_len = (
-                                pre_len - server_args.chunked_prefill_size
-                                if server_args.chunked_prefill_size > 0
-                                else pre_len
+                            # The preceding extend batch may be smaller than the
+                            # configured chunk size. Its actual prefix boundary is
+                            # the newest point known to be safe while it is still
+                            # in flight.
+                            assert 0 <= req.last_extend_prefix_len <= pre_len, (
+                                f"Invalid overlap extend boundary: "
+                                f"{req.last_extend_prefix_len=}, {pre_len=}, "
+                                f"{req.extend_batch_idx=}"
                             )
-                            self._evict_swa(req, pre_len)
+                            self._evict_swa(req, req.last_extend_prefix_len)
                     else:
                         self._evict_swa(req, pre_len)
 
