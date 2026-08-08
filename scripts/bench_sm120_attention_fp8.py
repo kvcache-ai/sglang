@@ -55,7 +55,9 @@ def main() -> None:
 
     # Trigger JIT compilation before allocating the largest shape.
     x0 = torch.randn(1, 128, dtype=torch.bfloat16, device=device)
-    w0 = torch.randn(128, 128, dtype=torch.bfloat16, device=device).to(torch.float8_e4m3fn)
+    w0 = torch.randn(128, 128, dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
     s0 = torch.ones(1, 1, dtype=torch.float32, device=device)
     cutlass_w8a8_block_fp8_linear_with_fallback(x0, w0, [128, 128], s0)
     torch.cuda.synchronize()
@@ -103,7 +105,9 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     triton_token_us = sum(x["triton_median_us"] * x["calls_per_token"] for x in results)
-    cutlass_token_us = sum(x["cutlass_median_us"] * x["calls_per_token"] for x in results)
+    cutlass_token_us = sum(
+        x["cutlass_median_us"] * x["calls_per_token"] for x in results
+    )
     payload = {
         "device": torch.cuda.get_device_name(),
         "repeats": args.repeats,
