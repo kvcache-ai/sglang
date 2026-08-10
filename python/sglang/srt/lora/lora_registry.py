@@ -37,10 +37,20 @@ class LoRARef:
     lora_name: Optional[str] = None
     lora_path: Optional[str] = None
     pinned: Optional[bool] = None
+    # KT composite LoRA metadata (optional; ordinary adapters leave defaults).
+    source_lora_path: Optional[str] = None
+    kt_expert_lora_path: Optional[str] = None
+    adapter_kind: str = "ordinary"  # ordinary | kt_composite
+    adapter_hash: Optional[str] = None
 
     def __post_init__(self):
         if self.lora_id is None:
             raise ValueError("lora_id cannot be None")
+        if self.adapter_kind not in ("ordinary", "kt_composite"):
+            raise ValueError(
+                f"Unsupported adapter_kind={self.adapter_kind!r}; "
+                "expected 'ordinary' or 'kt_composite'."
+            )
 
     def __str__(self) -> str:
         parts = [

@@ -311,6 +311,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For LoRA
     lora_ids: Optional[List[str]] = None
+    # M2 KT composite: per-request / per-token expert LoRA slot metadata
+    kt_lora_req_slots: Optional[List[int]] = None
+    kt_lora_token_slots: Optional[torch.Tensor] = None  # [num_tokens], int32
+    kt_lora_slot_generations: Optional[torch.Tensor] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -539,6 +543,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+            kt_manager = getattr(model_runner, "kt_lora_manager", None)
+            if kt_manager is not None:
+                kt_manager.prepare_batch(ret)
 
         return ret
 

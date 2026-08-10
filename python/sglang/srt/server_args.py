@@ -735,6 +735,12 @@ class ServerArgs:
     kt_expert_placement_strategy: str = "uniform"
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
+    # M1/M2 multi composite: max CPU expert slots (slot 0 reserved for base-only).
+    kt_max_loaded_loras: Optional[int] = None
+    # M2: max distinct KT composite adapters allowed in one forward batch.
+    kt_max_loras_per_batch: int = 4
+    # M2 dispatch: "single" = M1 batch-boundary activate; "grouped" = token-grouped.
+    kt_lora_dispatch: str = "single"
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -4919,7 +4925,36 @@ class ServerArgs:
             default=ServerArgs.kt_expert_lora_path,
             help="[experimental ktransformers parameter] Single PEFT adapter directory "
                  "for KT CPU expert LoRA. This bypasses SGLang's normal LoRA manager "
-                 "for expert weights and runs the KT CPU expert path through forward_sft.",
+                 "for expert weights and runs the KT CPU expert path through forward_sft. "
+                 "Prefer --lora-paths with merged KT composite adapters for M1 multi-LoRA.",
+        )
+        parser.add_argument(
+            "--kt-max-loaded-loras",
+            type=int,
+            default=ServerArgs.kt_max_loaded_loras,
+            help="[experimental ktransformers parameter] Maximum number of KT composite "
+                 "expert LoRA adapters resident in the CPU expert pool (excluding the "
+                 "reserved base-only slot). Defaults to --max-loaded-loras or the number "
+                 "of composite --lora-paths.",
+        )
+        parser.add_argument(
+            "--kt-max-loras-per-batch",
+            type=int,
+            default=ServerArgs.kt_max_loras_per_batch,
+            help="[experimental ktransformers parameter] Maximum number of distinct KT "
+                 "composite adapters in one forward batch. Use with "
+                 "--kt-lora-dispatch grouped (M2). M1/single mode forces this and "
+                 "--max-loras-per-batch to 1.",
+        )
+        parser.add_argument(
+            "--kt-lora-dispatch",
+            type=str,
+            default=ServerArgs.kt_lora_dispatch,
+            choices=["single", "grouped"],
+            help="[experimental ktransformers parameter] KT expert LoRA dispatch mode. "
+                 "'single' (M1): one adapter per batch, activate at batch boundary. "
+                 "'grouped' (M2): allow N adapters per batch via token-grouped "
+                 "activate+forward+scatter (enables parallel multi-LoRA sub-agents).",
         )
 
         # Diffusion LLM
@@ -5962,25 +5997,14 @@ class ServerArgs:
                     "Expected a list or a dictionary."
                 )
 
-            kt_composite_lora_ref: Optional[LoRARef] = None
-            kt_composite_expert_path: Optional[str] = None
             rewritten_lora_paths: List[LoRARef] = []
+            kt_composite_refs: List[LoRARef] = []
             for lora_ref in self.lora_paths:
                 prepared = _prepare_kt_composite_lora_adapter(lora_ref.lora_path)
                 if prepared is None:
                     rewritten_lora_paths.append(lora_ref)
                     continue
 
-                if kt_composite_lora_ref is not None:
-                    raise ValueError(
-                        "Only one merged KT composite LoRA adapter is supported "
-                        "in the current single-adapter implementation."
-                    )
-                if len(self.lora_paths) != 1:
-                    raise ValueError(
-                        "Merged KT composite LoRA cannot be mixed with other "
-                        "LoRA adapters in the current single-adapter implementation."
-                    )
                 if self.kt_expert_lora_path:
                     raise ValueError(
                         "--lora-paths with a merged KT composite adapter cannot be "
@@ -5989,28 +6013,96 @@ class ServerArgs:
                     )
 
                 expert_path, nonexpert_path = prepared
-                kt_composite_lora_ref = lora_ref
-                kt_composite_expert_path = expert_path
-                rewritten_lora_paths.append(
-                    LoRARef(
-                        lora_id=lora_ref.lora_id,
-                        lora_name=lora_ref.lora_name,
-                        lora_path=nonexpert_path,
-                        pinned=lora_ref.pinned,
-                    )
+                composite_ref = LoRARef(
+                    lora_id=lora_ref.lora_id,
+                    lora_name=lora_ref.lora_name,
+                    lora_path=nonexpert_path,
+                    pinned=lora_ref.pinned,
+                    source_lora_path=lora_ref.lora_path,
+                    kt_expert_lora_path=expert_path,
+                    adapter_kind="kt_composite",
                 )
+                rewritten_lora_paths.append(composite_ref)
+                kt_composite_refs.append(composite_ref)
 
-            if kt_composite_lora_ref is not None:
+            if kt_composite_refs:
+                ordinary_refs = [
+                    ref
+                    for ref in rewritten_lora_paths
+                    if getattr(ref, "adapter_kind", "ordinary") != "kt_composite"
+                ]
+                if ordinary_refs:
+                    raise ValueError(
+                        "Merged KT composite LoRA adapters cannot be mixed with "
+                        "ordinary --lora-paths in M1. Pass only composite adapters, "
+                        f"found ordinary: {[r.lora_name for r in ordinary_refs]}."
+                    )
+
                 self.lora_paths = rewritten_lora_paths
-                self.kt_expert_lora_path = kt_composite_expert_path
-                logger.warning(
-                    "Using merged KT composite LoRA adapter %s as %s. "
-                    "The adapter is internally split into expert/non-expert "
-                    "runtime directories. In this first implementation the KT "
-                    "expert LoRA is loaded statically at server startup.",
-                    kt_composite_lora_ref.lora_path,
-                    kt_composite_lora_ref.lora_name,
-                )
+                # Keep first expert path for legacy single-path KTConfig enablement;
+                # multi-adapter resident weights are owned by KTCompositeLoRAManager.
+                self.kt_expert_lora_path = kt_composite_refs[0].kt_expert_lora_path
+                if self.kt_max_loaded_loras is None:
+                    self.kt_max_loaded_loras = (
+                        self.max_loaded_loras
+                        if self.max_loaded_loras is not None
+                        else len(kt_composite_refs)
+                    )
+                if self.kt_max_loaded_loras < len(kt_composite_refs):
+                    raise ValueError(
+                        f"--kt-max-loaded-loras ({self.kt_max_loaded_loras}) must be "
+                        f">= number of KT composite adapters ({len(kt_composite_refs)})."
+                    )
+                dispatch = (self.kt_lora_dispatch or "single").lower()
+                if dispatch not in ("single", "grouped"):
+                    raise ValueError(
+                        f"--kt-lora-dispatch must be 'single' or 'grouped', got {self.kt_lora_dispatch!r}"
+                    )
+                self.kt_lora_dispatch = dispatch
+                if self.kt_max_loras_per_batch < 1:
+                    raise ValueError("--kt-max-loras-per-batch must be >= 1")
+
+                if dispatch == "single":
+                    # M1: one adapter kind per batch; GPU pool mirrors the same limit.
+                    if self.max_loras_per_batch != 1:
+                        logger.warning(
+                            "KT composite multi-LoRA M1 (kt-lora-dispatch=single) "
+                            "forces --max-loras-per-batch 1 (was %d). "
+                            "Same-batch mixed adapters require --kt-lora-dispatch grouped.",
+                            self.max_loras_per_batch,
+                        )
+                        self.max_loras_per_batch = 1
+                    self.kt_max_loras_per_batch = 1
+                    logger.warning(
+                        "Using %d merged KT composite LoRA adapter(s) %s. "
+                        "Each is split into expert/non-expert runtime directories. "
+                        "M1 loads KT expert weights into a CPU pool and switches "
+                        "the active slot at batch boundaries.",
+                        len(kt_composite_refs),
+                        [ref.lora_name for ref in kt_composite_refs],
+                    )
+                else:
+                    # M2 grouped: allow N distinct adapters per batch.
+                    if self.max_loras_per_batch < self.kt_max_loras_per_batch:
+                        raise ValueError(
+                            f"--max-loras-per-batch ({self.max_loras_per_batch}) must be "
+                            f">= --kt-max-loras-per-batch ({self.kt_max_loras_per_batch}) "
+                            "when --kt-lora-dispatch=grouped."
+                        )
+                    if self.kt_max_loaded_loras < self.kt_max_loras_per_batch:
+                        raise ValueError(
+                            f"--kt-max-loaded-loras ({self.kt_max_loaded_loras}) must be "
+                            f">= --kt-max-loras-per-batch ({self.kt_max_loras_per_batch}) "
+                            "when --kt-lora-dispatch=grouped."
+                        )
+                    logger.warning(
+                        "Using %d merged KT composite LoRA adapter(s) %s with "
+                        "kt-lora-dispatch=grouped (M2). Up to %d distinct adapters "
+                        "per forward batch via token-grouped CPU expert dispatch.",
+                        len(kt_composite_refs),
+                        [ref.lora_name for ref in kt_composite_refs],
+                        self.kt_max_loras_per_batch,
+                    )
                 if not self.disable_cuda_graph:
                     logger.warning(
                         "Cuda graph is disabled because KT expert LoRA uses "

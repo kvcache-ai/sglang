@@ -2155,6 +2155,13 @@ class Scheduler(
                         new_lora_set
                     ):
                         continue
+                    kt_manager = getattr(
+                        self.tp_worker.model_runner, "kt_lora_manager", None
+                    )
+                    if kt_manager is not None and not kt_manager.validate_batch(
+                        new_lora_set
+                    ):
+                        continue
 
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
