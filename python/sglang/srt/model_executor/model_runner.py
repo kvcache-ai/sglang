@@ -113,6 +113,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.kt_composite_lora_manager import KTCompositeLoRAManager
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -1598,6 +1599,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
         )
+        self.kt_lora_manager: Optional[KTCompositeLoRAManager] = None
+        if any(
+            getattr(ref, "adapter_kind", "ordinary") == "kt_composite"
+            for ref in (self.server_args.lora_paths or [])
+        ):
+            self.kt_lora_manager = KTCompositeLoRAManager(self)
+            self.kt_lora_manager.initialize_from_server_args()
 
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
@@ -1607,7 +1615,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        result = self.lora_manager.load_lora_adapter(lora_ref)
+        kt_slot = None
+        kt_manager = getattr(self, "kt_lora_manager", None)
+        if (
+            kt_manager is not None
+            and getattr(lora_ref, "adapter_kind", "ordinary") == "kt_composite"
+        ):
+            try:
+                kt_slot = kt_manager.stage(lora_ref)
+            except Exception as e:
+                return self.lora_manager.create_lora_update_result(
+                    success=False,
+                    error_message=f"KT expert stage failed: {e}",
+                )
+
+        try:
+            result = self.lora_manager.load_lora_adapter(lora_ref)
+        except Exception as e:
+            if kt_manager is not None and kt_slot is not None:
+                kt_manager.abort(lora_ref, kt_slot)
+            raise
+
+        if not getattr(result, "success", True):
+            if kt_manager is not None and kt_slot is not None:
+                kt_manager.abort(lora_ref, kt_slot)
+            return result
+
+        if kt_manager is not None and kt_slot is not None:
+            try:
+                kt_manager.commit(lora_ref, kt_slot)
+            except Exception as e:
+                self.lora_manager.unload_lora_adapter(lora_ref)
+                kt_manager.abort(lora_ref, kt_slot)
+                return self.lora_manager.create_lora_update_result(
+                    success=False,
+                    error_message=f"KT expert commit failed: {e}",
+                )
 
         logger.info(
             f"LoRA adapter loading completes: {lora_ref}. "
@@ -1635,6 +1678,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         result = self.lora_manager.unload_lora_adapter(lora_ref)
+        kt_manager = getattr(self, "kt_lora_manager", None)
+        if (
+            kt_manager is not None
+            and getattr(lora_ref, "adapter_kind", "ordinary") == "kt_composite"
+            and getattr(result, "success", True)
+        ):
+            kt_manager.unload(lora_ref)
 
         logger.info(
             f"LoRA adapter unloading completes: {lora_ref}. "
@@ -2162,6 +2212,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if lora_ids is not None:
             self.lora_manager.prepare_lora_batch(forward_batch)
+            kt_manager = getattr(self, "kt_lora_manager", None)
+            if kt_manager is not None:
+                kt_manager.prepare_batch(forward_batch)
 
         self.attn_backend.init_forward_metadata(forward_batch)
 

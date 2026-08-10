@@ -1056,9 +1056,22 @@ class Qwen3_5ForCausalLM(nn.Module):
         linear_value_dim = (
             config.linear_num_value_heads * config.linear_value_head_dim
         )
-        intermediate_size = getattr(config, "intermediate_size", None)
-        if intermediate_size is None:
-            intermediate_size = getattr(config, "moe_intermediate_size", None)
+        # NOTE: For the MoE text variant, the generic (non-expert) "down_proj" /
+        # "gate_up_proj" LoRA target names only ever correspond to the single
+        # `shared_expert` MLP (see Qwen2MoeSparseMoeBlock), which is built with
+        # `shared_expert_intermediate_size`, NOT the base `intermediate_size`
+        # field. The `intermediate_size` field on this config class carries an
+        # unrelated default (kept for the dense `qwen3_5_text` variant below)
+        # and must not be used here, or the LoRA buffer size will silently
+        # diverge from the real shared_expert weight shape.
+        if config.model_type == "qwen3_5_moe_text":
+            intermediate_size = getattr(config, "shared_expert_intermediate_size", None)
+            if not intermediate_size:
+                intermediate_size = getattr(config, "moe_intermediate_size", None)
+        else:
+            intermediate_size = getattr(config, "intermediate_size", None)
+            if intermediate_size is None:
+                intermediate_size = getattr(config, "moe_intermediate_size", None)
 
         if module_name == "qkv_proj":
             return hidden_size, full_q_dim + 2 * full_kv_dim

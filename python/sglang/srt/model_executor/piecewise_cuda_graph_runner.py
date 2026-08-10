@@ -544,6 +544,9 @@ class PiecewiseCudaGraphRunner:
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+            kt_manager = getattr(self.model_runner, "kt_lora_manager", None)
+            if kt_manager is not None:
+                kt_manager.prepare_batch(forward_batch)
 
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
