@@ -95,6 +95,7 @@ class KTConfig:
         gpu_prefill_token_threshold: token threshold for enabling full GPU fallback
         kt_enable_dynamic_expert_update: Enable dynamic GPU expert updates based on runtime statistics
         expert_lora_path: Optional PEFT adapter directory for KT CPU expert LoRA
+        is_glm5_next: Whether the exact GLM-5-Next boundary is active
     """
 
     layer_idx: int
@@ -110,6 +111,7 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+    is_glm5_next: bool = False
 
 
 @dataclass
@@ -139,6 +141,15 @@ def _map_kt_method_to_sft_method(method: str) -> str:
     raise ValueError(
         f"--kt-expert-lora-path currently supports only AMX/BF16 SFT-compatible "
         f"KT methods {sorted(_KT_SFT_METHOD_BY_INFERENCE_METHOD)}, got {method!r}."
+    )
+
+
+def _kt_supports_swiglu_parameters(method: Optional[str], is_glm5_next: bool) -> bool:
+    """Keep block-FP8 clamp propagation isolated to the exact GLM runtime."""
+
+    normalized = (method or "").upper()
+    return normalized in ("MXFP4", "MXFP8") or (
+        normalized == "FP8" and is_glm5_next
     )
 
 
@@ -3200,6 +3211,7 @@ def create_kt_config_from_server_args(
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
+        is_glm5_next=getattr(server_args, "_glm5_next_session_ab_active", False),
     )
 
 
@@ -3679,10 +3691,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_swiglu_limit = float(
                 _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
             )
-            # kt-kernel guards swiglu_limit to MXFP4/MXFP8 only.
-            # Zero it out for other methods (AMXINT4, BF16, etc.)
-            # so V4-Flash + non-MXFP runs don't crash at init.
-            if (self.kt_config.method or "").upper() not in ("MXFP4", "MXFP8"):
+            # MXFP4/MXFP8 retain their existing clamp behavior.  Block-FP8
+            # carries the parameters only for the exact GLM boundary; this
+            # prevents the new low-level FP8 capability from changing legacy
+            # models that also select KT method=FP8.
+            supports_swiglu_params = _kt_supports_swiglu_parameters(
+                self.kt_config.method,
+                self.kt_config.is_glm5_next,
+            )
+            if not supports_swiglu_params:
                 _kt_swiglu_limit = 0.0
                 _kt_swiglu_alpha = 0.0
             common_wrapper_kwargs = dict(

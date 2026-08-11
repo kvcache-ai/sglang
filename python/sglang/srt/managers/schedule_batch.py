@@ -1943,9 +1943,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
-            from sglang.srt.managers.forward_hooks_registry import dispatch
+            from sglang.srt.managers.forward_hooks_registry import dispatch_named
 
-            dispatch("on_request_retract", req)
+            dispatch_named("hisparse", "on_request_retract", req)
+        if not req.finished() and getattr(
+            server_args, "_glm5_next_session_ab_active", False
+        ):
+            from sglang.srt.managers.forward_hooks_registry import dispatch_named
+
+            dispatch_named("glm5_next_kpool", "on_request_retract", req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(

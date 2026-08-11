@@ -28,8 +28,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
-    return original_seq_lens.clamp(max=nsa_index_topk)
+def compute_nsa_seqlens(
+    original_seq_lens, nsa_index_topk: int, index_kpool: int = 1
+):
+    """Compute sparse-attention lengths, preserving a KPool ragged tail.
+
+    ``index_kpool=1`` is the historical NSA behavior.  For GLM-5-Next's
+    KPool4 layout, history is selected as complete pools while the at-most
+    three unpooled tokens at the end are always appended to the sparse set.
+    """
+
+    if index_kpool <= 1:
+        return original_seq_lens.clamp(max=nsa_index_topk)
+
+    full_pool_tokens = (
+        torch.div(original_seq_lens, index_kpool, rounding_mode="floor")
+        * index_kpool
+    )
+    selected_history_tokens = full_pool_tokens.clamp(max=nsa_index_topk)
+    return selected_history_tokens + (original_seq_lens - full_pool_tokens)
 
 
 def is_nsa_enable_prefill_cp():

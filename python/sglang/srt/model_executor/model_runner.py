@@ -1709,10 +1709,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
+    def glm5_next_linear_config(self):
+        """Return GLM-5-Next's text config for the hybrid linear runtime.
+
+        GLM-5-Next deliberately does not inherit ``KimiLinearConfig``.  Keep
+        the compatibility bridge here exact so no other multimodal or MLA
+        model is accidentally routed through the stateful KDA scheduler.
+        """
+
+        if getattr(self.model_config, "is_glm5_next", False):
+            return self.model_config.hf_text_config
+        return None
+
+    @property
     def mambaish_config(self):
         return (
             self.mamba2_config
             or self.hybrid_gdn_config
+            or self.glm5_next_linear_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
         )

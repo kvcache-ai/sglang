@@ -23,6 +23,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.glm5_next import get_glm5_next_capabilities
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -183,6 +184,14 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.glm5_next_capabilities = get_glm5_next_capabilities(self.hf_config)
+        self.is_glm5_next = self.glm5_next_capabilities.is_glm5_next
+        self.uses_kpool4_compress = (
+            self.glm5_next_capabilities.uses_kpool4_compress
+        )
+        self.uses_kda_safe_gate = self.glm5_next_capabilities.uses_kda_safe_gate
+        self.uses_zero_rope_mla = self.glm5_next_capabilities.uses_zero_rope_mla
+        self.uses_mhc = self.glm5_next_capabilities.uses_mhc
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -196,6 +205,7 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
+                "Glm5NextForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
@@ -501,6 +511,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -516,9 +527,13 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_text_config)
-                if is_deepseek_nsa(self.hf_text_config)
-                else None
+                self.hf_text_config.index_head_dim
+                if self.is_glm5_next
+                else (
+                    get_nsa_index_head_dim(self.hf_text_config)
+                    if is_deepseek_nsa(self.hf_text_config)
+                    else None
+                )
             )
             # Handle rope scaling
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)

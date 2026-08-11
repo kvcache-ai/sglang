@@ -54,6 +54,8 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    Glm5NextConfig,
+    Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -94,6 +96,8 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     # effect registration. The dataclass is lightweight and doesn't pull
     # DSV4 module deps.
     DeepSeekV4Config,
+    Glm5NextConfig,
+    Glm5NextTextConfig,
     MultiModalityConfig,
     KimiVLConfig,
     InternVLChatConfig,
@@ -818,4 +822,3 @@ def get_rope_config(config):
     if rope_params is not None:
         return rope_params["rope_theta"], rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
-
