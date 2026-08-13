@@ -1433,8 +1433,8 @@ class ServerArgs:
             )
         if self.enable_piecewise_cuda_graph:
             raise ValueError(
-                "GLM-5-Next Session AB requires eager execution and does not "
-                "support --enable-piecewise-cuda-graph."
+                "GLM-5-Next Session C supports decode CUDA graphs only and does "
+                "not support --enable-piecewise-cuda-graph."
             )
 
         if self.moe_runner_backend == "auto":
@@ -1457,13 +1457,39 @@ class ServerArgs:
                     f"CPU expert kernel; got {self.kt_method!r}."
                 )
 
+            # The positive threshold enables GLM's layerwise full-GPU prefill
+            # route.  Its two-slot FP8 pipeline is accepted only for the TP=8
+            # production layout.  Dynamic expert replacement mutates the
+            # resident set behind those slots and is deliberately excluded.
+            prefill_threshold = getattr(
+                self, "kt_gpu_prefill_token_threshold", None
+            )
+            if prefill_threshold is not None and prefill_threshold > 0:
+                if self.tp_size != 8:
+                    raise ValueError(
+                        "GLM-5-Next KT layerwise prefill "
+                        "(--kt-gpu-prefill-token-threshold > 0) requires TP=8; "
+                        "TP=1 is structural-test-only and must keep the "
+                        "threshold unset or <= 0."
+                    )
+                if getattr(self, "kt_enable_dynamic_expert_update", False):
+                    raise ValueError(
+                        "GLM-5-Next KT layerwise prefill requires "
+                        "--kt-enable-dynamic-expert-update to remain disabled."
+                    )
+
         # The shared-expert fusion path has not been accepted for GLM's
         # clamp-before-SiLU contract.  The top-level unfused shared expert has
         # the exact model-local activation and is the Session AB oracle.
         self.disable_shared_experts_fusion = True
 
-        # CUDA graph support is a later, separately accepted stage.
-        self.disable_cuda_graph = True
+        # Session C captures normal decode only.  Fixed small graph batches
+        # bound the wide 1M-context NSA page-table and activation reservation;
+        # all unsupported graph modes are rejected above.  This exact-model
+        # override intentionally does not change any non-GLM defaults.
+        if not self.disable_cuda_graph:
+            self.cuda_graph_bs = [1, 2, 4]
+            self.cuda_graph_max_bs = 4
 
         # GLM's KPool live tail is request-local and Session AB does not yet
         # restore it from a reused prefix.  Force the safe no-prefix-cache
@@ -1506,8 +1532,8 @@ class ServerArgs:
 
         logger.warning(
             "Set GLM-5-Next KPool4 NSA dispatcher paths to trtllm for FP8 KV "
-            "cache on Blackwell; Session AB uses the model-local eager sparse "
-            "MLA correctness fallback."
+            "cache on Blackwell; Session C uses the model-local graph-safe "
+            "SM120 indexer and sparse-MLA kernels."
         )
 
     def _set_default_nsa_kv_cache_dtype(self, major: int) -> str:

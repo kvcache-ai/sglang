@@ -102,6 +102,14 @@ class ModelRunnerKVCacheMixin:
                 # exact layout selected by the pool factory; otherwise memory
                 # profiling overestimates token capacity by roughly 1.66x.
                 cell_size = self.calculate_mla_kv_cache_dim() * num_layers * kv_size
+                if self.kv_cache_dtype == torch.float8_e4m3fn:
+                    # Exact GLM keeps TRTLLM's 512-byte raw latent row and a
+                    # separate FP32 descale per 128 channels.  Count the
+                    # sidecar here so 500k profiling cannot overcommit memory.
+                    latent_scale_groups = self.model_config.kv_lora_rank // 128
+                    cell_size += (
+                        latent_scale_groups * torch.float32.itemsize * num_layers
+                    )
             else:
                 cell_size = (
                     (
@@ -363,9 +371,9 @@ class ModelRunnerKVCacheMixin:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
-            assert (
-                kv_lora_rank % quant_block_size == 0
-            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            assert kv_lora_rank % quant_block_size == 0, (
+                f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            )
 
             return (
                 kv_lora_rank
@@ -444,9 +452,9 @@ class ModelRunnerKVCacheMixin:
             full_per_token * full_layers_num
             + swa_full_tokens_ratio * swa_per_token * swa_layers_num
         )
-        assert (
-            denominator > 0
-        ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+        assert denominator > 0, (
+            f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+        )
 
         self.full_max_total_num_tokens = int(total_memory / denominator)
         self.swa_max_total_num_tokens = int(
@@ -472,15 +480,15 @@ class ModelRunnerKVCacheMixin:
         logger.info(f"DSv4 compressed attention: state_dtype={self.state_dtype}")
 
         page_size = self.server_args.page_size
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             config = getattr(self.server_args, "_draft_pool_config", None)
-            assert (
-                config is not None
-            ), "Draft worker requires target's pool config but _draft_pool_config is not set."
+            assert config is not None, (
+                "Draft worker requires target's pool config but _draft_pool_config is not set."
+            )
             self.full_max_total_num_tokens = config["full_max_total_num_tokens"]
             self.swa_max_total_num_tokens = config["swa_max_total_num_tokens"]
             self.c4_max_total_num_tokens = 0

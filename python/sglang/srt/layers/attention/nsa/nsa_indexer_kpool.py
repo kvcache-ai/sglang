@@ -31,14 +31,26 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
-    get_token_to_kv_pool,
-)
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import KVCache, NSATokenToKVPool
+
+
+def _token_pool_from_batch(forward_batch: ForwardBatch) -> "KVCache":
+    """Return the cache pool owned by this forward, or fail closed.
+
+    KPool plans and sequence metadata are derived from ``forward_batch``.  Use
+    the pool carried by that same batch so nested backend contexts cannot pair
+    a batch-local plan with an unrelated ambient cache.  Both eager execution
+    and CUDA Graph capture populate this field.
+    """
+
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None:
+        raise RuntimeError("GLM-5-Next KPool requires ForwardBatch.token_to_kv_pool")
+    return pool
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -218,7 +230,7 @@ class IndexerKPool(MultiPlatformOp):
             kpool_softmax_rotate_write_cache,
         )
 
-        pool = get_token_to_kv_pool()
+        pool = _token_pool_from_batch(forward_batch)
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -253,7 +265,7 @@ class IndexerKPool(MultiPlatformOp):
         if batch == 0:
             return
 
-        pool = get_token_to_kv_pool()
+        pool = _token_pool_from_batch(forward_batch)
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -303,7 +315,7 @@ class IndexerKPool(MultiPlatformOp):
             scatter_kpool_tail_updates,
         )
 
-        pool = get_token_to_kv_pool()
+        pool = _token_pool_from_batch(forward_batch)
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
@@ -648,9 +660,9 @@ class IndexerKPool(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
-            assert isinstance(get_token_to_kv_pool(), NSATokenToKVPool)
+            assert isinstance(_token_pool_from_batch(forward_batch), NSATokenToKVPool)
 
-        pool = get_token_to_kv_pool()
+        pool = _token_pool_from_batch(forward_batch)
         page_size = pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         assert page_size == 64, "only support page size 64"
@@ -744,25 +756,6 @@ class IndexerKPool(MultiPlatformOp):
         )
         return topk_result
 
-    def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device: torch.device
-    ) -> Tuple[bool, int]:
-        """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
-        Return: (need_chunk, free_mem)
-        """
-        # Quick static check for normal batches
-        if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
-            return False, 0
-
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
-        bytes_per_elem = 4  # float32
-        logits_bytes = num_q * num_k * bytes_per_elem
-
-        # Logits should not exceed 50% of free memory or 30% of total memory
-        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
-        return need_chunk, free_mem
-
     def _get_topk_ragged_kpool_plan(
         self,
         forward_batch: ForwardBatch,
@@ -797,7 +790,7 @@ class IndexerKPool(MultiPlatformOp):
             k_u8 = plan.ragged_k_u8
             k_scale = plan.ragged_k_scale
             assert k_u8 is not None and k_scale is not None
-            pool = get_token_to_kv_pool()
+            pool = _token_pool_from_batch(forward_batch)
             gather_index_k_scale_prefix_into(
                 pool=pool,
                 buf=self._get_index_k_read_buffer(pool, layer_id),
@@ -808,26 +801,44 @@ class IndexerKPool(MultiPlatformOp):
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
             if self._should_use_eager_logits(q_fp8):
-                from sglang.srt.layers.attention.nsa.glm5_next_indexer_logits import (
-                    glm5_next_eager_fp8_mqa_logits,
+                topk_method = getattr(metadata, "topk_transform_method", None)
+                attn_metadata = getattr(metadata, "attn_metadata", None)
+                page_table_all = None
+                page_table_row_index_all = None
+                topk_offsets_all = None
+                if envs.SGLANG_NSA_FUSE_TOPK.get():
+                    if getattr(topk_method, "name", "") == "PAGED":
+                        page_table_all = plan.ragged_paged_page_table
+                        page_table_row_index_all = (
+                            plan.ragged_paged_page_table_row_index
+                        )
+                    elif getattr(topk_method, "name", "") == "RAGGED":
+                        topk_offsets_all = getattr(
+                            attn_metadata, "topk_indices_offset", None
+                        )
+
+                return self._topk_from_glm5_next_eager_logits_rows(
+                    q_fp8[:n_real].contiguous(),
+                    (k_fp8.contiguous(), k_scale.contiguous()),
+                    weights[:n_real].contiguous(),
+                    pool_lens,
+                    seq_lens_expanded,
+                    ks_per_q,
+                    ke_per_q,
+                    total_q=total_q,
+                    page_table=page_table_all,
+                    topk_offsets=topk_offsets_all,
+                    page_table_row_index=page_table_row_index_all,
                 )
 
-                logits = glm5_next_eager_fp8_mqa_logits(
-                    q_fp8[:n_real].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
-                    weights[:n_real].contiguous(),
-                    ks_per_q,
-                    ke_per_q,
-                )
-            else:
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8[:n_real].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
-                    weights[:n_real].contiguous(),
-                    ks_per_q,
-                    ke_per_q,
-                    clean_logits=True,
-                )
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8[:n_real].contiguous(),
+                (k_fp8.contiguous(), k_scale.contiguous()),
+                weights[:n_real].contiguous(),
+                ks_per_q,
+                ke_per_q,
+                clean_logits=True,
+            )
         else:
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
@@ -854,6 +865,87 @@ class IndexerKPool(MultiPlatformOp):
             page_table_row_index=page_table_row_index_all,
         )
 
+    def _topk_from_glm5_next_eager_logits_rows(
+        self,
+        q_fp8: torch.Tensor,
+        kv_fp8: tuple[torch.Tensor, torch.Tensor],
+        weights: torch.Tensor,
+        pool_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        *,
+        total_q: int,
+        page_table: Optional[torch.Tensor],
+        topk_offsets: Optional[torch.Tensor],
+        page_table_row_index: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Score/select fixed query-row chunks for exact-GLM SM120 prefill."""
+
+        from sglang.srt.layers.attention.nsa.glm5_next_indexer_logits import (
+            iter_glm5_next_eager_fp8_mqa_logits,
+        )
+
+        n_real = q_fp8.shape[0]
+        if total_q < n_real:
+            raise ValueError(
+                "GLM-5-Next total query rows cannot be smaller than real queries"
+            )
+        if not (
+            pool_lens.shape[0]
+            == seq_lens.shape[0]
+            == ks.shape[0]
+            == ke.shape[0]
+            == n_real
+        ):
+            raise ValueError("GLM-5-Next ragged row metadata must match real queries")
+        if topk_offsets is not None and topk_offsets.shape[0] != n_real:
+            raise ValueError("GLM-5-Next ragged topk offsets must match real queries")
+        if page_table_row_index is not None and page_table_row_index.shape[0] != n_real:
+            raise ValueError("GLM-5-Next paged row mapping must match real queries")
+        if (page_table is None) != (page_table_row_index is None):
+            raise ValueError(
+                "GLM-5-Next paged table and row mapping must be provided together"
+            )
+
+        # Consume each fixed query-row logits chunk immediately. At the final
+        # 500K boundary this avoids simultaneously retaining multi-GiB
+        # [4096, 125056] logits/mask tensors. The complete K payload is
+        # converted only once inside the iterator.
+        topk_result = torch.full(
+            (total_q, self.index_topk + self.index_kpool - 1),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+        logits_rows = iter_glm5_next_eager_fp8_mqa_logits(
+            q_fp8,
+            kv_fp8,
+            weights,
+            ks,
+            ke,
+        )
+        for q_start, q_end, logits_chunk in logits_rows:
+            topk_offsets_chunk = (
+                None if topk_offsets is None else topk_offsets[q_start:q_end]
+            )
+            page_table_row_index_chunk = (
+                None
+                if page_table_row_index is None
+                else page_table_row_index[q_start:q_end]
+            )
+            topk_result[q_start:q_end] = self._topk_from_kpool_logits(
+                logits_chunk,
+                pool_lens[q_start:q_end],
+                seq_lens=seq_lens[q_start:q_end],
+                page_table=page_table,
+                topk_offsets=topk_offsets_chunk,
+                row_starts=ks[q_start:q_end],
+                page_table_row_index=page_table_row_index_chunk,
+            )
+            del logits_chunk
+        return topk_result
+
     def _get_topk_ragged(
         self,
         forward_batch: ForwardBatch,
@@ -863,7 +955,9 @@ class IndexerKPool(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
         assert forward_batch.forward_mode.is_extend_without_speculative()
-        assert get_token_to_kv_pool().page_size == 64, "only support page size 64"
+        assert _token_pool_from_batch(forward_batch).page_size == 64, (
+            "only support page size 64"
+        )
         assert getattr(metadata.attn_metadata, "kpool_extend_plan", None) is not None
         return self._get_topk_ragged_kpool_plan(
             forward_batch,
@@ -910,11 +1004,10 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        """Eager-only GLM-5-Next KPool forward path.
+        """GLM-5-Next KPool forward path.
 
-        Decode and non-speculative extend are supported. CP, MTP, and CUDA
-        graph capture must keep using their pre-existing NSA implementation
-        until their KPool contracts are integrated independently.
+        Decode (including CUDA-graph replay) and non-speculative extend are
+        supported. CP and MTP remain outside this model-local contract.
         """
         if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
@@ -922,7 +1015,7 @@ class IndexerKPool(MultiPlatformOp):
             from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
-            assert isinstance(get_token_to_kv_pool(), NSATokenToKVPool)
+            assert isinstance(_token_pool_from_batch(forward_batch), NSATokenToKVPool)
 
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
         if metadata is None:
@@ -940,7 +1033,8 @@ class IndexerKPool(MultiPlatformOp):
             )
         if not (mode.is_decode() or mode.is_extend_without_speculative()):
             raise NotImplementedError(
-                "GLM-5-Next KPool currently supports eager decode and eager extend only"
+                "GLM-5-Next KPool supports decode (including CUDA graphs) and "
+                "non-speculative extend only"
             )
 
         if mode.is_extend_without_speculative():

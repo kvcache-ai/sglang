@@ -436,6 +436,7 @@ class DeepseekV2MoE(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        glm5_next_hf_two_round_swiglu: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -505,6 +506,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
+            glm5_next_hf_two_round_swiglu=glm5_next_hf_two_round_swiglu,
             prefix=add_prefix("experts", prefix),
         )
 

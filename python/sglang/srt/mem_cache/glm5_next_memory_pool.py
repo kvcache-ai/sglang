@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 GLM5_NEXT_INDEX_KPOOL = 4
 GLM5_NEXT_INDEX_HEAD_DIM = 128
 GLM5_NEXT_REAL_PAGE_SIZE = 64
+GLM5_NEXT_LATENT_SCALE_GROUP_SIZE = 128
+GLM5_NEXT_LATENT_SCALE_GROUPS = 4
 
 
 def _normalize_req_pool_indices(
@@ -149,6 +151,25 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             allocation_context,
         ):
+            # Keep the 512-byte latent cache ABI consumed by TRTLLM/Triton and
+            # store its four per-128-channel descales in an exact-GLM sidecar.
+            # This mirrors NSA index-cache scale semantics without changing
+            # any shared MLA or DeepSeek cache layout.
+            self._latent_scale = (
+                [
+                    torch.zeros(
+                        (
+                            size + page_size,
+                            GLM5_NEXT_LATENT_SCALE_GROUPS,
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+                if dtype == torch.float8_e4m3fn
+                else []
+            )
             self._compress_tail_k = [
                 torch.zeros(
                     (req_pool_size, index_kpool, index_head_dim),
@@ -185,6 +206,43 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         local_idx = self._local_layer_index(layer_id)
         return self._compress_tail_k[local_idx], self._compress_tail_score[local_idx]
+
+    def get_latent_scale_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        """Return the physical-token block descales for one compact DSA layer."""
+
+        if not self._latent_scale:
+            return None
+        return self._latent_scale[self._local_layer_index(layer_id)]
+
+    def set_latent_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        """Write dynamic latent descales beside their FP8 cache rows."""
+
+        target = self.get_latent_scale_buffer(layer_id)
+        if target is None:
+            raise RuntimeError("latent scales are available only for GLM FP8 KV cache")
+        if scale.ndim == 3 and scale.shape[-2] == 1:
+            scale = scale.squeeze(-2)
+        expected = (loc.numel(), GLM5_NEXT_LATENT_SCALE_GROUPS)
+        if tuple(scale.shape) != expected:
+            raise ValueError(
+                f"GLM latent scale must have shape {expected}, got {tuple(scale.shape)}"
+            )
+        if scale.dtype != torch.float32:
+            raise TypeError(f"GLM latent scale must be FP32, got {scale.dtype}")
+        target[loc] = scale
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        """Fail closed for the speculative-only cache relocation contract."""
+
+        raise NotImplementedError(
+            "GLM-5-Next KV-cache relocation is outside the current boundary: "
+            "MTP/speculative decoding is not supported"
+        )
 
     def clear_compress_tail_rows(
         self, req_pool_indices: int | Iterable[int] | torch.Tensor
@@ -253,10 +311,12 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
 
     def get_kv_size_bytes(self):
         size_bytes = super().get_kv_size_bytes()
+        latent_scale = getattr(self, "_latent_scale", ())
         tail_k = getattr(self, "_compress_tail_k", ())
         tail_score = getattr(self, "_compress_tail_score", ())
         return size_bytes + sum(
-            tensor.numel() * tensor.element_size() for tensor in (*tail_k, *tail_score)
+            tensor.numel() * tensor.element_size()
+            for tensor in (*latent_scale, *tail_k, *tail_score)
         )
 
 
@@ -264,6 +324,14 @@ class Glm5NextHybridKVPool(HybridLinearKVPool):
     """Hybrid wrapper mapping global DSA layer IDs to a compact NSA pool."""
 
     is_glm5_next_kpool = True
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        """Reject the speculative-only relocation API at the public pool seam."""
+
+        raise NotImplementedError(
+            "GLM-5-Next KV-cache relocation is outside the current boundary: "
+            "MTP/speculative decoding is not supported"
+        )
 
     def __init__(
         self,
@@ -416,6 +484,21 @@ class Glm5NextHybridKVPool(HybridLinearKVPool):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.full_kv_pool.get_compress_tail_buffers(
             self._transfer_full_attention_id(layer_id)
+        )
+
+    def get_latent_scale_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
+        return self.full_kv_pool.get_latent_scale_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    def set_latent_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        self.full_kv_pool.set_latent_scale_buffer(
+            self._transfer_full_attention_id(layer_id), loc, scale
         )
 
     def clear_compress_tail_rows(

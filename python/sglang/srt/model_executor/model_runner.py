@@ -128,6 +128,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -584,6 +589,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
+
+        # Exact GLM-5-Next treats a positive threshold as a required
+        # layerwise-prefill enable switch.  Materialize its two raw block-FP8
+        # slots before KV profiling so the profiler observes the real reserved
+        # VRAM and a startup OOM fails closed rather than surfacing on the first
+        # long request.
+        self.glm5_next_fp8_layerwise_prefill_allocated_bytes = 0
+        if (
+            getattr(server_args, "_glm5_next_session_ab_active", False)
+            and (server_args.kt_method or "").upper() == "FP8"
+            and (server_args.kt_gpu_prefill_token_threshold or 0) > 0
+        ):
+            from sglang.srt.layers.moe.kt_ep_wrapper import (
+                initialize_glm5_next_fp8_layerwise_prefill,
+            )
+
+            self.glm5_next_fp8_layerwise_prefill_allocated_bytes = (
+                initialize_glm5_next_fp8_layerwise_prefill()
+            )
 
         # Do not allocate the MXFP4 layerwise slots at startup.  Still account
         # for their future capacity before KV-cache profiling, otherwise the
@@ -2547,6 +2571,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return output
 
     def _forward_raw(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
+    ) -> ModelRunnerOutput:
+        # Exact GLM-5-Next KPool/DSA resolves active attention/pool state
+        # through a per-forward context. Preserve an explicit caller override;
+        # otherwise publish this runner's backend only for that exact model so
+        # every other model keeps the pre-Session-C execution path.
+        if has_forward_context() or not getattr(
+            self.model_config, "is_glm5_next", False
+        ):
+            ctx_mgr = empty_context()
+        else:
+            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+        with ctx_mgr:
+            return self._forward_raw_with_context(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
+    def _forward_raw_with_context(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool,

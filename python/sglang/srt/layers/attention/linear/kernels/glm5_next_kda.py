@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.layers.attention.fla.kda import chunk_kda
+from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kernels.glm5_next_kda_ops import (
     glm5_next_safe_decode,
     glm5_next_safe_gate,
@@ -89,21 +91,32 @@ class Glm5NextTritonKDAKernel(TritonKDAKernel):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
         )
-        activated_beta = beta.float().sigmoid()
+        # The released GLM reference materializes sigmoid in b_proj's dtype
+        # before chunk KDA widens beta to FP32.  In production b_proj is BF16,
+        # so widening the raw logits first skips a real BF16 rounding boundary.
+        activated_beta = beta.sigmoid().float()
 
         # Padding requests use -1.  KT's MambaPool reserves slot 0 as the
         # padding sentinel and allocates real requests from [1, size].
         safe_cache_indices = torch.where(cache_indices >= 0, cache_indices, 0).to(
             torch.int32
         )
-        return super().extend(
-            q,
-            k,
-            v,
-            activated_gate,
-            activated_beta,
-            ssm_states=ssm_states,
-            cache_indices=safe_cache_indices,
-            query_start_loc=query_start_loc,
-            **kwargs,
+        input_dtype = q.dtype
+        # Match the released GLM recurrence: widen q/k/v together, normalize
+        # q/k in FP32, and keep every tl.dot operand FP32.  Widening q/k alone
+        # is not a valid Triton contract because v participates in the same
+        # chunk-core dot products.
+        normalized_q = l2norm_fwd(q.contiguous(), output_dtype=torch.float32)
+        normalized_k = l2norm_fwd(k.contiguous(), output_dtype=torch.float32)
+        output = chunk_kda(
+            q=normalized_q,
+            k=normalized_k,
+            v=v.float(),
+            g=activated_gate,
+            beta=activated_beta,
+            initial_state=ssm_states,
+            initial_state_indices=safe_cache_indices,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=query_start_loc,
         )
+        return output.to(input_dtype)

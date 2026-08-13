@@ -220,8 +220,39 @@ class TestGlm5NextKPoolMemoryPool(unittest.TestCase):
         self.assertEqual(tail_score.shape, tail_k.shape)
         self.assertEqual(tail_k.dtype, torch.bfloat16)
         self.assertEqual(tail_score.dtype, torch.bfloat16)
-        expected_bytes = 1024 + 2 * 2 * 6 * 4 * 128 * 2
+        latent_scale_bytes = 2 * (128 + 64) * 4 * 4
+        expected_bytes = 1024 + latent_scale_bytes + 2 * 2 * 6 * 4 * 128 * 2
         self.assertEqual(sparse.get_kv_size_bytes(), expected_bytes)
+
+    def test_scaled_fp8_latent_sidecar_is_compact_and_writable(self):
+        pool = _make_hybrid_pool()
+        for layer_id in (3, 7, 11):
+            scale = pool.get_latent_scale_buffer(layer_id)
+            self.assertEqual(scale.shape, (128 + 64, 4))
+            self.assertEqual(scale.dtype, torch.float32)
+
+        loc = torch.tensor([2, 9], dtype=torch.long)
+        values = torch.tensor(
+            [[[0.1, 0.2, 0.3, 0.4]], [[1.1, 1.2, 1.3, 1.4]]],
+            dtype=torch.float32,
+        )
+        pool.set_latent_scale_buffer(7, loc, values)
+        actual = pool.get_latent_scale_buffer(7)[loc]
+        self.assertTrue(torch.equal(actual, values.squeeze(1)))
+        self.assertEqual(torch.count_nonzero(pool.get_latent_scale_buffer(3)), 0)
+
+        with self.assertRaises(ValueError):
+            pool.get_latent_scale_buffer(0)
+
+    def test_speculative_cache_move_fails_closed(self):
+        pool = _make_hybrid_pool()
+        with self.assertRaisesRegex(
+            NotImplementedError, "MTP/speculative decoding is not supported"
+        ):
+            pool.move_kv_cache(
+                torch.tensor([5], dtype=torch.long),
+                torch.tensor([3], dtype=torch.long),
+            )
 
     def test_zero_rope_fp8_uses_raw_trtllm_cache_layout(self):
         pool = _make_hybrid_pool()
@@ -416,6 +447,28 @@ class TestGlm5NextKPoolLifecycle(unittest.TestCase):
                 tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
                 self.assertEqual(torch.count_nonzero(tail_k[row]).item(), 0)
                 self.assertEqual(torch.count_nonzero(tail_score[row]).item(), 0)
+
+    def test_cache_flush_resets_prepared_rows_and_tail_state(self):
+        pool = _make_hybrid_pool()
+        coordinator = COORDINATOR.attach_glm5_next_kpool_lifecycle(pool)
+        hook = REGISTERED_HOOKS["glm5_next_kpool"]
+
+        coordinator.prepare_kpool_request([1, 4])
+        for layer_id in (3, 7, 11):
+            tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+            tail_k[1].fill_(17)
+            tail_k[4].fill_(19)
+            tail_score[1].fill_(23)
+            tail_score[4].fill_(29)
+
+        hook.on_cache_flush()
+
+        self.assertFalse(coordinator.is_prepared(1))
+        self.assertFalse(coordinator.is_prepared(4))
+        for layer_id in (3, 7, 11):
+            tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+            self.assertEqual(torch.count_nonzero(tail_k[[1, 4]]).item(), 0)
+            self.assertEqual(torch.count_nonzero(tail_score[[1, 4]]).item(), 0)
 
 
 if __name__ == "__main__":

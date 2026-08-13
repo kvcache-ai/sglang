@@ -8,12 +8,10 @@ BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# The fused radix selector stores one threshold-bin candidate list in 4,096
-# shared-memory entries. It is exact only while a row itself is no longer than
-# that capacity: a larger row can put more than 4,096 values in one coarse FP16
-# bin and the kernel clips the candidate list. Eager Session-AB execution may
-# synchronize and use torch.topk for longer rows.
-KPOOL_RADIX_EXACT_ROW_CAPACITY = 4096
+# Each fixed-width shard contributes its local top-k to a second exact top-k.
+# The union is mathematically sufficient for the global result and, unlike the
+# old shared-memory radix selector, has no candidate-capacity correctness cap.
+KPOOL_HIERARCHICAL_TOPK_CHUNK_SIZE = 32768
 
 
 def build_pooled_page_table_64(
@@ -352,43 +350,107 @@ def _exact_topk_from_pooled_history_logits(
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Exact eager fallback for rows beyond the fused radix capacity."""
+    """Device-only exact hierarchical top-k over arbitrary row lengths.
+
+    The shard loop depends only on the static logits width captured by CUDA
+    graph.  Replay-varying row starts/lengths stay on device, so this routine
+    contains no host synchronization or data-dependent Python control flow.
+    Keeping the best ``K`` entries from every shard is exact: every global
+    top-``K`` value must be in its shard's local top-``K`` set.
+    """
 
     rows, cols = logits.shape
     group_topk = history_group_budget_for_topk(topk, pool_size)
-    lengths_cpu = group_lengths.detach().to(device="cpu", dtype=torch.int64).tolist()
-    if row_starts is None:
-        starts_cpu = [0] * rows
-    else:
-        if row_starts.shape != group_lengths.shape:
-            raise ValueError(
-                "KPool row_starts must match group_lengths, got "
-                f"{tuple(row_starts.shape)} and {tuple(group_lengths.shape)}"
-            )
-        starts_cpu = row_starts.detach().to(device="cpu", dtype=torch.int64).tolist()
+    if row_starts is not None and row_starts.shape != group_lengths.shape:
+        raise ValueError(
+            "KPool row_starts must match group_lengths, got "
+            f"{tuple(row_starts.shape)} and {tuple(group_lengths.shape)}"
+        )
 
-    selected_groups = torch.zeros(
-        (rows, group_topk), dtype=torch.int64, device=logits.device
+    starts = (
+        torch.zeros_like(group_lengths, dtype=torch.int64)
+        if row_starts is None
+        else row_starts.to(torch.int64)
+    ).clamp(min=0, max=cols)
+    bounded_lengths = torch.minimum(
+        group_lengths.to(torch.int64).clamp_min(0),
+        torch.full_like(starts, cols) - starts,
     )
-    valid_counts = torch.empty((rows,), dtype=torch.int64, device=logits.device)
-    for row, (row_start, length) in enumerate(
-        zip(starts_cpu, lengths_cpu, strict=True)
-    ):
-        if row_start < 0 or length < 0 or row_start + length > cols:
-            raise ValueError(
-                "KPool exact top-k row bounds are invalid: "
-                f"row={row}, start={row_start}, length={length}, cols={cols}"
+
+    if cols == 0:
+        selected_groups = torch.zeros(
+            (rows, group_topk), dtype=torch.int64, device=logits.device
+        )
+    else:
+        positions = torch.arange(cols, dtype=torch.int64, device=logits.device)
+        valid = (positions.unsqueeze(0) >= starts.unsqueeze(1)) & (
+            positions.unsqueeze(0) < (starts + bounded_lengths).unsqueeze(1)
+        )
+        masked_logits = logits.masked_fill(~valid, float("-inf"))
+
+        candidate_values = []
+        candidate_indices = []
+        for chunk_start in range(0, cols, KPOOL_HIERARCHICAL_TOPK_CHUNK_SIZE):
+            chunk_end = min(chunk_start + KPOOL_HIERARCHICAL_TOPK_CHUNK_SIZE, cols)
+            chunk_width = chunk_end - chunk_start
+            local_k = min(group_topk, chunk_width)
+            values, indices = torch.topk(
+                masked_logits[:, chunk_start:chunk_end],
+                k=local_k,
+                dim=1,
+                largest=True,
+                sorted=False,
             )
-        count = min(group_topk, length)
-        valid_counts[row] = count
-        if count == 0:
-            continue
-        selected_groups[row, :count] = torch.topk(
-            logits[row, row_start : row_start + length],
-            k=count,
+            indices = indices.to(torch.int64) + chunk_start
+            if local_k != group_topk:
+                pad_width = group_topk - local_k
+                values = torch.cat(
+                    [
+                        values,
+                        torch.full(
+                            (rows, pad_width),
+                            float("-inf"),
+                            dtype=values.dtype,
+                            device=values.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+                indices = torch.cat(
+                    [
+                        indices,
+                        torch.zeros(
+                            (rows, pad_width),
+                            dtype=torch.int64,
+                            device=indices.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            candidate_values.append(values)
+            candidate_indices.append(indices)
+
+        all_values = torch.cat(candidate_values, dim=1)
+        all_indices = torch.cat(candidate_indices, dim=1)
+        _, candidate_rank = torch.topk(
+            all_values,
+            k=group_topk,
+            dim=1,
             largest=True,
-            sorted=False,
-        ).indices
+            # Keep every finite candidate before the padded ``-inf`` entries.
+            # ``group_valid`` below is a prefix mask when a short sequence has
+            # fewer than ``group_topk`` groups, so this ordering is part of the
+            # correctness contract rather than a presentation preference.
+            sorted=True,
+        )
+        selected_groups = torch.gather(
+            all_indices, 1, candidate_rank
+        ) - starts.unsqueeze(1)
+
+    valid_counts = torch.minimum(
+        bounded_lengths,
+        torch.full_like(bounded_lengths, group_topk),
+    )
 
     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int64)
     group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
@@ -534,97 +596,18 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
-    if group_topk in (128, 160, 192, 224, 256, 512):
-        # The shared-memory radix kernel clips a threshold bin after 4,096
-        # candidates. A longer row is routed to an exact eager selector before
-        # the JIT kernel can lose a later high score. CUDA graph is disabled at
-        # the Session-AB boundary, so this host synchronization is intentional.
-        max_group_length = (
-            int(group_lengths.max().item()) if group_lengths.numel() else 0
-        )
-        if max_group_length > KPOOL_RADIX_EXACT_ROW_CAPACITY:
-            return _exact_topk_from_pooled_history_logits(
-                logits,
-                group_lengths,
-                pool_size=pool_size,
-                topk=topk,
-                page_table=page_table,
-                topk_offsets=topk_offsets,
-                seq_lens=seq_lens,
-                row_starts=row_starts,
-                out_rows=out_rows,
-                page_table_row_index=page_table_row_index,
-            )
-
-        from sglang.jit_kernel.kpool_topk_transform import (
-            fast_kpool_topk_transform_fused,
-        )
-
-        result = fast_kpool_topk_transform_fused(
-            score=logits,
-            lengths=group_lengths.to(torch.int32),
-            pool_size=pool_size,
-            topk=topk,
-            page_table=page_table,
-            topk_indices_offset=topk_offsets,
-            row_starts=row_starts,
-            seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
-            page_table_row_index=page_table_row_index,
-        )
-        if out_rows is None or out_rows == result.shape[0]:
-            return result
-        padded = torch.full(
-            (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-        )
-        padded[: result.shape[0]] = result
-        return padded
-
-    assert page_table_row_index is None, (
-        "page_table_row_index requires the fused fast_kpool group_topk path"
-    )
-
-    from sgl_kernel import fast_topk_v2
-
-    selected_groups = fast_topk_v2(
+    return _exact_topk_from_pooled_history_logits(
         logits,
-        group_lengths.to(torch.int32),
-        group_topk,
-        row_starts=row_starts,
-    )
-
-    rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
-    max_valid_groups = min(cols, group_topk)
-    valid_counts = torch.minimum(
-        group_lengths.to(torch.int32),
-        torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
-    )
-    group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
-    expanded = expand_pooled_groups_to_topk(
-        selected_groups.contiguous(),
-        group_valid,
-        topk=topk,
+        group_lengths,
         pool_size=pool_size,
+        topk=topk,
         page_table=page_table,
         topk_offsets=topk_offsets,
+        seq_lens=seq_lens,
+        row_starts=row_starts,
+        out_rows=out_rows,
+        page_table_row_index=page_table_row_index,
     )
-    if seq_lens is None:
-        result = expanded
-    else:
-        result = append_kpool_tail_to_topk(
-            expanded,
-            seq_lens=seq_lens,
-            pool_lens=group_lengths,
-            pool_size=pool_size,
-            page_table=page_table,
-            topk_offsets=topk_offsets,
-        )
-    if out_rows is None or out_rows == result.shape[0]:
-        return result
-    padded = torch.full(
-        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-    )
-    padded[: result.shape[0]] = result
-    return padded
 
 
 def kpool_softmax_rotate_write_cache(

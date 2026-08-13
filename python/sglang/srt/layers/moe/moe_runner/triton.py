@@ -203,6 +203,9 @@ class TritonRunnerCore(MoeRunnerCore):
         inplace = self.config.inplace
         gemm1_alpha = self.config.gemm1_alpha
         gemm1_limit = self.config.gemm1_clamp_limit
+        glm5_next_hf_two_round_swiglu = (
+            self.config.glm5_next_hf_two_round_swiglu
+        )
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
 
@@ -252,7 +255,26 @@ class TritonRunnerCore(MoeRunnerCore):
         )
 
         if activation == "silu":
-            if gemm1_alpha is not None:
+            if glm5_next_hf_two_round_swiglu:
+                if gemm1_alpha is not None or gemm1_limit is not None:
+                    raise ValueError(
+                        "GLM-5-Next HF two-round SwiGLU is incompatible with "
+                        "gemm1_alpha/gemm1_limit"
+                    )
+                if self.config.swiglu_limit is None:
+                    raise ValueError(
+                        "GLM-5-Next HF two-round SwiGLU requires swiglu_limit"
+                    )
+                from sglang.srt.layers.moe.glm5_next_swiglu import (
+                    glm5_next_hf_two_round_swiglu as glm5_next_swiglu,
+                )
+
+                intermediate_cache2 = glm5_next_swiglu(
+                    intermediate_cache1.view(-1, N),
+                    self.config.swiglu_limit,
+                    output=intermediate_cache2,
+                )
+            elif gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 # kvcache fork asserts interleaved=False (FusedMoE layer.py:199),
                 # so w13 output is concatenated gate||up. Use the chunk(2, dim=-1)

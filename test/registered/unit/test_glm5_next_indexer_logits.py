@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import unittest
@@ -88,6 +89,65 @@ class TestGlm5NextIndexerLogits(unittest.TestCase):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         self.assertTrue(torch.isneginf(actual[4]).all())
 
+    def test_ragged_row_iterator_matches_one_shot_with_partial_chunk(self):
+        torch.manual_seed(29)
+        num_queries, num_keys, num_heads, dim = 7, 17, 3, 128
+        q = torch.randn(num_queries, num_heads, dim).to(torch.float8_e4m3fn)
+        k = torch.randn(num_keys, dim).to(torch.float8_e4m3fn)
+        scales = torch.linspace(0.01, 0.17, num_keys)
+        weights = torch.randn(num_queries, num_heads)
+        ks = torch.tensor([0, 0, 1, 4, 8, 13, 17], dtype=torch.int32)
+        ke = torch.tensor([0, 5, 17, 9, 16, 17, 17], dtype=torch.int32)
+
+        expected = LOGITS.glm5_next_eager_fp8_mqa_logits(
+            q,
+            (k, scales),
+            weights,
+            ks,
+            ke,
+            query_chunk_size=num_queries,
+            key_chunk_size=4,
+        )
+        chunks = list(
+            LOGITS.iter_glm5_next_eager_fp8_mqa_logits(
+                q,
+                (k, scales),
+                weights,
+                ks,
+                ke,
+                query_chunk_size=3,
+                key_chunk_size=4,
+            )
+        )
+
+        self.assertEqual(
+            [(start, end) for start, end, _ in chunks], [(0, 3), (3, 6), (6, 7)]
+        )
+        actual = torch.cat([chunk for _, _, chunk in chunks], dim=0)
+        self.assertTrue(torch.equal(torch.isneginf(actual), torch.isneginf(expected)))
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_500k_query_row_plan_is_statically_bounded(self):
+        pooled_keys = ((500_000 // 4 + 63) // 64) * 64
+        ranges = list(
+            LOGITS.glm5_next_prefill_query_row_ranges(
+                4096,
+                query_chunk_size=LOGITS.GLM5_NEXT_PREFILL_QUERY_ROW_CHUNK,
+            )
+        )
+
+        self.assertEqual(len(ranges), 128)
+        self.assertEqual(ranges[0], (0, 32))
+        self.assertEqual(ranges[-1], (4064, 4096))
+        self.assertEqual(
+            [start for start, _ in ranges],
+            [0, *[end for _, end in ranges[:-1]]],
+        )
+        self.assertTrue(all(end - start <= 32 for start, end in ranges))
+        self.assertLessEqual(
+            max((end - start) * pooled_keys for start, end in ranges), 4_001_792
+        )
+
     def test_paged_layout_page_order_lengths_and_chunks(self):
         torch.manual_seed(23)
         pages, heads, dim = 4, 2, 128
@@ -145,6 +205,22 @@ class TestGlm5NextIndexerLogits(unittest.TestCase):
                 torch.zeros(1, dtype=torch.int32),
                 torch.ones(1, dtype=torch.int32),
             )
+
+    def test_paged_decode_source_has_no_host_sync_or_dynamic_python_loop(self):
+        tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+        paged = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "glm5_next_eager_fp8_paged_mqa_logits"
+        )
+        source = ast.unparse(paged)
+
+        for host_sync in (".item()", ".cpu()", ".tolist()"):
+            self.assertNotIn(host_sync, source)
+        self.assertFalse(
+            any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(paged))
+        )
 
 
 if __name__ == "__main__":

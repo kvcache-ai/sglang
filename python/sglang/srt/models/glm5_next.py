@@ -20,6 +20,10 @@ from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
@@ -30,9 +34,14 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    is_allocation_symmetric,
+)
+from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -49,6 +58,7 @@ from sglang.srt.models.kimi_linear import (
 )
 from sglang.srt.models.glm5_next_dsa import Glm5NextDSAAttention
 from sglang.srt.models.glm5_next_moe import Glm5NextMLP, Glm5NextMoE
+from sglang.srt.models.glm5_next_norm import Glm5NextRMSNorm
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator
@@ -168,6 +178,87 @@ def _kda_construction_config(config: Glm5NextTextConfig) -> Glm5NextTextConfig:
     return kda_config
 
 
+def _glm5_next_hc_post(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    h_res: torch.Tensor,
+    h_post: torch.Tensor,
+    hc_mult: int,
+) -> torch.Tensor:
+    """Apply GLM's checkpoint-native BF16 hyper-connection update.
+
+    The learned mix metadata is kept in FP32 by ``hc_pre``, but the released
+    model casts it to the hidden-state dtype *before* the branch multiply and
+    residual matmul.  Keep this arithmetic model-local: the shared mHC helper
+    is also used by existing models whose historical FP32 accumulation must
+    remain unchanged.
+    """
+
+    if hidden_states.ndim != 2 or residual.ndim != 2:
+        raise ValueError("GLM-5-Next mHC post expects flat 2-D tensors")
+    tokens, hidden_size = hidden_states.shape
+    if residual.shape != (tokens, hc_mult * hidden_size):
+        raise ValueError(
+            "GLM-5-Next mHC residual has shape "
+            f"{tuple(residual.shape)}, expected {(tokens, hc_mult * hidden_size)}"
+        )
+    residual_streams = residual.reshape(tokens, hc_mult, hidden_size)
+    post = h_post.reshape(tokens, hc_mult).to(hidden_states.dtype)
+    comb = h_res.reshape(tokens, hc_mult, hc_mult).to(hidden_states.dtype)
+    output = post.unsqueeze(-1) * hidden_states.unsqueeze(1) + torch.matmul(
+        comb.transpose(-1, -2), residual_streams
+    )
+    return output.reshape(tokens, hc_mult * hidden_size)
+
+
+def _glm5_next_kda_can_use_fp32_o_proj(
+    o_proj: nn.Module,
+    hidden_states: torch.Tensor,
+) -> bool:
+    """Keep the higher-precision KDA partial behind a GLM-only contract."""
+
+    weight = getattr(o_proj, "weight", None)
+    return (
+        isinstance(o_proj, RowParallelLinear)
+        and isinstance(getattr(o_proj, "quant_method", None), UnquantizedLinearMethod)
+        and hidden_states.is_cuda
+        and hidden_states.dtype is torch.bfloat16
+        and weight is not None
+        and weight.is_cuda
+        and weight.device == hidden_states.device
+        and weight.dtype is torch.bfloat16
+        and getattr(o_proj, "bias", None) is None
+        and getattr(o_proj, "reduce_results", None) is False
+        and getattr(o_proj, "input_is_parallel", None) is True
+    )
+
+
+def _glm5_next_kda_o_proj(
+    o_proj: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate one GLM KDA TP partial without an intermediate BF16 round."""
+
+    if not hidden_states.is_cuda:
+        return o_proj(hidden_states)[0]
+    if not _glm5_next_kda_can_use_fp32_o_proj(o_proj, hidden_states):
+        raise RuntimeError(
+            "GLM-5-Next CUDA KDA o_proj requires an unquantized BF16 "
+            "RowParallelLinear with no bias, input_is_parallel=True, and "
+            "reduce_results=False"
+        )
+
+    # Match RowParallelLinear's allocator contract so CUDA Graph capture and
+    # symmetric-allocation bookkeeping remain unchanged.  mHC performs the TP
+    # all-reduce and casts its result once before applying hc_post.
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        return torch.mm(
+            hidden_states,
+            o_proj.weight.t(),
+            out_dtype=torch.float32,
+        )
+
+
 class Glm5NextLinearAttention(KimiDeltaAttention):
     """Phase-3 construction seam backed by KT's existing KDA module."""
 
@@ -193,6 +284,34 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
         self.config = config
         self.attn.lower_bound = config.linear_attn_config["gate_lower_bound"]
 
+        # The released checkpoint keeps b_proj in BF16 and evaluates its full
+        # 64-output GEMM before slicing heads.  A ColumnParallelLinear instead
+        # evaluates eight independent 8-output GEMMs at TP=8.  Although the
+        # weights and input are identical, CUDA's BF16 GEMM choice changes at
+        # that output geometry and the beta logits are observably different.
+        # Keep this replacement GLM-local and tiny (64 * hidden_size BF16 per
+        # rank), then slice the exact full result to the local attention heads.
+        if not self.do_fuse_qkvbfg:
+            self.b_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.num_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.b_proj",
+            )
+            if self.num_heads % self.attn_tp_size != 0:
+                raise ValueError(
+                    "GLM-5-Next beta heads must divide attention TP size: "
+                    f"heads={self.num_heads}, attention_tp={self.attn_tp_size}"
+                )
+            self._beta_heads_per_rank = self.num_heads // self.attn_tp_size
+            self._beta_head_start = (
+                get_attention_tp_rank() * self._beta_heads_per_rank
+            )
+        else:
+            self._beta_heads_per_rank = self.local_num_heads
+            self._beta_head_start = 0
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -214,6 +333,11 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
                 hidden_states
             )
+            beta = beta.narrow(
+                -1,
+                self._beta_head_start,
+                self._beta_heads_per_rank,
+            )
 
         # GLM applies neither fused_kda_gate nor sigmoid here.  Its dedicated
         # backend activates both raw tensors identically in prefill and decode.
@@ -230,7 +354,7 @@ class Glm5NextLinearAttention(KimiDeltaAttention):
         norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
-        return self.o_proj(core_attn_out)[0]
+        return _glm5_next_kda_o_proj(self.o_proj, core_attn_out)
 
 
 def build_glm5_next_attention(
@@ -337,8 +461,10 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
                 swiglu_limit=config.swiglu_limit,
             )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = Glm5NextRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = Glm5NextRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -401,6 +527,9 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                attn_all_reduce_output_dtype=(
+                    torch.bfloat16 if config.is_kda_layer(layer_idx) else None
+                ),
             )
 
     def _is_layer_sparse(self, layer_idx: int) -> bool:
@@ -448,15 +577,13 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):
-        from sglang.kernels.ops.layernorm.mhc import hc_post
-
         if not self.mhc_enabled:
             raise RuntimeError("hc_post is only valid when config.mhc is True")
-        return hc_post(
-            x=hidden_states,
+        return _glm5_next_hc_post(
+            hidden_states=hidden_states,
             residual=residual,
-            h_post=h_post,
             h_res=h_res,
+            h_post=h_post,
             hc_mult=self.config.hc_mult,
         )
 
@@ -569,7 +696,9 @@ class Glm5NextModel(KimiLinearModel):
         )
 
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = Glm5NextRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
         else:
             self.norm = PPMissingLayer()
 

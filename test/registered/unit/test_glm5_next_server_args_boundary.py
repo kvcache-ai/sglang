@@ -99,6 +99,8 @@ def _boundary_args(**overrides):
         moe_runner_backend="auto",
         kt_weight_path=None,
         kt_method=None,
+        kt_gpu_prefill_token_threshold=None,
+        kt_enable_dynamic_expert_update=False,
         disable_shared_experts_fusion=False,
         disable_cuda_graph=False,
         disable_radix_cache=False,
@@ -116,16 +118,27 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
             )
         )
 
-    def test_defaults_resolve_to_correctness_first_moe_and_eager_mode(self):
+    def test_defaults_enable_only_small_decode_graph_batches(self):
         args = _boundary_args()
 
         self.validate(args)
 
         self.assertEqual(args.moe_runner_backend, "triton")
         self.assertTrue(args.disable_shared_experts_fusion)
-        self.assertTrue(args.disable_cuda_graph)
+        self.assertFalse(args.disable_cuda_graph)
+        self.assertEqual(args.cuda_graph_bs, [1, 2, 4])
+        self.assertEqual(args.cuda_graph_max_bs, 4)
         self.assertTrue(args.disable_radix_cache)
         self.assertTrue(args._glm5_next_session_ab_active)
+
+    def test_explicit_cuda_graph_disable_is_preserved(self):
+        args = _boundary_args(disable_cuda_graph=True)
+
+        self.validate(args)
+
+        self.assertTrue(args.disable_cuda_graph)
+        self.assertFalse(hasattr(args, "cuda_graph_bs"))
+        self.assertFalse(hasattr(args, "cuda_graph_max_bs"))
 
     def test_prefix_cache_is_always_disabled_and_external_caches_are_rejected(self):
         already_disabled = _boundary_args(disable_radix_cache=True)
@@ -268,6 +281,44 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                         )
                     )
 
+    def test_layerwise_prefill_requires_tp8_and_static_experts(self):
+        accepted = _boundary_args(
+            tp_size=8,
+            kt_weight_path="stub/experts",
+            kt_method="fp8",
+            kt_gpu_prefill_token_threshold=4096,
+        )
+        self.validate(accepted)
+
+        with self.assertRaisesRegex(ValueError, "requires TP=8"):
+            self.validate(
+                _boundary_args(
+                    tp_size=1,
+                    kt_weight_path="stub/experts",
+                    kt_method="fp8",
+                    kt_gpu_prefill_token_threshold=4096,
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "dynamic-expert-update"):
+            self.validate(
+                _boundary_args(
+                    tp_size=8,
+                    kt_weight_path="stub/experts",
+                    kt_method="fp8",
+                    kt_gpu_prefill_token_threshold=4096,
+                    kt_enable_dynamic_expert_update=True,
+                )
+            )
+
+        structural = _boundary_args(
+            tp_size=1,
+            kt_weight_path="stub/experts",
+            kt_method="fp8",
+            kt_gpu_prefill_token_threshold=0,
+        )
+        self.validate(structural)
+
 
 class TestGlm5NextSessionABNSA(unittest.TestCase):
     @staticmethod
@@ -317,6 +368,45 @@ class TestGlm5NextSessionABNSA(unittest.TestCase):
         source = ast.unparse(configure)
         self.assertNotIn("0.6.17", source)
         self.assertNotIn("sparse_mla_top_k_lens", source)
+
+    def test_cuda_graph_kpool_metadata_is_initialized_and_updated(self):
+        tree = ast.parse(
+            NSA_BACKEND_PATH.read_text(encoding="utf-8"),
+            filename=str(NSA_BACKEND_PATH),
+        )
+        backend = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "NativeSparseAttnBackend"
+        )
+        methods = {
+            node.name: ast.unparse(node)
+            for node in backend.body
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        self.assertIn(
+            "self._init_glm5_next_kpool_graph_metadata(metadata, forward_mode)",
+            methods["init_forward_metadata_capture_cuda_graph"],
+        )
+        replay = methods["init_forward_metadata_replay_cuda_graph"]
+        self.assertIn(
+            "self._update_glm5_next_kpool_graph_metadata(metadata, forward_mode)",
+            replay,
+        )
+        self.assertLess(
+            replay.index("metadata.real_page_table[:new_rows, :new_cols].copy_"),
+            replay.index("self._update_glm5_next_kpool_graph_metadata"),
+        )
+
+        for method_name in (
+            "_init_glm5_next_kpool_graph_metadata",
+            "_update_glm5_next_kpool_graph_metadata",
+        ):
+            source = methods[method_name]
+            self.assertIn("self.is_glm5_next", source)
+            self.assertIn("self.nsa_index_kpool == 4", source)
+            self.assertIn("forward_mode.is_decode_or_idle()", source)
 
 
 class TestGlm5NextBoundaryIsolation(unittest.TestCase):

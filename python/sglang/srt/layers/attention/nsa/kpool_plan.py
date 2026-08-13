@@ -12,7 +12,6 @@ from sglang.srt.layers.attention.nsa.kpool_fp8_index import (
     build_pooled_page_table_64,
     kpool_build_ragged_layout,
 )
-from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -22,6 +21,27 @@ if TYPE_CHECKING:
 
 _RAGGED_SCRATCH_K_U8: Optional[torch.Tensor] = None
 _RAGGED_SCRATCH_K_SCALE: Optional[torch.Tensor] = None
+
+
+def _req_to_token_table_from_batch(forward_batch: ForwardBatch) -> torch.Tensor:
+    """Use the batch-owned request table as the authoritative metadata source.
+
+    Keeping this dependency explicit avoids ambient-context ordering assumptions
+    in eager, direct metadata initialization, and CUDA Graph capture paths.  Fail
+    closed for synthetic or incomplete batches.
+    """
+
+    req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+    if req_to_token_pool is None:
+        raise RuntimeError(
+            "GLM-5-Next KPool metadata requires ForwardBatch.req_to_token_pool"
+        )
+    req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+    if req_to_token is None:
+        raise RuntimeError(
+            "GLM-5-Next KPool metadata requires a req_to_token table"
+        )
+    return req_to_token
 
 
 def _get_ragged_scratch(
@@ -379,7 +399,7 @@ def _kpool_plan_to_gpu(
     ragged_paged_page_table = None
     ragged_paged_page_table_row_index = None
     if need_paged:
-        req_to_token = get_req_to_token_pool().req_to_token
+        req_to_token = _req_to_token_table_from_batch(forward_batch)
         ragged_paged_page_table_row_index = torch.repeat_interleave(
             local_req_pool_indices.to(torch.int32), ragged_q_len_t
         )

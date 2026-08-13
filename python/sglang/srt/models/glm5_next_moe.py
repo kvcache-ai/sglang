@@ -39,47 +39,34 @@ def glm5_next_swiglu(
         limit = float(swiglu_limit)
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
-    return F.silu(gate) * up
+    # Keep the activation as a named tensor.  For BF16 checkpoints this is a
+    # real model semantic: Transformers materializes the BF16 SiLU result
+    # before the BF16 multiply.  The generic fused CUDA kernel computes both
+    # operations in FP32 and rounds only once, which measurably changes GLM's
+    # hidden states even when given identical inputs.
+    activated_gate = F.silu(gate)
+    return activated_gate * up
 
 
 class Glm5NextSiluAndMul(nn.Module):
-    """Clamp-aware SwiGLU with the existing KT CUDA kernel as its fast path."""
+    """Clamp-aware SwiGLU preserving GLM's BF16 intermediate rounding."""
 
     def __init__(self, swiglu_limit: Optional[float]) -> None:
         super().__init__()
         self.swiglu_limit = swiglu_limit
 
     def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
-        if gate_up.shape[-1] % 2 != 0:
-            raise ValueError(
-                "GLM-5-Next SwiGLU expects an even gate/up width, got "
-                f"{gate_up.shape[-1]}"
-            )
-
-        # The in-tree JIT kernel is NVIDIA-only and currently instantiates
-        # kernels for fp16/bf16.  Keep CPU, ROCm, and unusual dtypes on the
-        # device-agnostic reference path instead of importing CUDA code at
-        # module import time.
-        use_cuda_kernel = (
-            self.swiglu_limit is not None
-            and gate_up.is_cuda
-            and torch.version.hip is None
-            and gate_up.dtype in (torch.float16, torch.bfloat16)
-        )
-        if not use_cuda_kernel:
+        if not gate_up.is_cuda:
             return glm5_next_swiglu(gate_up, self.swiglu_limit)
 
-        from sglang.jit_kernel.deepseek_v4 import silu_and_mul_clamp
-
-        original_shape = gate_up.shape
-        gate_up_2d = gate_up.reshape(-1, original_shape[-1])
-        output_2d = gate_up.new_empty((gate_up_2d.shape[0], gate_up_2d.shape[1] // 2))
-        silu_and_mul_clamp(
-            gate_up_2d,
-            output_2d,
-            float(self.swiglu_limit),
+        from sglang.srt.layers.moe.glm5_next_swiglu import (
+            glm5_next_hf_two_round_swiglu,
         )
-        return output_2d.view(*original_shape[:-1], original_shape[-1] // 2)
+
+        # Dense and non-fused shared experts use the same private primitive as
+        # routed experts.  It materializes HF's BF16 SiLU boundary while
+        # leaving every generic activation kernel unchanged.
+        return glm5_next_hf_two_round_swiglu(gate_up, self.swiglu_limit)
 
 
 class Glm5NextMLP(DeepseekV2MLP):
@@ -146,6 +133,7 @@ class Glm5NextMoE(DeepseekV2MoE):
             prefix=prefix,
             alt_stream=alt_stream,
             is_nextn=is_nextn,
+            glm5_next_hf_two_round_swiglu=True,
         )
         self.layer_idx = layer_id
         self.swiglu_limit = getattr(config, "swiglu_limit", None)
@@ -204,7 +192,43 @@ class Glm5NextMoE(DeepseekV2MoE):
                 "sgl_kernel.fused_experts_cpu and sgl_kernel.shared_expert_cpu; "
                 "their current AMX ABI has no swiglu_limit argument"
             )
-        return super().forward(hidden_states, *args, **kwargs)
+
+        # DeepseekV2MoE.forward does not pass ForwardBatch through its normal
+        # (non-A2A) dispatcher ABI.  Expose only the mode, temporarily and only
+        # to the exact GLM KT wrapper, so it can route plain EXTEND through the
+        # required layerwise pipeline while CUDA-graph DECODE/IDLE bypass it.
+        quant_method = getattr(self.experts, "quant_method", None)
+        kt_config = getattr(quant_method, "kt_config", None)
+        layerwise_required = (
+            kt_config is not None
+            and bool(getattr(kt_config, "is_glm5_next", False))
+            and (getattr(kt_config, "method", "") or "").upper() == "FP8"
+            and (getattr(kt_config, "gpu_prefill_token_threshold", 0) or 0) > 0
+        )
+        if not layerwise_required:
+            return super().forward(hidden_states, *args, **kwargs)
+
+        forward_batch = kwargs.get("forward_batch")
+        if forward_batch is None and args:
+            forward_batch = args[0]
+        if forward_batch is None or not hasattr(forward_batch, "forward_mode"):
+            raise RuntimeError(
+                "GLM-5-Next required FP8 layerwise routing needs "
+                "ForwardBatch.forward_mode"
+            )
+
+        missing = object()
+        previous_mode = getattr(
+            quant_method, "_glm5_next_forward_mode", missing
+        )
+        quant_method._glm5_next_forward_mode = forward_batch.forward_mode
+        try:
+            return super().forward(hidden_states, *args, **kwargs)
+        finally:
+            if previous_mode is missing:
+                delattr(quant_method, "_glm5_next_forward_mode")
+            else:
+                quant_method._glm5_next_forward_mode = previous_mode
 
 
 __all__ = [

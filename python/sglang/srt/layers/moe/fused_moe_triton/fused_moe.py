@@ -106,6 +106,7 @@ def inplace_fused_experts(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    glm5_next_hf_two_round_swiglu: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -137,6 +138,7 @@ def inplace_fused_experts(
         gemm1_limit,
         filter_expert,
         swiglu_limit=swiglu_limit,
+        glm5_next_hf_two_round_swiglu=glm5_next_hf_two_round_swiglu,
     )
 
 
@@ -170,6 +172,7 @@ def outplace_fused_experts(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    glm5_next_hf_two_round_swiglu: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -201,6 +204,7 @@ def outplace_fused_experts(
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
         swiglu_limit=swiglu_limit,
+        glm5_next_hf_two_round_swiglu=glm5_next_hf_two_round_swiglu,
     )
 
 
@@ -260,6 +264,7 @@ def fused_experts(
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
             moe_runner_config.swiglu_limit,
+            moe_runner_config.glm5_next_hf_two_round_swiglu,
         )
         return hidden_states
     else:
@@ -292,6 +297,9 @@ def fused_experts(
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
+            glm5_next_hf_two_round_swiglu=(
+                moe_runner_config.glm5_next_hf_two_round_swiglu
+            ),
         )
 
 
@@ -365,6 +373,7 @@ def fused_experts_impl(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    glm5_next_hf_two_round_swiglu: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -519,7 +528,26 @@ def fused_experts_impl(
         if activation == "silu" and is_gated:
             # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
             # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
-            if gemm1_alpha is not None:
+            if glm5_next_hf_two_round_swiglu:
+                if gemm1_alpha is not None or gemm1_limit is not None:
+                    raise ValueError(
+                        "GLM-5-Next HF two-round SwiGLU is incompatible with "
+                        "gemm1_alpha/gemm1_limit"
+                    )
+                if swiglu_limit is None:
+                    raise ValueError(
+                        "GLM-5-Next HF two-round SwiGLU requires swiglu_limit"
+                    )
+                from sglang.srt.layers.moe.glm5_next_swiglu import (
+                    glm5_next_hf_two_round_swiglu as glm5_next_swiglu,
+                )
+
+                intermediate_cache2 = glm5_next_swiglu(
+                    intermediate_cache1.view(-1, N),
+                    swiglu_limit,
+                    output=intermediate_cache2,
+                )
+            elif gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
                     intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit

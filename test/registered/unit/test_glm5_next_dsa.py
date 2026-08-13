@@ -16,6 +16,7 @@ from torch import nn
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MODULE_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next_dsa.py"
+NORM_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next_norm.py"
 
 
 class _Glm5NextTextConfig:
@@ -116,6 +117,13 @@ def _load_module(*, cp_enabled=False):
     deepseek.DeepseekV2AttentionMLA = _RecordingBaseAttention
     packages[deepseek.__name__] = deepseek
 
+    norm_name = "sglang.srt.models.glm5_next_norm"
+    norm_spec = importlib.util.spec_from_file_location(norm_name, NORM_PATH)
+    norm_module = importlib.util.module_from_spec(norm_spec)
+    assert norm_spec is not None and norm_spec.loader is not None
+    norm_spec.loader.exec_module(norm_module)
+    packages[norm_name] = norm_module
+
     utils = types.ModuleType("sglang.srt.utils")
     utils.add_prefix = lambda name, prefix: f"{prefix}.{name}" if prefix else name
     packages[utils.__name__] = utils
@@ -177,6 +185,12 @@ class TestGlm5NextDSAAttention(unittest.TestCase):
         self.assertFalse(attention.skip_topk)
         self.assertFalse(attention.next_skip_topk)
         self.assertIsNotNone(attention.base_forward_dependency)
+        self.assertIsInstance(
+            attention.q_a_layernorm, self.module.Glm5NextRMSNorm
+        )
+        self.assertIsInstance(
+            attention.kv_a_layernorm, self.module.Glm5NextRMSNorm
+        )
 
         base_kwargs = attention.base_kwargs
         self.assertIsNot(base_kwargs["config"], config)

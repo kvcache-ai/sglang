@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.nsa.nsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.models.glm5_next_norm import Glm5NextRMSNorm
 from sglang.srt.utils import add_prefix
 
 
@@ -181,6 +182,17 @@ class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
         )
 
         self.config = config
+        # The inherited DeepSeek modules use the shared optimized RMSNorm,
+        # whose CUDA path rounds after the weight multiply.  GLM's checkpoint
+        # semantics round the normalized activation to BF16 first.  Replace
+        # only these two model-local latent norms before weight loading; their
+        # parameter names remain q_a_layernorm/kv_a_layernorm.
+        self.q_a_layernorm = Glm5NextRMSNorm(
+            q_lora_rank, eps=config.rms_norm_eps
+        )
+        self.kv_a_layernorm = Glm5NextRMSNorm(
+            kv_lora_rank, eps=config.rms_norm_eps
+        )
         self.use_nsa = True
         self.nsa_enable_prefill_cp = False
         self.is_nextn = False

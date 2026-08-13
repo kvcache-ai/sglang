@@ -70,6 +70,14 @@ class Glm5NextKPoolCoordinator:
     def on_request_retract(self, req) -> None:
         self._release_request(req)
 
+    def reset(self) -> None:
+        """Clear all rows still owned by this coordinator during cache flush."""
+
+        rows = sorted(self._prepared_rows)
+        if rows:
+            self.pool.clear_compress_tail_rows(rows)
+        self._prepared_rows.clear()
+
     def is_prepared(self, req_pool_idx: int) -> bool:
         """Test/debug visibility; not used to skip mandatory row clearing."""
 
@@ -100,6 +108,10 @@ class _Glm5NextKPoolHookAdapter:
     def on_request_retract(self, req) -> None:
         if self._coordinator is not None:
             self._coordinator.on_request_retract(req)
+
+    def on_cache_flush(self) -> None:
+        if self._coordinator is not None:
+            self._coordinator.reset()
 
 
 _GLM5_NEXT_KPOOL_HOOK = _Glm5NextKPoolHookAdapter()

@@ -17,8 +17,9 @@ import triton.language as tl
 
 
 _MAX_TRITON_GRID_Z = 65535
-_BT_AUTOTUNE = (32, 64, 128)
-_NUM_WARPS_AUTOTUNE = (2, 4, 8, 16) if torch.version.hip else (4, 8, 16, 32)
+_SAFE_GATE_BLOCK_T = 32
+_SAFE_GATE_NUM_WARPS = 8
+_SAFE_GATE_NUM_STAGES = 3
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -126,15 +127,6 @@ def _torch_safe_gate(
     return gate.view(*original_shape, num_heads, head_k_dim)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BT": bt}, num_warps=num_warps, num_stages=num_stages)
-        for bt in _BT_AUTOTUNE
-        for num_warps in _NUM_WARPS_AUTOTUNE
-        for num_stages in (2, 3)
-    ],
-    key=["H", "D"],
-)
 @triton.jit
 def _glm5_next_safe_gate_kernel(
     raw_gate,
@@ -209,8 +201,7 @@ def glm5_next_safe_gate(
         )
     output = torch.empty_like(raw_gate, dtype=torch.float32)
 
-    def grid(meta):
-        return (_cdiv(num_tokens, meta["BT"]), num_heads)
+    grid = (_cdiv(num_tokens, _SAFE_GATE_BLOCK_T), num_heads)
 
     _glm5_next_safe_gate_kernel[grid](
         raw_gate,
@@ -221,8 +212,11 @@ def glm5_next_safe_gate(
         num_tokens,
         num_heads,
         head_k_dim,
+        BT=_SAFE_GATE_BLOCK_T,
         BD=_next_power_of_2(head_k_dim),
         HAS_BIAS=dt_bias is not None,
+        num_warps=_SAFE_GATE_NUM_WARPS,
+        num_stages=_SAFE_GATE_NUM_STAGES,
     )
     return output.view(*original_shape, num_heads, head_k_dim)
 
@@ -311,7 +305,11 @@ def _glm5_next_safe_decode_kernel(
         bias = tl.load(bias_ptr, mask=mask_k, other=0).to(tl.float32)
 
         gate = lower_bound * tl.sigmoid(gate_scale * (gate + bias))
-        beta = tl.sigmoid(beta)
+        # Match ``torch.sigmoid(b_proj(hidden_states))`` in the released GLM:
+        # sigmoid is materialized in the projection dtype (BF16 in production)
+        # before recurrent KDA widens it to FP32.  Keep this round inside the
+        # fused decode kernel rather than adding one launch per linear layer.
+        beta = tl.sigmoid(beta).to(raw_beta.dtype.element_ty).to(tl.float32)
         if USE_QK_L2NORM_IN_KERNEL:
             q_value /= tl.sqrt(tl.sum(q_value * q_value) + 1e-6)
             k_value /= tl.sqrt(tl.sum(k_value * k_value) + 1e-6)
@@ -404,7 +402,7 @@ def _torch_safe_decode(
                         + flat_bias[value_head]
                     )
                 )
-                beta = raw_beta[0, token_id, value_head].float().sigmoid()
+                beta = raw_beta[0, token_id, value_head].sigmoid().float()
                 head_state = state[value_head]
                 head_state *= gate.exp().unsqueeze(-1)
                 value = v[0, token_id, value_head].float()
@@ -435,7 +433,11 @@ def glm5_next_safe_decode(
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
-    """GLM bounded-gate decode; both gate and beta inputs are raw logits."""
+    """GLM bounded-gate decode; both gate and beta inputs are raw logits.
+
+    Beta activation is rounded in ``raw_beta.dtype`` before FP32 recurrence,
+    matching the released model's projection/activation boundary.
+    """
 
     if lower_bound >= 0:
         raise ValueError(f"GLM KDA lower_bound must be negative, got {lower_bound}")

@@ -40,6 +40,7 @@ class MHCState:
     hc_attn_pre: Callable
     hc_ffn_pre: Callable
     hc_post: Callable
+    attn_all_reduce_output_dtype: Optional[torch.dtype] = None
     h_res: Optional[torch.Tensor] = None
     h_post: Optional[torch.Tensor] = None
 
@@ -75,6 +76,8 @@ class MHCState:
         out_norm: Optional[torch.nn.Module] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.h_res is not None and self.h_post is not None
+        if self.attn_all_reduce_output_dtype is not None:
+            hidden_states = hidden_states.to(self.attn_all_reduce_output_dtype)
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
         residual = hidden_states
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)
@@ -224,6 +227,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         hc_attn_pre: Callable,
         hc_ffn_pre: Callable,
         hc_post: Callable,
+        attn_all_reduce_output_dtype: Optional[torch.dtype] = None,
     ):
         self.is_first_layer = is_first_layer
         self.mhc = MHCState(
@@ -231,6 +235,7 @@ class MHCLayerCommunicator(LayerCommunicator):
             hc_attn_pre=hc_attn_pre,
             hc_ffn_pre=hc_ffn_pre,
             hc_post=hc_post,
+            attn_all_reduce_output_dtype=attn_all_reduce_output_dtype,
         )
         super().__init__(
             layer_scatter_modes,

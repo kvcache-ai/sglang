@@ -20,6 +20,7 @@ from torch import nn
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = REPO_ROOT / "python/sglang/srt/configs/glm5_next.py"
 MODEL_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next.py"
+NORM_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next_norm.py"
 MODEL_CONFIG_PATH = REPO_ROOT / "python/sglang/srt/configs/model_config.py"
 
 
@@ -67,6 +68,8 @@ def _load_model_module(config_module):
         "sglang",
         "sglang.srt",
         "sglang.srt.configs",
+        "sglang.srt.distributed",
+        "sglang.srt.distributed.device_communicators",
         "sglang.srt.eplb",
         "sglang.srt.layers",
         "sglang.srt.layers.quantization",
@@ -81,6 +84,13 @@ def _load_model_module(config_module):
 
     packages["sglang.srt.configs.glm5_next"] = config_module
 
+    norm_name = "sglang.srt.models.glm5_next_norm"
+    norm_spec = importlib.util.spec_from_file_location(norm_name, NORM_PATH)
+    norm_module = importlib.util.module_from_spec(norm_spec)
+    assert norm_spec is not None and norm_spec.loader is not None
+    norm_spec.loader.exec_module(norm_module)
+    packages[norm_name] = norm_module
+
     pp_group = SimpleNamespace(
         is_first_rank=True,
         is_last_rank=True,
@@ -88,9 +98,22 @@ def _load_model_module(config_module):
         world_size=1,
     )
     distributed = types.ModuleType("sglang.srt.distributed")
+    distributed.__path__ = []
     distributed.get_pp_group = lambda: pp_group
     distributed.get_tensor_model_parallel_world_size = lambda: 1
+    distributed.get_tp_group = lambda: object()
     packages[distributed.__name__] = distributed
+
+    @contextmanager
+    def use_symmetric_memory(*args, **kwargs):
+        del args, kwargs
+        yield
+
+    pynccl_allocator = types.ModuleType(
+        "sglang.srt.distributed.device_communicators.pynccl_allocator"
+    )
+    pynccl_allocator.use_symmetric_memory = use_symmetric_memory
+    packages[pynccl_allocator.__name__] = pynccl_allocator
 
     expert_distribution = types.ModuleType("sglang.srt.eplb.expert_distribution")
     expert_distribution.get_global_expert_distribution_recorder = lambda: None
@@ -150,6 +173,28 @@ def _load_model_module(config_module):
     communicator_mhc.MHCLayerCommunicator = _MHCLayerCommunicator
     packages[communicator_mhc.__name__] = communicator_mhc
 
+    dp_attention = types.ModuleType("sglang.srt.layers.dp_attention")
+    dp_attention.get_attention_tp_rank = lambda: 0
+    dp_attention.is_allocation_symmetric = lambda: False
+    packages[dp_attention.__name__] = dp_attention
+
+    class _ReplicatedLinear(nn.Module):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__()
+            self.input_size = input_size
+            self.output_size = output_size
+            self.kwargs = kwargs
+
+        def forward(self, hidden_states):
+            return hidden_states.new_empty(
+                (*hidden_states.shape[:-1], self.output_size)
+            ), None
+
+    linear = types.ModuleType("sglang.srt.layers.linear")
+    linear.ReplicatedLinear = _ReplicatedLinear
+    linear.RowParallelLinear = type("RowParallelLinear", (), {})
+    packages[linear.__name__] = linear
+
     class _Layer(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
@@ -165,6 +210,10 @@ def _load_model_module(config_module):
     base_config = types.ModuleType("sglang.srt.layers.quantization.base_config")
     base_config.QuantizationConfig = type("QuantizationConfig", (), {})
     packages[base_config.__name__] = base_config
+
+    unquant = types.ModuleType("sglang.srt.layers.quantization.unquant")
+    unquant.UnquantizedLinearMethod = type("UnquantizedLinearMethod", (), {})
+    packages[unquant.__name__] = unquant
 
     layer_utils = types.ModuleType("sglang.srt.layers.utils")
     layer_utils.PPMissingLayer = _Layer
@@ -192,9 +241,14 @@ def _load_model_module(config_module):
         def __init__(self, *, config, **kwargs):
             super().__init__()
             self.config = config
+            self.hidden_size = config.hidden_size
             self.num_heads = config.linear_attn_config["num_heads"]
             self.head_dim = config.linear_attn_config["head_dim"]
             self.head_v_dim = config.v_head_dim
+            self.local_num_heads = self.num_heads
+            self.attn_tp_size = 1
+            self.do_fuse_qkvbfg = False
+            self.f_a_proj = _ReplicatedLinear(self.hidden_size, self.head_dim)
             self.o_proj = SimpleNamespace(reduce_results=True)
             self.attn = SimpleNamespace(lower_bound=None)
 
@@ -460,6 +514,32 @@ class TestGlm5NextModelBoundary(unittest.TestCase):
         self.assertEqual(result.linear_head_dim, 128)
         self.assertEqual(result.v_head_dim, 128)
 
+    def test_kda_beta_projection_is_replicated_then_head_sliced(self):
+        config_module = _load_config_module()
+        model_module = _load_model_module(config_module)
+        config = config_module.Glm5NextTextConfig()
+
+        attention = model_module.Glm5NextLinearAttention(
+            layer_idx=0,
+            hidden_size=config.hidden_size,
+            config=config,
+            quant_config=object(),
+            prefix="model.layers.0.self_attn",
+        )
+
+        self.assertEqual(attention.b_proj.input_size, config.hidden_size)
+        self.assertEqual(attention.b_proj.output_size, 64)
+        self.assertEqual(attention._beta_head_start, 0)
+        self.assertEqual(attention._beta_heads_per_rank, 64)
+        self.assertEqual(
+            attention.b_proj.kwargs["prefix"],
+            "model.layers.0.self_attn.b_proj",
+        )
+
+        source = MODEL_PATH.read_text(encoding="utf-8")
+        self.assertIn("beta = beta.narrow(", source)
+        self.assertNotIn("tensor_model_parallel_all_gather(beta", source)
+
     def test_weight_prefix_and_phase7_visual_whitelist_are_exact(self):
         normalize = _compile_function(MODEL_PATH, "normalize_glm5_next_weight_name")
         normalize.__globals__["GLM5_NEXT_PHASE7_VISUAL_WEIGHT_PREFIXES"] = (
@@ -556,6 +636,8 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
         last = self.model_module.Glm5NextDecoderLayer(self._config(), layer_idx=1)
 
         expected_shapes = {
+            "input_layernorm.weight": (4,),
+            "post_attention_layernorm.weight": (4,),
             "hc_attn_base": (8,),
             "hc_attn_scale": (3,),
             "hc_attn_fn": (8, 8),
@@ -563,9 +645,10 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
             "hc_ffn_scale": (3,),
             "hc_ffn_fn": (8, 8),
         }
-        self.assertEqual(set(dict(first.named_parameters())), set(expected_shapes))
+        named_parameters = dict(first.named_parameters())
+        self.assertEqual(set(named_parameters), set(expected_shapes))
         for name, shape in expected_shapes.items():
-            parameter = getattr(first, name)
+            parameter = named_parameters[name]
             self.assertEqual(tuple(parameter.shape), shape)
             self.assertEqual(parameter.dtype, torch.float32)
 
@@ -577,12 +660,117 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
         self.assertIs(first.layer_communicator.kwargs["hc_attn_pre"].__self__, first)
         self.assertIs(first.layer_communicator.kwargs["hc_ffn_pre"].__self__, first)
         self.assertIs(first.layer_communicator.kwargs["hc_post"].__self__, first)
+        self.assertIs(
+            first.layer_communicator.kwargs["attn_all_reduce_output_dtype"],
+            torch.bfloat16,
+        )
+        self.assertIsNone(
+            last.layer_communicator.kwargs["attn_all_reduce_output_dtype"]
+        )
         self.assertIsNone(first.layer_communicator.kwargs["qkv_latent_func"])
         dsa_latent_func = last.layer_communicator.kwargs["qkv_latent_func"]
         self.assertIs(dsa_latent_func.__self__, last.self_attn)
         self.assertIs(
             dsa_latent_func.__func__, last.self_attn.prepare_qkv_latent.__func__
         )
+
+    def test_glm_norm_matches_checkpoint_bf16_rounding_boundary(self):
+        norm = self.model_module.Glm5NextRMSNorm(17, eps=1e-6).to(torch.bfloat16)
+        generator = torch.Generator().manual_seed(0)
+        hidden_states = torch.randn(3, 17, generator=generator).to(torch.bfloat16)
+        with torch.no_grad():
+            norm.weight.copy_(
+                torch.randn(17, generator=generator).to(torch.bfloat16)
+            )
+
+        actual = norm(hidden_states)
+        hidden_states_fp32 = hidden_states.float()
+        normalized_fp32 = hidden_states_fp32 * torch.rsqrt(
+            hidden_states_fp32.pow(2).mean(-1, keepdim=True) + 1e-6
+        )
+        expected = norm.weight * normalized_fp32.to(torch.bfloat16)
+        shared_optimized_order = (norm.weight.float() * normalized_fp32).to(
+            torch.bfloat16
+        )
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(actual, shared_optimized_order))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_glm_norm_cuda_graph_bs_1_2_4_replays_dynamic_inputs_in_place(self):
+        hidden_size = 17
+        generator = torch.Generator().manual_seed(20260812)
+        weight = torch.randn(hidden_size, generator=generator).to(torch.bfloat16)
+
+        def checkpoint_reference(norm, hidden_states):
+            hidden_states_fp32 = hidden_states.float()
+            normalized_fp32 = hidden_states_fp32 * torch.rsqrt(
+                hidden_states_fp32.pow(2).mean(-1, keepdim=True) + 1e-6
+            )
+            return norm.weight * normalized_fp32.to(hidden_states.dtype)
+
+        for batch_size in (1, 2, 4):
+            with self.subTest(batch_size=batch_size):
+                norm = self.model_module.Glm5NextRMSNorm(hidden_size, eps=1e-6).to(
+                    device="cuda", dtype=torch.bfloat16
+                )
+                with torch.no_grad():
+                    norm.weight.copy_(weight)
+
+                input_a = torch.randn(batch_size, hidden_size, generator=generator).to(
+                    device="cuda", dtype=torch.bfloat16
+                )
+                poison = torch.randn(batch_size, hidden_size, generator=generator).to(
+                    device="cuda", dtype=torch.bfloat16
+                )
+                static_input = input_a.clone()
+                expected_a = checkpoint_reference(norm, input_a)
+
+                # Warm up all kernels and allocator paths before capture.
+                norm(static_input)
+                torch.cuda.synchronize()
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_output = norm(static_input)
+
+                stable_pointers = {
+                    "input": static_input.data_ptr(),
+                    "output": static_output.data_ptr(),
+                    "weight": norm.weight.data_ptr(),
+                }
+
+                def replay(value):
+                    static_input.copy_(value)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertEqual(static_input.data_ptr(), stable_pointers["input"])
+                    self.assertEqual(
+                        static_output.data_ptr(), stable_pointers["output"]
+                    )
+                    self.assertEqual(norm.weight.data_ptr(), stable_pointers["weight"])
+                    return static_output.clone()
+
+                first_a = replay(input_a)
+                poison_output = replay(poison)
+                second_a = replay(input_a)
+
+                torch.testing.assert_close(first_a, expected_a, rtol=0, atol=0)
+                self.assertFalse(torch.equal(poison_output, first_a))
+                torch.testing.assert_close(second_a, first_a, rtol=0, atol=0)
+
+    def test_all_glm_decoder_and_final_norms_are_model_local(self):
+        model = self.model_module.Glm5NextModel(self._config())
+
+        for layer in model.layers:
+            self.assertIsInstance(
+                layer.input_layernorm, self.model_module.Glm5NextRMSNorm
+            )
+            self.assertIsInstance(
+                layer.post_attention_layernorm, self.model_module.Glm5NextRMSNorm
+            )
+        self.assertIsInstance(model.norm, self.model_module.Glm5NextRMSNorm)
 
     def test_top_level_forward_owns_dsa_latent_context_lifetime(self):
         model = self.model_module.Glm5NextForConditionalGeneration(self._config())
@@ -627,10 +815,6 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
             calls.append(("pre", kwargs))
             return "pre-result"
 
-        def hc_post(**kwargs):
-            calls.append(("post", kwargs))
-            return "post-result"
-
         packages = {}
         for name in (
             "sglang",
@@ -643,29 +827,64 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
             packages[name] = module
         mhc = types.ModuleType("sglang.kernels.ops.layernorm.mhc")
         mhc.hc_pre = hc_pre
-        mhc.hc_post = hc_post
         packages[mhc.__name__] = mhc
 
         x = torch.zeros(1, 8)
         with patch.dict(sys.modules, packages):
             self.assertEqual(layer.hc_attn_pre(x, "weight", 1e-4), "pre-result")
             self.assertEqual(layer.hc_ffn_pre(x, "weight", 1e-4), "pre-result")
-            self.assertEqual(
-                layer.hc_post("x", "residual", "h_res", "h_post"),
-                "post-result",
-            )
 
         attn_kwargs = calls[0][1]
         ffn_kwargs = calls[1][1]
-        post_kwargs = calls[2][1]
         self.assertIs(attn_kwargs["hc_fn"], layer.hc_attn_fn)
         self.assertIs(attn_kwargs["hc_scale"], layer.hc_attn_scale)
         self.assertIs(attn_kwargs["hc_base"], layer.hc_attn_base)
         self.assertIs(ffn_kwargs["hc_fn"], layer.hc_ffn_fn)
         self.assertIs(ffn_kwargs["hc_scale"], layer.hc_ffn_scale)
         self.assertIs(ffn_kwargs["hc_base"], layer.hc_ffn_base)
-        self.assertEqual(post_kwargs["hc_mult"], 2)
         self.assertEqual(attn_kwargs["sinkhorn_iters"], 20)
+
+    def test_hc_post_uses_glm_bf16_matmul_semantics(self):
+        layer = self.model_module.Glm5NextDecoderLayer(self._config(), layer_idx=0)
+        generator = torch.Generator().manual_seed(0)
+        tokens, hc_mult, hidden_size = 3, layer.config.hc_mult, 17
+        hidden_states = (
+            torch.randn(tokens, hidden_size, generator=generator) * 3
+        ).to(torch.bfloat16)
+        residual_streams = (
+            torch.randn(tokens, hc_mult, hidden_size, generator=generator) * 3
+        ).to(torch.bfloat16)
+        residual = residual_streams.flatten(1)
+        h_post = torch.randn(tokens, hc_mult, generator=generator)
+        h_res_matrix = torch.randn(tokens, hc_mult, hc_mult, generator=generator)
+        h_res = h_res_matrix.flatten(1)
+
+        actual = layer.hc_post(hidden_states, residual, h_res, h_post)
+        expected = (
+            h_post.to(torch.bfloat16).unsqueeze(-1) * hidden_states.unsqueeze(1)
+            + torch.matmul(
+                h_res_matrix.to(torch.bfloat16).transpose(-1, -2),
+                residual_streams,
+            )
+        ).flatten(1)
+        elementwise_sum = (
+            h_post.to(torch.bfloat16).unsqueeze(-1) * hidden_states.unsqueeze(1)
+            + (
+                h_res_matrix.to(torch.bfloat16)
+                .transpose(-1, -2)
+                .unsqueeze(-1)
+                * residual_streams.unsqueeze(1)
+            ).sum(dim=2)
+        ).flatten(1)
+        late_cast = (
+            h_post.unsqueeze(-1) * hidden_states.float().unsqueeze(1)
+            + torch.matmul(h_res_matrix.transpose(-1, -2), residual_streams.float())
+        ).to(torch.bfloat16).flatten(1)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(actual, elementwise_sum))
+        self.assertFalse(torch.equal(actual, late_cast))
 
     def test_mhc_layer_forward_orders_attention_mlp_and_post(self):
         layer = self.model_module.Glm5NextDecoderLayer(self._config(), layer_idx=0)

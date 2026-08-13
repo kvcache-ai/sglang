@@ -13,6 +13,9 @@ from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_p
 from sglang.srt.layers.attention.nsa.glm5_next_sparse_attention import (
     glm5_next_sparse_mla_reference,
 )
+from sglang.srt.layers.attention.nsa.glm5_next_scaled_fp8 import (
+    glm5_next_mla_prepare_scaled_fp8_no_rope,
+)
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -306,6 +309,11 @@ class NativeSparseAttnBackend(
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
+        # ForwardContext may publish this backend directly or through the
+        # hybrid KDA/DSA wrapper.  Keep the normal AttentionBackend pool
+        # contract so both routes resolve the same persistent pool objects.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
@@ -315,9 +323,7 @@ class NativeSparseAttnBackend(
         # Do not widen their object contract for a nested config that is used
         # exclusively by the exact GLM wrapper.
         text_config = (
-            model_runner.model_config.hf_text_config
-            if is_glm5_next
-            else hf_config
+            model_runner.model_config.hf_text_config if is_glm5_next else hf_config
         )
         self.is_glm5_next = is_glm5_next
         self.use_nsa = is_deepseek_nsa(hf_config) or is_glm5_next
@@ -326,9 +332,7 @@ class NativeSparseAttnBackend(
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
         self.nsa_index_topk = (
-            text_config.index_topk
-            if is_glm5_next
-            else get_nsa_index_topk(hf_config)
+            text_config.index_topk if is_glm5_next else get_nsa_index_topk(hf_config)
         )
         self.nsa_index_kpool = (
             int(getattr(text_config, "index_kpool", 1)) if is_glm5_next else 1
@@ -410,6 +414,63 @@ class NativeSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def _init_glm5_next_kpool_graph_metadata(
+        self, metadata: NSAMetadata, forward_mode: ForwardMode
+    ) -> NSAMetadata:
+        """Allocate the stable pooled decode views captured by exact GLM."""
+
+        if not (
+            self.is_glm5_next
+            and self.nsa_index_kpool == 4
+            and forward_mode.is_decode_or_idle()
+        ):
+            return metadata
+
+        from sglang.srt.layers.attention.nsa.kpool_plan import (
+            init_pooled_paged_mqa_metadata,
+        )
+
+        return init_pooled_paged_mqa_metadata(
+            metadata,
+            metadata.cache_seqlens_int32,
+            forward_mode,
+            pool_size=self.nsa_index_kpool,
+            real_page_size=self.real_page_size,
+            # GLM's compressed index cache still stores 64 pooled entries in
+            # each physical page; this is not real_page_size / pool_size.
+            slots_per_page=64,
+            # SM120 consumes the graph-safe model-local scorer and has no
+            # DeepGEMM schedule.  Other Blackwell variants keep the existing
+            # schedule contract.
+            build_schedule_metadata=self.device_capability != (12, 0),
+        )
+
+    def _update_glm5_next_kpool_graph_metadata(
+        self, metadata: NSAMetadata, forward_mode: ForwardMode
+    ) -> None:
+        """Refresh pooled views in-place before replay, preserving pointers."""
+
+        if not (
+            self.is_glm5_next
+            and self.nsa_index_kpool == 4
+            and forward_mode.is_decode_or_idle()
+        ):
+            return
+
+        from sglang.srt.layers.attention.nsa.kpool_plan import (
+            update_pooled_paged_mqa_metadata,
+        )
+
+        update_pooled_paged_mqa_metadata(
+            metadata,
+            metadata.cache_seqlens_int32,
+            forward_mode,
+            pool_size=self.nsa_index_kpool,
+            real_page_size=self.real_page_size,
+            slots_per_page=64,
+            build_schedule_metadata=self.device_capability != (12, 0),
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -607,9 +668,9 @@ class NativeSparseAttnBackend(
                         )
                     ]
                 )
-                assert page_table_1_flattened.shape[0] == sum(
-                    indexer_seq_lens_cpu
-                ), f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                assert page_table_1_flattened.shape[0] == sum(indexer_seq_lens_cpu), (
+                    f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
+                )
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
@@ -650,10 +711,14 @@ class NativeSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+        if (
+            is_cuda()
+            and not (self.is_glm5_next and self.device_capability == (12, 0))
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            )
         ):
             try:
                 import deep_gemm
@@ -752,6 +817,9 @@ class NativeSparseAttnBackend(
                     pool_size=self.nsa_index_kpool,
                     real_page_size=self.real_page_size,
                     slots_per_page=slots_per_page,
+                    build_schedule_metadata=not (
+                        self.is_glm5_next and self.device_capability == (12, 0)
+                    ),
                 )
         self.forward_metadata = metadata
 
@@ -986,10 +1054,14 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+        if (
+            is_cuda()
+            and not (self.is_glm5_next and self.device_capability == (12, 0))
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend()
+            )
         ):
             try:
                 import deep_gemm
@@ -1025,6 +1097,7 @@ class NativeSparseAttnBackend(
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
+        metadata = self._init_glm5_next_kpool_graph_metadata(metadata, forward_mode)
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
@@ -1161,10 +1234,14 @@ class NativeSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+        if (
+            is_cuda()
+            and not (self.is_glm5_next and self.device_capability == (12, 0))
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend()
+            )
         ):
             try:
                 import deep_gemm
@@ -1206,6 +1283,11 @@ class NativeSparseAttnBackend(
             metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
+
+        # The graph captures these pooled tensors by address.  Recompute their
+        # contents after the real page table is refreshed and copy in-place;
+        # never replace a field with a replay-time allocation.
+        self._update_glm5_next_kpool_graph_metadata(metadata, forward_mode)
 
         if self.nsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(
@@ -1453,9 +1535,9 @@ class NativeSparseAttnBackend(
         if self.use_mha:
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
-            assert (
-                layer.tp_k_head_num == layer.tp_q_head_num > 1
-            ), "MHA_ONE_SHOT requires dense multi-head config"
+            assert layer.tp_k_head_num == layer.tp_q_head_num > 1, (
+                "MHA_ONE_SHOT requires dense multi-head config"
+            )
             return self._forward_standard_mha(
                 q=q,
                 k=k,
@@ -1870,8 +1952,8 @@ class NativeSparseAttnBackend(
 
         # Verify batch sizes match (length of cu_seqlens should be batch_size + 1)
         assert len(cu_seqlens_q) == len(cu_seqlens_k), (
-            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q)-1} requests, "
-            f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
+            f"batch_size mismatch: cu_seqlens_q has {len(cu_seqlens_q) - 1} requests, "
+            f"cu_seqlens_k has {len(cu_seqlens_k) - 1} requests"
         )
 
         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
@@ -1996,6 +2078,19 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
+        glm5_key_scale = None
+        glm5_current_chunk_kv = None
+        glm5_current_chunk_locs = None
+        use_glm5_scaled_fp8 = (
+            self.is_glm5_next
+            and self.device_capability == (12, 0)
+            and self.kv_cache_dtype == torch.float8_e4m3fn
+        )
+        use_glm5_current_chunk_bf16 = (
+            use_glm5_scaled_fp8
+            and is_prefill
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -2005,14 +2100,32 @@ class NativeSparseAttnBackend(
                 assert self.qk_rope_head_dim == 0, (
                     "missing RoPE cache is valid only for zero-RoPE MLA"
                 )
-                q, k, k_rope = mla_quantize_for_fp8_no_rope(
-                    q,
-                    q_rope,
-                    k.squeeze(1),
-                    k_rope.squeeze(1),
-                    self.kv_lora_rank,
-                    self.qk_rope_head_dim,
-                )
+                if use_glm5_scaled_fp8:
+                    if use_glm5_current_chunk_bf16:
+                        glm5_current_chunk_kv = k.squeeze(1).contiguous()
+                        if glm5_current_chunk_kv.dtype != torch.bfloat16:
+                            raise TypeError(
+                                "GLM-5-Next EXTEND current-chunk latent must be "
+                                f"BF16 before FP8 cache storage, got "
+                                f"{glm5_current_chunk_kv.dtype}"
+                            )
+                    q, k, k_rope, glm5_key_scale = (
+                        glm5_next_mla_prepare_scaled_fp8_no_rope(
+                            q,
+                            q_rope,
+                            k.squeeze(1),
+                            k_rope.squeeze(1),
+                        )
+                    )
+                else:
+                    q, k, k_rope = mla_quantize_for_fp8_no_rope(
+                        q,
+                        q_rope,
+                        k.squeeze(1),
+                        k_rope.squeeze(1),
+                        self.kv_lora_rank,
+                        self.qk_rope_head_dim,
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -2029,17 +2142,23 @@ class NativeSparseAttnBackend(
 
             # Save KV cache if requested
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             cache_loc = (
                 forward_batch.out_cache_loc
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
+            if glm5_current_chunk_kv is not None:
+                glm5_current_chunk_locs = cache_loc
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, cache_loc, k, k_rope
             )
+            if glm5_key_scale is not None:
+                forward_batch.token_to_kv_pool.set_latent_scale_buffer(
+                    layer.layer_id, cache_loc, glm5_key_scale
+                )
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
@@ -2082,6 +2201,45 @@ class NativeSparseAttnBackend(
                     f"indices plus three tail indices ({expected_top_k} total), "
                     f"got {sparse_mla_top_k}"
                 )
+        if use_glm5_scaled_fp8:
+            # Q remains BF16 and dynamic block scales reconstruct K/V.
+            # Checkpoint-level static k_scale belongs to the legacy raw-cast
+            # convention and must not be applied a second time.
+            bmm1_scale = layer.scaling
+        else:
+            q_scale = 1.0
+            k_scale = (
+                layer.k_scale_float
+                if getattr(layer, "k_scale_float", None) is not None
+                else 1.0
+            )
+            bmm1_scale = q_scale * k_scale * layer.scaling
+
+        if self.is_glm5_next and self.device_capability == (12, 0):
+            latent_scale = (
+                forward_batch.token_to_kv_pool.get_latent_scale_buffer(layer.layer_id)
+                if use_glm5_scaled_fp8
+                else None
+            )
+            # CUDA Graph decode needs the fixed-shape scaled-FP8 H512 Triton
+            # kernel.  EXTEND keeps history in that same persistent cache, but
+            # selected rows from its current chunk use the pre-quantization
+            # BF16 latent.  This avoids an unnecessary write/read FP8 round on
+            # new tokens without allocating a 500k-token BF16 cache.
+            return glm5_next_sparse_mla_reference(
+                query=q_all,
+                kv_cache=kv_cache,
+                indices=page_table_1,
+                sm_scale=bmm1_scale,
+                use_cuda_decode_kernel=not is_prefill,
+                kv_scale=latent_scale,
+                current_chunk_kv=glm5_current_chunk_kv,
+                current_chunk_locs=glm5_current_chunk_locs,
+            )
+
+        # Padding to a multiple of four belongs to FlashInfer's TRTLLM ABI.
+        # The exact GLM kernel above consumes its native 2048+3 width and must
+        # dispatch before this shared-backend transform.
         padded_sparse_mla_top_k = ((sparse_mla_top_k + 3) // 4) * 4
         if padded_sparse_mla_top_k != sparse_mla_top_k:
             page_table_1 = torch.cat(
@@ -2100,25 +2258,6 @@ class NativeSparseAttnBackend(
                 dim=1,
             )
         sparse_mla_top_k = padded_sparse_mla_top_k
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-
-        if self.is_glm5_next:
-            # FlashInfer <=0.6.16 has no native H512 ABI; 0.6.17 adds it for
-            # TRTLLM-GEN architectures but still reports "Unsupported
-            # architecture" on SM120.  Keep the exact GLM eager path correct
-            # without upgrading the global dependency used by existing models.
-            return glm5_next_sparse_mla_reference(
-                query=q_all,
-                kv_cache=kv_cache,
-                indices=page_table_1,
-                sm_scale=bmm1_scale,
-            )
 
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
@@ -2234,8 +2373,7 @@ class NativeSparseAttnBackend(
         """
         if (
             # disable for MTP
-            self.nsa_kv_cache_store_fp8
-            and self.nsa_prefill_impl == "flashmla_sparse"
+            self.nsa_kv_cache_store_fp8 and self.nsa_prefill_impl == "flashmla_sparse"
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
@@ -2272,7 +2410,6 @@ class NativeSparseAttnBackend(
 
 
 class NativeSparseAttnMultiStepBackend:
-
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):

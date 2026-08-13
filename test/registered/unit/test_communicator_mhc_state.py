@@ -260,6 +260,64 @@ class TestMHCState(unittest.TestCase):
         output, _ = state.attn_split(flat, out_norm=_ScaleNorm(2, 10.0))
         torch.testing.assert_close(output, torch.tensor([[1.0, 2.0]]))
 
+    def test_attention_all_reduce_cast_policy_is_opt_in_and_precedes_hc_post(self):
+        def run(output_dtype):
+            events = []
+
+            def pre(x, norm_weight, norm_eps):
+                del norm_weight, norm_eps
+                tokens = x.shape[0]
+                return (
+                    x,
+                    torch.zeros(tokens, 4),
+                    torch.zeros(tokens, 2),
+                    True,
+                )
+
+            def post(x, residual, h_res, h_post):
+                del h_res, h_post
+                events.append(("hc_post", x.dtype))
+                return residual
+
+            state = COMMUNICATOR_MHC.MHCState(
+                hc_mult=2,
+                hc_attn_pre=pre,
+                hc_ffn_pre=pre,
+                hc_post=post,
+                attn_all_reduce_output_dtype=output_dtype,
+                h_res=torch.zeros(1, 4),
+                h_post=torch.zeros(1, 2),
+            )
+
+            def all_reduce(x):
+                events.append(("all_reduce", x.dtype))
+                return x
+
+            with patch.object(
+                COMMUNICATOR_MHC,
+                "tensor_model_parallel_all_reduce",
+                side_effect=all_reduce,
+            ):
+                COMMUNICATOR_MHC.MHCCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
+                    hidden_states=torch.ones(1, 2, dtype=torch.float32),
+                    residual=torch.ones(1, 4, dtype=torch.bfloat16),
+                    forward_batch=object(),
+                    layernorm=None,
+                    context=types.SimpleNamespace(attn_dp_size=1, attn_cp_size=1),
+                    residual_input_mode=COMMUNICATOR_MHC.ScatterMode.TP_ATTN_FULL,
+                    mhc=state,
+                )
+            return events
+
+        self.assertEqual(
+            run(torch.bfloat16),
+            [("all_reduce", torch.float32), ("hc_post", torch.bfloat16)],
+        )
+        self.assertEqual(
+            run(None),
+            [("all_reduce", torch.float32), ("hc_post", torch.float32)],
+        )
+
 
 class TestMHCLayerCommunicatorTopology(unittest.TestCase):
     @staticmethod
@@ -281,6 +339,7 @@ class TestMHCLayerCommunicatorTopology(unittest.TestCase):
         pre=None,
         post=None,
         qkv_latent_func=None,
+        attn_all_reduce_output_dtype=None,
     ):
         norm = _ScaleNorm(hidden_size=2, scale=1.0)
 
@@ -305,6 +364,7 @@ class TestMHCLayerCommunicatorTopology(unittest.TestCase):
             hc_ffn_pre=pre,
             hc_post=post,
             qkv_latent_func=qkv_latent_func,
+            attn_all_reduce_output_dtype=attn_all_reduce_output_dtype,
         )
 
     def test_dsa_latent_is_installed_after_mhc_attention_preprocess(self):

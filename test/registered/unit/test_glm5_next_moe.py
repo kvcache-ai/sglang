@@ -30,6 +30,12 @@ FUSED_MOE_PATH = (
     REPO_ROOT / "python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py"
 )
 TRITON_RUNNER_PATH = REPO_ROOT / "python/sglang/srt/layers/moe/moe_runner/triton.py"
+MOE_RUNNER_BASE_PATH = (
+    REPO_ROOT / "python/sglang/srt/layers/moe/moe_runner/base.py"
+)
+GLM_SWIGLU_PATH = (
+    REPO_ROOT / "python/sglang/srt/layers/moe/glm5_next_swiglu.py"
+)
 FP8_PATH = REPO_ROOT / "python/sglang/srt/layers/quantization/fp8.py"
 KT_EP_PATH = REPO_ROOT / "python/sglang/srt/layers/moe/kt_ep_wrapper.py"
 FLASHINFER_RUNNER_PATH = (
@@ -178,6 +184,7 @@ class _DeepseekV2MoEStub(nn.Module):
         prefix="",
         alt_stream=None,
         is_nextn=False,
+        glm5_next_hf_two_round_swiglu=False,
     ):
         super().__init__()
         del quant_config, alt_stream, is_nextn
@@ -187,6 +194,9 @@ class _DeepseekV2MoEStub(nn.Module):
         self.use_grouped_topk = config.n_group > config.topk_group
         self.gate = _GateStub(config)
         self.experts = _ExpertsStub(config)
+        self.experts.moe_runner_config.glm5_next_hf_two_round_swiglu = (
+            glm5_next_hf_two_round_swiglu
+        )
         self.topk = SimpleNamespace(
             topk_config=SimpleNamespace(
                 use_grouped_topk=self.use_grouped_topk,
@@ -206,6 +216,12 @@ class _DeepseekV2MoEStub(nn.Module):
 
     def forward(self, hidden_states, *args, **kwargs):
         self.base_forward_calls.append((args, kwargs))
+        quant_method = getattr(self.experts, "quant_method", None)
+        self.base_forward_mode_seen = getattr(
+            quant_method, "_glm5_next_forward_mode", None
+        )
+        if getattr(self, "raise_in_base_forward", False):
+            raise RuntimeError("base forward failed")
         return hidden_states + 1
 
 
@@ -299,6 +315,54 @@ class TestGlm5NextSwiGLU(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "even gate/up width"):
             self.module.Glm5NextSiluAndMul(10.0)(torch.randn(2, 7))
 
+    def test_bfloat16_materializes_silu_before_multiply(self):
+        # This pair separates Transformers' two BF16 operations from the
+        # former fused CUDA implementation, which rounded only once after an
+        # FP32 SiLU-and-multiply expression.
+        gate_up = torch.tensor(
+            [[-11.25, -6.125]],
+            dtype=torch.bfloat16,
+        )
+        actual = self.module.Glm5NextSiluAndMul(10.0)(gate_up)
+        gate, up = gate_up.chunk(2, dim=-1)
+        expected = F.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0)
+        fused_one_round = (
+            F.silu(gate.float().clamp(max=10.0))
+            * up.float().clamp(-10.0, 10.0)
+        ).to(torch.bfloat16)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertNotEqual(actual.item(), fused_one_round.item())
+
+    def test_private_primitive_cpu_reference_and_output_reuse(self):
+        spec = importlib.util.spec_from_file_location(
+            "_glm5_next_private_swiglu_test", GLM_SWIGLU_PATH
+        )
+        private_module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(private_module)
+
+        gate_up = torch.tensor([[-11.25, -6.125]], dtype=torch.bfloat16)
+        output = torch.empty((1, 1), dtype=torch.bfloat16)
+        actual = private_module.glm5_next_hf_two_round_swiglu(
+            gate_up, 10.0, output=output
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        expected = F.silu(gate.clamp(max=10.0)) * up.clamp(-10.0, 10.0)
+        fused_one_round = (
+            F.silu(gate.float().clamp(max=10.0))
+            * up.float().clamp(-10.0, 10.0)
+        ).to(torch.bfloat16)
+
+        self.assertIs(actual, output)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertNotEqual(actual.item(), fused_one_round.item())
+
+        with self.assertRaisesRegex(ValueError, "output shape mismatch"):
+            private_module.glm5_next_hf_two_round_swiglu(
+                gate_up, 10.0, output=torch.empty((1, 2), dtype=torch.bfloat16)
+            )
+
 
 class TestGlm5NextMLPAndMoE(unittest.TestCase):
     @classmethod
@@ -357,6 +421,9 @@ class TestGlm5NextMLPAndMoE(unittest.TestCase):
             moe.gate.e_score_correction_bias,
         )
         self.assertEqual(moe.experts.moe_runner_config.swiglu_limit, 10.0)
+        self.assertTrue(
+            moe.experts.moe_runner_config.glm5_next_hf_two_round_swiglu
+        )
         self.assertIsInstance(moe.shared_experts.act_fn, self.module.Glm5NextSiluAndMul)
         self.assertEqual(moe.shared_experts.swiglu_limit, 10.0)
         self.assertFalse(moe.shared_experts.reduce_results)
@@ -413,6 +480,31 @@ class TestGlm5NextMLPAndMoE(unittest.TestCase):
         )
         self.assertNotIn("forward_normal", self.module.Glm5NextMoE.__dict__)
         self.assertNotIn("forward_deepep", self.module.Glm5NextMoE.__dict__)
+
+    def test_required_layerwise_mode_is_scoped_to_one_base_forward(self):
+        moe = self.module.Glm5NextMoE(
+            config=_config(swiglu_limit=None), layer_id=3
+        )
+        quant_method = SimpleNamespace(
+            kt_config=SimpleNamespace(
+                is_glm5_next=True,
+                method="FP8",
+                gpu_prefill_token_threshold=4096,
+            )
+        )
+        moe.experts.quant_method = quant_method
+        forward_mode = object()
+        forward_batch = SimpleNamespace(forward_mode=forward_mode)
+
+        moe(torch.zeros(1, 4), forward_batch=forward_batch)
+
+        self.assertIs(moe.base_forward_mode_seen, forward_mode)
+        self.assertFalse(hasattr(quant_method, "_glm5_next_forward_mode"))
+
+        moe.raise_in_base_forward = True
+        with self.assertRaisesRegex(RuntimeError, "base forward failed"):
+            moe(torch.zeros(1, 4), forward_batch=forward_batch)
+        self.assertFalse(hasattr(quant_method, "_glm5_next_forward_mode"))
 
     def test_cpu_amx_moe_fails_fast_until_both_expert_abis_gain_limit(self):
         moe = self.module.Glm5NextMoE(config=_config(), layer_id=3)
@@ -481,6 +573,35 @@ class TestGlm5NextMLPAndMoE(unittest.TestCase):
 
 
 class TestExistingKernelReuseEvidence(unittest.TestCase):
+    def test_glm_two_round_flag_is_private_default_off_and_reaches_both_runners(self):
+        base_source = MOE_RUNNER_BASE_PATH.read_text(encoding="utf-8")
+        deepseek_source = DEEPSEEK_PATH.read_text(encoding="utf-8")
+        layer_source = FUSED_MOE_LAYER_PATH.read_text(encoding="utf-8")
+        fused_source = FUSED_MOE_PATH.read_text(encoding="utf-8")
+        triton_source = TRITON_RUNNER_PATH.read_text(encoding="utf-8")
+        kt_source = KT_EP_PATH.read_text(encoding="utf-8")
+        private_source = GLM_SWIGLU_PATH.read_text(encoding="utf-8")
+
+        private_flag = "glm5_next_hf_two_round_swiglu"
+        self.assertIn(f"{private_flag}: bool = False", base_source)
+        self.assertIn(f"{private_flag}: bool = False", deepseek_source)
+        self.assertIn(f"{private_flag}: bool = False", layer_source)
+        self.assertIn(f"{private_flag}={private_flag}", deepseek_source)
+        self.assertIn(f"{private_flag}={private_flag}", layer_source)
+        self.assertIn(f"moe_runner_config.{private_flag}", fused_source)
+        self.assertIn(f"self.config.{private_flag}", triton_source)
+        self.assertIn(
+            f'getattr(runner_config, "{private_flag}", False)', kt_source
+        )
+
+        # Two independent launches plus an in-place BF16 output reload are the
+        # source-level guard against a compiler collapsing both rounds again.
+        self.assertIn("_glm5_next_silu_to_bf16_kernel[grid]", private_source)
+        self.assertIn("_glm5_next_bf16_mul_kernel[grid]", private_source)
+        self.assertIn(
+            "activated_gate = tl.load(output_ptr + offsets", private_source
+        )
+
     def test_deepseek_base_supplies_noaux_shared_tp_and_ep_contracts(self):
         source = DEEPSEEK_PATH.read_text(encoding="utf-8")
         self.assertIn('if config.topk_method == "noaux_tc"', source)
