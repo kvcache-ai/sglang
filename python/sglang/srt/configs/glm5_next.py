@@ -291,13 +291,29 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.gate_lower_bound = (
             gate_lower_bound if gate_lower_bound is not None else linear_lower_bound
         )
-        self.layer_types = list(layer_types)
+        # The pinned checkpoint names DSA layers
+        # ``deepseek_sparse_attention``.  transformers-kt 5.6 validates the
+        # generic ``PreTrainedConfig.layer_types`` field against its closed
+        # vocabulary, where the corresponding public name is ``sparse``.
+        # Keep the checkpoint-native names separately for provenance while
+        # exposing validator-compatible generic names to shared Transformers
+        # and SGLang helpers.  GLM runtime selection remains driven by the
+        # exact ``linear_attn_config`` partition below.
+        self._glm5_next_checkpoint_layer_types = list(layer_types)
+        self.layer_types = [
+            "linear_attention"
+            if layer_type == "linear_attention"
+            else "sparse"
+            for layer_type in layer_types
+        ]
         self.mlp_layer_types = list(mlp_layer_types)
 
         if linear_attn_config is None:
             kda_layers = [
                 layer_idx
-                for layer_idx, layer_type in enumerate(self.layer_types)
+                for layer_idx, layer_type in enumerate(
+                    self._glm5_next_checkpoint_layer_types
+                )
                 if layer_type == "linear_attention"
             ]
             kda_layer_set = set(kda_layers)
@@ -455,6 +471,13 @@ class Glm5NextConfig(PretrainedConfig):
             self.text_config = Glm5NextTextConfig(**top_level_text_config)
         else:
             self.text_config = text_config
+
+        # A legacy top-level ``layer_types`` copy is present in the pinned
+        # checkpoint.  The nested text config above has already validated and
+        # normalized it, so do not let the root PreTrainedConfig validate the
+        # raw checkpoint spelling a second time.
+        if "layer_types" in kwargs:
+            kwargs["layer_types"] = list(self.text_config.layer_types)
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id

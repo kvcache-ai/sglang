@@ -9,6 +9,7 @@ behavior for existing architectures.
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from collections.abc import Iterable, Iterator
 from typing import Optional
@@ -62,6 +63,9 @@ from sglang.srt.models.glm5_next_norm import Glm5NextRMSNorm
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator
+
+
+logger = logging.getLogger(__name__)
 
 
 # This historical constant name is retained for compatibility with Session AB
@@ -714,7 +718,13 @@ class Glm5NextModel(KimiLinearModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.layer_types = tuple(config.layer_types)
+        self.layer_types = tuple(
+            getattr(
+                config,
+                "_glm5_next_checkpoint_layer_types",
+                config.layer_types,
+            )
+        )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1366,6 +1376,13 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         self._checkpoint_visual_source_contract_complete = bool(
             self.multimodal_enabled
         )
+        if require_complete and self.multimodal_enabled:
+            logger.info(
+                "GLM-5-Next visual checkpoint source contract complete: "
+                "loaded=%d expected=%d dtype=BF16",
+                len(self._checkpoint_seen_visual_source_names),
+                len(self._checkpoint_expected_visual_source_names or ()),
+            )
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None) -> None:
         DeepseekV2WeightLoaderMixin.post_load_weights(
