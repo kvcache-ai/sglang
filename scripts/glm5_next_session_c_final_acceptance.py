@@ -224,29 +224,37 @@ def validate_graph_counter_progress(
     failures: list[str] = []
     expected_ranks = {str(rank) for rank in range(tp_size)}
     per_rank: dict[str, Any] = {}
-    for mode in ("decode_cuda_graph", "decode_none"):
-        if (
-            set(before.get(mode, {})) != expected_ranks
-            or set(after.get(mode, {})) != expected_ranks
-        ):
-            failures.append(
-                f"{mode} counters do not cover exact TP ranks 0..{tp_size - 1}"
-            )
+    if (
+        set(before.get("decode_cuda_graph", {})) != expected_ranks
+        or set(after.get("decode_cuda_graph", {})) != expected_ranks
+    ):
+        failures.append(
+            "decode_cuda_graph counters do not cover exact TP ranks "
+            f"0..{tp_size - 1}"
+        )
+    unexpected_none_ranks = (
+        set(before.get("decode_none", {}))
+        | set(after.get("decode_none", {}))
+    ) - expected_ranks
+    if unexpected_none_ranks:
+        failures.append(
+            "decode_none contains unexpected TP ranks: "
+            f"{sorted(unexpected_none_ranks, key=int)}"
+        )
     for rank in sorted(expected_ranks, key=int):
         graph_before = before.get("decode_cuda_graph", {}).get(rank)
         graph_after = after.get("decode_cuda_graph", {}).get(rank)
-        none_before = before.get("decode_none", {}).get(rank)
-        none_after = after.get("decode_none", {}).get(rank)
+        # prometheus_client does not publish a labeled Counter series before
+        # its first increment.  A rank which has never executed decode_none
+        # therefore has no series, and its exact counter value is zero.
+        none_before = before.get("decode_none", {}).get(rank, 0.0)
+        none_after = after.get("decode_none", {}).get(rank, 0.0)
         graph_delta = (
             graph_after - graph_before
             if graph_before is not None and graph_after is not None
             else None
         )
-        none_delta = (
-            none_after - none_before
-            if none_before is not None and none_after is not None
-            else None
-        )
+        none_delta = none_after - none_before
         rank_failures: list[str] = []
         if graph_delta is not None and graph_delta < minimum_graph_delta_per_rank:
             rank_failures.append(
@@ -265,7 +273,7 @@ def validate_graph_counter_progress(
             "failures": rank_failures,
             "pass": not rank_failures
             and graph_delta is not None
-            and none_delta is not None,
+            and none_delta == 0,
         }
     return {
         "expected_tp_ranks": sorted(expected_ranks, key=int),
@@ -278,13 +286,19 @@ def validate_graph_counter_progress(
 
 
 def parse_layerwise_summaries(text: str) -> list[dict[str, Any]]:
+    """Return one completion summary per full 42-layer prefill round."""
     summaries: list[dict[str, Any]] = []
     for match in LAYERWISE_PATTERN.finditer(text):
         item: dict[str, Any] = {
             key: int(value) if key != "load_kind" else value
             for key, value in match.groupdict().items()
         }
-        summaries.append(item)
+        # Production logs every MoE layer so operators can diagnose a stalled
+        # prefetch.  Only layer 44 completes a round and advances
+        # completed_rounds; accepting all 42 events as summaries makes every
+        # healthy request fail the exact-round gate.
+        if item["layer"] == 44:
+            summaries.append(item)
     return summaries
 
 
@@ -447,7 +461,7 @@ def validate_prefill_parity_server_log(text: str, *, threshold: int) -> dict[str
     else:
         if LAYERWISE_STARTUP_PATTERN.search(text) is not None:
             failures.append("threshold-0 server allocated the layerwise manager")
-        if parse_layerwise_summaries(text):
+        if LAYERWISE_PATTERN.search(text) is not None:
             failures.append("threshold-0 server executed the layerwise manager")
 
     return {

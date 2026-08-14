@@ -66,6 +66,63 @@ def test_layerwise_log_parser_and_progress_gate_accept_exact_rounds():
     )
 
 
+def test_layerwise_log_parser_ignores_per_layer_diagnostics():
+    lines = []
+    for epoch in range(2):
+        for layer in range(3, 45):
+            offset = layer - 3
+            lines.append(
+                "KT GLM-5-Next FP8 layerwise prefill: "
+                f"layer={layer} epoch={epoch} slot={offset % 2} "
+                f"{'prime' if layer == 3 else 'prefetch-hit'} "
+                f"apply_count={epoch * 42 + offset + 1} "
+                f"prime_count={epoch + 1} "
+                f"prefetch_hit_count={epoch * 41 + offset} "
+                f"completed_rounds={epoch + (layer == 44)} fallback_count=0"
+            )
+
+    summaries = ACCEPTANCE.parse_layerwise_summaries("\n".join(lines))
+
+    assert summaries == [
+        _summary(
+            epoch=0,
+            apply_count=42,
+            prime_count=1,
+            prefetch_hit_count=41,
+            completed_rounds=1,
+        ),
+        _summary(
+            epoch=1,
+            apply_count=84,
+            prime_count=2,
+            prefetch_hit_count=82,
+            completed_rounds=2,
+        ),
+    ]
+    assert not ACCEPTANCE.validate_layerwise_progress(
+        None, summaries, expected_rounds=2
+    )
+
+
+def test_layerwise_partial_round_does_not_become_a_summary():
+    text = "\n".join(
+        "KT GLM-5-Next FP8 layerwise prefill: "
+        f"layer={layer} epoch=0 slot={(layer - 3) % 2} "
+        f"{'prime' if layer == 3 else 'prefetch-hit'} "
+        f"apply_count={layer - 2} prime_count=1 "
+        f"prefetch_hit_count={layer - 3} completed_rounds=0 fallback_count=0"
+        for layer in range(3, 44)
+    )
+
+    summaries = ACCEPTANCE.parse_layerwise_summaries(text)
+    failures = ACCEPTANCE.validate_layerwise_progress(
+        None, summaries, expected_rounds=1
+    )
+
+    assert summaries == []
+    assert any("expected 1" in failure for failure in failures)
+
+
 def test_layerwise_progress_fails_closed_on_missing_round_or_fallback():
     previous = _summary(
         epoch=0,
@@ -169,6 +226,62 @@ def test_per_rank_graph_gate_rejects_decode_none_growth():
     )
     assert not result["pass"]
     assert any("decode_none" in item for item in result["failures"])
+
+
+def test_per_rank_graph_gate_treats_unpublished_decode_none_as_zero():
+    before = {
+        "decode_cuda_graph": {str(rank): 10.0 for rank in range(2)},
+        "decode_none": {},
+    }
+    after = {
+        "decode_cuda_graph": {str(rank): 17.0 for rank in range(2)},
+        "decode_none": {},
+    }
+
+    result = ACCEPTANCE.validate_graph_counter_progress(
+        before, after, tp_size=2, minimum_graph_delta_per_rank=7
+    )
+
+    assert result["pass"]
+    assert all(
+        item["decode_none_delta"] == 0
+        for item in result["per_rank"].values()
+    )
+
+
+def test_per_rank_graph_gate_rejects_lazy_decode_none_growth_and_disappearance():
+    graph_before = {"0": 10.0, "1": 10.0}
+    graph_after = {"0": 17.0, "1": 17.0}
+    appeared = ACCEPTANCE.validate_graph_counter_progress(
+        {"decode_cuda_graph": graph_before, "decode_none": {}},
+        {"decode_cuda_graph": graph_after, "decode_none": {"0": 1.0}},
+        tp_size=2,
+        minimum_graph_delta_per_rank=7,
+    )
+    disappeared = ACCEPTANCE.validate_graph_counter_progress(
+        {"decode_cuda_graph": graph_before, "decode_none": {"0": 1.0}},
+        {"decode_cuda_graph": graph_after, "decode_none": {}},
+        tp_size=2,
+        minimum_graph_delta_per_rank=7,
+    )
+
+    assert not appeared["pass"]
+    assert not disappeared["pass"]
+    assert appeared["per_rank"]["0"]["decode_none_delta"] == 1
+    assert disappeared["per_rank"]["0"]["decode_none_delta"] == -1
+
+
+def test_per_rank_graph_gate_rejects_unexpected_decode_none_rank():
+    graph = {"0": 10.0, "1": 10.0}
+    result = ACCEPTANCE.validate_graph_counter_progress(
+        {"decode_cuda_graph": graph, "decode_none": {}},
+        {"decode_cuda_graph": graph, "decode_none": {"2": 0.0}},
+        tp_size=2,
+        minimum_graph_delta_per_rank=0,
+    )
+
+    assert not result["pass"]
+    assert any("unexpected TP ranks" in item for item in result["failures"])
 
 
 def _bucket_payload(label, outputs):
@@ -375,6 +488,30 @@ def test_prefill_server_log_binds_explicit_threshold_and_tp8():
         "kt_gpu_prefill_token_threshold" in failure
         for failure in wrong_threshold["failures"]
     )
+
+
+def test_threshold_zero_rejects_nonfinal_layerwise_event():
+    threshold_0_log = "\n".join(
+        [
+            (
+                "server_args=ServerArgs(tp_size=8, chunked_prefill_size=4096, "
+                "kt_method='FP8', kt_gpu_prefill_token_threshold=0)"
+            ),
+            "The server is fired up and ready to roll!",
+            (
+                "KT GLM-5-Next FP8 layerwise prefill: layer=3 epoch=0 slot=0 "
+                "prime apply_count=1 prime_count=1 prefetch_hit_count=0 "
+                "completed_rounds=0 fallback_count=0"
+            ),
+        ]
+    )
+
+    result = ACCEPTANCE.validate_prefill_parity_server_log(
+        threshold_0_log, threshold=0
+    )
+
+    assert not result["pass"]
+    assert any("executed" in failure for failure in result["failures"])
 
 
 def test_completed_request_requires_length_finish_and_in_range_tokens():
