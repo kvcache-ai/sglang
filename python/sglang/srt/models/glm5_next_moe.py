@@ -194,9 +194,11 @@ class Glm5NextMoE(DeepseekV2MoE):
             )
 
         # DeepseekV2MoE.forward does not pass ForwardBatch through its normal
-        # (non-A2A) dispatcher ABI.  Expose only the mode, temporarily and only
-        # to the exact GLM KT wrapper, so it can route plain EXTEND through the
-        # required layerwise pipeline while CUDA-graph DECODE/IDLE bypass it.
+        # (non-A2A) dispatcher ABI.  Expose only the mode and the exact GLM
+        # image marker, temporarily and only to the KT wrapper.  Text EXTEND
+        # uses the required layerwise pipeline, while image EXTEND deliberately
+        # uses the existing CPU/hybrid path and CUDA-graph DECODE/IDLE bypasses
+        # both prefill routes.
         quant_method = getattr(self.experts, "quant_method", None)
         kt_config = getattr(quant_method, "kt_config", None)
         layerwise_required = (
@@ -221,7 +223,13 @@ class Glm5NextMoE(DeepseekV2MoE):
         previous_mode = getattr(
             quant_method, "_glm5_next_forward_mode", missing
         )
+        previous_image_marker = getattr(
+            quant_method, "_glm5_next_has_image_inputs", missing
+        )
         quant_method._glm5_next_forward_mode = forward_batch.forward_mode
+        quant_method._glm5_next_has_image_inputs = bool(
+            getattr(forward_batch, "glm5_next_has_image_inputs", False)
+        )
         try:
             return super().forward(hidden_states, *args, **kwargs)
         finally:
@@ -229,6 +237,10 @@ class Glm5NextMoE(DeepseekV2MoE):
                 delattr(quant_method, "_glm5_next_forward_mode")
             else:
                 quant_method._glm5_next_forward_mode = previous_mode
+            if previous_image_marker is missing:
+                delattr(quant_method, "_glm5_next_has_image_inputs")
+            else:
+                quant_method._glm5_next_has_image_inputs = previous_image_marker
 
 
 __all__ = [

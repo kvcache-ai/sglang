@@ -1332,7 +1332,7 @@ class ServerArgs:
         return capture_sizes
 
     def _validate_glm5_next_session_ab_boundary(self) -> None:
-        """Keep exact GLM-5-Next on the isolated Session AB surface."""
+        """Keep exact GLM-5-Next on the isolated Session D surface."""
 
         if self.enable_hierarchical_cache:
             raise ValueError(
@@ -1349,10 +1349,32 @@ class ServerArgs:
                 "GLM-5-Next Session AB does not support HiSparse; "
                 "--enable-hisparse must remain disabled."
             )
-        if self.enable_multimodal is True:
+        if self.mm_enable_dp_encoder:
             raise ValueError(
-                "GLM-5-Next multimodal input is deferred to Session D; "
-                "--enable-multimodal must remain disabled in Session AB."
+                "GLM-5-Next Session D does not support "
+                "--mm-enable-dp-encoder; the vision tower is TP-only."
+            )
+        if self.encoder_only or self.language_only or self.encoder_urls:
+            raise ValueError(
+                "GLM-5-Next Session D does not support encoder/language "
+                "disaggregation; --encoder-only, --language-only, and "
+                "--encoder-urls must remain unset."
+            )
+        unsupported_mm_options = {
+            "enable_broadcast_mm_inputs_process": self.enable_broadcast_mm_inputs_process,
+            "enable_prefix_mm_cache": self.enable_prefix_mm_cache,
+            "enable_mm_global_cache": self.enable_mm_global_cache,
+            "keep_mm_feature_on_device": self.keep_mm_feature_on_device,
+            "mm_attention_backend": self.mm_attention_backend is not None,
+        }
+        enabled_unsupported_mm_options = [
+            name for name, enabled in unsupported_mm_options.items() if enabled
+        ]
+        if enabled_unsupported_mm_options:
+            raise ValueError(
+                "GLM-5-Next Session D does not support these multimodal "
+                "execution/cache options: "
+                f"{enabled_unsupported_mm_options}."
             )
         if self.is_embedding:
             raise ValueError(
@@ -1430,6 +1452,11 @@ class ServerArgs:
             raise ValueError(
                 "GLM-5-Next Session AB does not support "
                 "--enable-two-batch-overlap."
+            )
+        if self.enable_mixed_chunk:
+            raise ValueError(
+                "GLM-5-Next Session D supports plain EXTEND prefill only and "
+                "does not support --enable-mixed-chunk."
             )
         if self.enable_piecewise_cuda_graph:
             raise ValueError(

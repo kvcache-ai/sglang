@@ -79,11 +79,21 @@ def _boundary_args(**overrides):
         disaggregation_mode="null",
         enable_dp_attention=False,
         enable_two_batch_overlap=False,
+        enable_mixed_chunk=False,
         enable_piecewise_cuda_graph=False,
         enable_hierarchical_cache=False,
         enable_lmcache=False,
         enable_hisparse=False,
         enable_multimodal=None,
+        mm_enable_dp_encoder=False,
+        encoder_only=False,
+        language_only=False,
+        encoder_urls=None,
+        enable_broadcast_mm_inputs_process=False,
+        enable_prefix_mm_cache=False,
+        enable_mm_global_cache=False,
+        keep_mm_feature_on_device=False,
+        mm_attention_backend=None,
         is_embedding=False,
         dllm_algorithm=None,
         dllm_algorithm_config=None,
@@ -155,14 +165,39 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self.validate(_boundary_args(**overrides))
 
-    def test_multimodal_and_non_fp8_weights_are_deferred(self):
-        with self.assertRaisesRegex(ValueError, "Session D"):
-            self.validate(_boundary_args(enable_multimodal=True))
+    def test_multimodal_default_and_explicit_modes_are_accepted(self):
+        for enable_multimodal in (None, True, False):
+            with self.subTest(enable_multimodal=enable_multimodal):
+                args = _boundary_args(enable_multimodal=enable_multimodal)
+                self.validate(args)
+                self.assertIs(args.enable_multimodal, enable_multimodal)
+
+    def test_non_fp8_weights_are_rejected(self):
 
         for quantization in (None, "mxfp8", "bf16", "compressed-tensors"):
             with self.subTest(quantization=quantization):
                 with self.assertRaisesRegex(ValueError, "FP8 weight format"):
                     self.validate(_boundary_args(quantization=quantization))
+
+    def test_unsupported_multimodal_execution_modes_are_rejected(self):
+        cases = (
+            ({"mm_enable_dp_encoder": True}, "mm-enable-dp-encoder"),
+            ({"encoder_only": True}, "encoder/language disaggregation"),
+            ({"language_only": True}, "encoder/language disaggregation"),
+            ({"encoder_urls": ["stub"]}, "encoder/language disaggregation"),
+            (
+                {"enable_broadcast_mm_inputs_process": True},
+                "execution/cache options",
+            ),
+            ({"enable_prefix_mm_cache": True}, "execution/cache options"),
+            ({"enable_mm_global_cache": True}, "execution/cache options"),
+            ({"keep_mm_feature_on_device": True}, "execution/cache options"),
+            ({"mm_attention_backend": "fa3"}, "execution/cache options"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    self.validate(_boundary_args(**overrides))
 
     def test_non_generation_request_modes_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "is-embedding"):
@@ -196,6 +231,7 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
             ({"disaggregation_mode": "decode"}, "PD/disaggregation"),
             ({"enable_dp_attention": True}, "enable-dp-attention"),
             ({"enable_two_batch_overlap": True}, "two-batch-overlap"),
+            ({"enable_mixed_chunk": True}, "enable-mixed-chunk"),
             (
                 {"enable_piecewise_cuda_graph": True},
                 "piecewise-cuda-graph",

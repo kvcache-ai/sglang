@@ -86,9 +86,48 @@ _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
 
 
 class _Glm5NextVisionConfigHolder(PretrainedConfig):
-    """Field-preserving placeholder; it does not import any vision runtime."""
+    """GLM-5-Next vision config without importing the vision runtime."""
 
     model_type = "glm_ocr_vision"
+    base_config_key = "vision_config"
+
+    def __init__(
+        self,
+        depth: int = 24,
+        hidden_size: int = 1024,
+        intermediate_size: int = 4096,
+        num_heads: int = 16,
+        in_channels: int = 3,
+        patch_size: int = 14,
+        temporal_patch_size: int = 2,
+        spatial_merge_size: int = 2,
+        out_hidden_size: int = 4096,
+        projection_intermediate_size: int = 10240,
+        rms_norm_eps: float = 1e-5,
+        hidden_act: str = "silu",
+        image_size: int = 448,
+        initializer_range: float = 0.02,
+        attention_dropout: float = 0.0,
+        attention_bias: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.depth = depth
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_heads = num_heads
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.spatial_merge_size = spatial_merge_size
+        self.out_hidden_size = out_hidden_size
+        self.projection_intermediate_size = projection_intermediate_size
+        self.rms_norm_eps = rms_norm_eps
+        self.hidden_act = hidden_act
+        self.image_size = image_size
+        self.initializer_range = initializer_range
+        self.attention_dropout = attention_dropout
+        self.attention_bias = attention_bias
 
 
 class Glm5NextTextConfig(PretrainedConfig):
@@ -386,12 +425,12 @@ class Glm5NextConfig(PretrainedConfig):
         self,
         text_config=None,
         vision_config=None,
-        image_token_id: int = 59280,
-        video_token_id: int = 59281,
-        image_start_token_id: int = 59256,
-        image_end_token_id: int = 59257,
-        video_start_token_id: int = 59258,
-        video_end_token_id: int = 59259,
+        image_token_id: int = 154854,
+        video_token_id: int = 154855,
+        image_start_token_id: int = 154830,
+        image_end_token_id: int = 154831,
+        video_start_token_id: int = 154832,
+        video_end_token_id: int = 154833,
         **kwargs,
     ):
         kwargs.setdefault("architectures", [_GLM5_NEXT_ARCH])

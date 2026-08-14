@@ -258,6 +258,22 @@ class TestGlm5NextFp8Gates(unittest.TestCase):
                     result.hidden_states, torch.full((1, 2), 7.0)
                 )
 
+    def test_image_extend_bypasses_layerwise_and_uses_hybrid_path(self):
+        wrapper = self._wrapper(mode="EXTEND")
+        wrapper._glm5_next_has_image_inputs = True
+        manager = mock.Mock()
+        kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS[
+            wrapper._glm5_next_fp8_pipeline_signature
+        ] = manager
+
+        result = self._apply(wrapper, num_tokens=17)
+
+        manager.apply.assert_not_called()
+        self.assertEqual(wrapper._glm5_next_mm_hybrid_extend_count, 1)
+        torch.testing.assert_close(
+            result.hidden_states, torch.full((17, 2), 7.0)
+        )
+
     def test_unsupported_modes_and_missing_manager_fail_closed(self):
         for mode in ("MIXED", "TARGET_VERIFY", "SPLIT_PREFILL", "DLLM_EXTEND"):
             with self.subTest(mode=mode):

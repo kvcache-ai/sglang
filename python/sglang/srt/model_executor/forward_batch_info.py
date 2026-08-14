@@ -302,6 +302,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    # Exact GLM-5-Next keeps image EXTEND on the CPU/hybrid MoE path.  The
+    # model sets this for image EXTEND before general_mm_embed_routine clears
+    # ``mm_inputs``; retained decode metadata must leave it false.
+    glm5_next_has_image_inputs: bool = False
 
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None

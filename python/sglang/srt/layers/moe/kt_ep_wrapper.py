@@ -5599,15 +5599,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
             forward_mode_name = _glm5_next_forward_mode_name(forward_mode)
             if forward_mode_name == "EXTEND":
-                # The threshold is an enable switch for exact GLM, not a
-                # per-chunk size cutoff.  This includes the final short chunk.
-                return _get_glm5_next_fp8_layerwise_manager(self).apply(
-                    self, layer, dispatch_output
-                )
-            if forward_mode_name not in ("DECODE", "IDLE"):
+                if bool(getattr(self, "_glm5_next_has_image_inputs", False)):
+                    # Session D keeps the complete image EXTEND batch on the
+                    # already accepted CPU/hybrid expert route.  Keep
+                    # _glm5_next_fp8_required true so the generic full-GPU
+                    # threshold fallback below cannot accidentally select a
+                    # different image-prefill implementation.
+                    self._glm5_next_mm_hybrid_extend_count = (
+                        getattr(self, "_glm5_next_mm_hybrid_extend_count", 0) + 1
+                    )
+                    if self.tp_rank == 0 and self.kt_config.layer_idx in (3, 44):
+                        logger.info(
+                            "GLM-5-Next image EXTEND bypasses FP8 layerwise "
+                            "prefill: layer=%d count=%d",
+                            self.kt_config.layer_idx,
+                            self._glm5_next_mm_hybrid_extend_count,
+                        )
+                else:
+                    # The threshold is an enable switch for exact GLM, not a
+                    # per-chunk size cutoff.  This includes the final short
+                    # chunk of every pure-text EXTEND.
+                    self._glm5_next_layerwise_extend_count = (
+                        getattr(self, "_glm5_next_layerwise_extend_count", 0) + 1
+                    )
+                    return _get_glm5_next_fp8_layerwise_manager(self).apply(
+                        self, layer, dispatch_output
+                    )
+            if forward_mode_name not in ("EXTEND", "DECODE", "IDLE"):
                 raise RuntimeError(
                     "GLM-5-Next required FP8 layerwise prefill supports only "
-                    "plain EXTEND and bypasses only DECODE/IDLE; got "
+                    "plain EXTEND (text layerwise or image hybrid) and bypasses "
+                    "only DECODE/IDLE; got "
                     f"ForwardMode.{forward_mode_name}"
                 )
 

@@ -22,6 +22,7 @@ CONFIG_PATH = REPO_ROOT / "python/sglang/srt/configs/glm5_next.py"
 MODEL_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next.py"
 NORM_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next_norm.py"
 MODEL_CONFIG_PATH = REPO_ROOT / "python/sglang/srt/configs/model_config.py"
+MM_UTILS_PATH = REPO_ROOT / "python/sglang/srt/managers/mm_utils.py"
 
 
 class _PretrainedConfigStub:
@@ -605,7 +606,16 @@ class TestGlm5NextModelBoundary(unittest.TestCase):
             )
         )
         self.assertEqual(ast.unparse(entry.value), "[Glm5NextForConditionalGeneration]")
-        self.assertNotIn("sglang.srt.models.glm_ocr", source)
+        top_level_imports = [
+            ast.unparse(node)
+            for node in tree.body
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        ]
+        self.assertFalse(
+            any("sglang.srt.models.glm_ocr" in item for item in top_level_imports)
+        )
+        self.assertIn("from sglang.srt.models.glm_ocr import GlmOcrVisionModel", source)
+        self.assertIn("if self.multimodal_enabled:", source)
         self.assertNotIn('if "visual" in name', source)
 
 
@@ -806,6 +816,222 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
         self.assertEqual(
             attn_context.init_calls[-1], (self._config().q_lora_rank, True)
         )
+
+    def test_multimodal_embed_routine_is_scoped_to_image_extend(self):
+        model = self.model_module.Glm5NextForConditionalGeneration(self._config())
+        model.multimodal_enabled = True
+        calls = []
+
+        class _Inner(nn.Module):
+            def forward(inner_self, *args):
+                del inner_self, args
+                calls.append("direct")
+                return torch.ones(1, 4)
+
+        class _Logits(nn.Module):
+            def forward(inner_self, input_ids, hidden_states, lm_head, batch):
+                del inner_self, input_ids, lm_head, batch
+                return hidden_states
+
+        model.model = _Inner()
+        model.logits_processor = _Logits()
+
+        managers = types.ModuleType("sglang.srt.managers")
+        managers.__path__ = []
+        mm_utils = types.ModuleType("sglang.srt.managers.mm_utils")
+
+        def general_mm_embed_routine(**kwargs):
+            del kwargs
+            calls.append("multimodal")
+            return torch.ones(1, 4)
+
+        mm_utils.general_mm_embed_routine = general_mm_embed_routine
+
+        def batch(mode):
+            return SimpleNamespace(
+                forward_mode=SimpleNamespace(name=mode),
+                contains_image_inputs=lambda: True,
+                contains_video_inputs=lambda: False,
+                contains_audio_inputs=lambda: False,
+            )
+
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.managers": managers,
+                "sglang.srt.managers.mm_utils": mm_utils,
+            },
+        ):
+            model(
+                input_ids=torch.tensor([0]),
+                positions=torch.tensor([0]),
+                forward_batch=batch("EXTEND"),
+            )
+            self.assertEqual(calls, ["multimodal"])
+
+            decode_batch = batch("DECODE")
+            model(
+                input_ids=torch.tensor([0]),
+                positions=torch.tensor([0]),
+                forward_batch=decode_batch,
+            )
+            self.assertEqual(calls, ["multimodal", "direct"])
+            self.assertFalse(decode_batch.glm5_next_has_image_inputs)
+
+    def test_general_mm_embed_routine_matches_inner_model_input_embed_abi(self):
+        general_mm_embed_routine = _compile_function(
+            MM_UTILS_PATH, "general_mm_embed_routine"
+        )
+        model = self.model_module.Glm5NextModel(self._config())
+        embedding_weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        model.embed_tokens = nn.Embedding.from_pretrained(embedding_weight)
+
+        class _Stage(nn.Module):
+            def forward(inner_self, **kwargs):
+                del inner_self
+                return kwargs["hidden_states"], kwargs["residual"]
+
+        model.layers = nn.ModuleList([_Stage(), _Stage()])
+        model.norm = nn.Identity()
+        expected_embedding = embedding_weight[3:4].clone()
+        general_mm_embed_routine.__globals__["embed_mm_inputs"] = (
+            lambda **kwargs: (expected_embedding, {})
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: False,
+                is_target_verify=lambda: False,
+            ),
+            contains_mm_inputs=lambda: True,
+            mm_inputs=[SimpleNamespace(mm_items=[])],
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[1],
+            input_embeds=None,
+        )
+        recorder = SimpleNamespace(with_current_layer=lambda layer_idx: nullcontext())
+        model_globals = self.model_module.Glm5NextModel.forward.__globals__
+
+        with patch.dict(
+            model_globals,
+            {"get_global_expert_distribution_recorder": lambda: recorder},
+        ):
+            output = general_mm_embed_routine(
+                input_ids=torch.tensor([3]),
+                positions=torch.tensor([0]),
+                forward_batch=forward_batch,
+                language_model=model,
+            )
+
+        torch.testing.assert_close(output, expected_embedding)
+        self.assertIsNone(forward_batch.mm_inputs)
+        self.assertIs(forward_batch.mm_input_embeds, expected_embedding)
+
+    def test_mrope_metadata_does_not_replace_kpool_logical_positions(self):
+        config = self._config()
+        config.rope_scaling = {"mrope_section": [0, 0, 0]}
+        model = self.model_module.Glm5NextForConditionalGeneration(config)
+        model.multimodal_enabled = True
+        seen = {}
+
+        class _Inner(nn.Module):
+            def forward(inner_self, *args):
+                del inner_self
+                seen["direct_positions"] = args[1]
+                return torch.ones(1, 4)
+
+        class _Logits(nn.Module):
+            def forward(inner_self, input_ids, hidden_states, lm_head, batch):
+                del inner_self, input_ids, lm_head, batch
+                return hidden_states
+
+        model.model = _Inner()
+        model.logits_processor = _Logits()
+
+        managers = types.ModuleType("sglang.srt.managers")
+        managers.__path__ = []
+        mm_utils = types.ModuleType("sglang.srt.managers.mm_utils")
+
+        def general_mm_embed_routine(**kwargs):
+            seen["multimodal_positions"] = kwargs["positions"]
+            return torch.ones(1, 4)
+
+        mm_utils.general_mm_embed_routine = general_mm_embed_routine
+
+        def batch(mode, mrope_positions):
+            return SimpleNamespace(
+                forward_mode=SimpleNamespace(name=mode),
+                mrope_positions=mrope_positions,
+                contains_image_inputs=lambda: True,
+                contains_video_inputs=lambda: False,
+                contains_audio_inputs=lambda: False,
+            )
+
+        extend_mrope_positions = torch.tensor([[1], [2], [3]])
+        decode_mrope_positions = torch.tensor(
+            [[4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]]
+        )
+        extend_logical_positions = torch.tensor([99])
+        decode_logical_positions = torch.tensor([20, 21, 22, 23])
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.managers": managers,
+                "sglang.srt.managers.mm_utils": mm_utils,
+            },
+        ):
+            model(
+                input_ids=torch.tensor([0]),
+                positions=extend_logical_positions,
+                forward_batch=batch("EXTEND", extend_mrope_positions),
+            )
+            model(
+                input_ids=torch.tensor([0, 0, 0, 0]),
+                positions=decode_logical_positions,
+                forward_batch=batch("DECODE", decode_mrope_positions),
+            )
+
+        self.assertIs(seen["multimodal_positions"], extend_logical_positions)
+        self.assertIs(seen["direct_positions"], decode_logical_positions)
+        self.assertEqual(tuple(seen["direct_positions"].shape), (4,))
+
+    def test_idle_with_retained_image_metadata_bypasses_mrope_and_vision(self):
+        config = self._config()
+        config.rope_scaling = {"mrope_section": [0, 0, 0]}
+        model = self.model_module.Glm5NextForConditionalGeneration(config)
+        model.multimodal_enabled = True
+        seen = {}
+
+        class _Inner(nn.Module):
+            def forward(inner_self, *args):
+                del inner_self
+                seen["positions"] = args[1]
+                return torch.ones(0, 4)
+
+        class _Logits(nn.Module):
+            def forward(inner_self, input_ids, hidden_states, lm_head, batch):
+                del inner_self, input_ids, lm_head, batch
+                return hidden_states
+
+        model.model = _Inner()
+        model.logits_processor = _Logits()
+        logical_positions = torch.empty(0, dtype=torch.int64)
+        idle_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(name="IDLE"),
+            mrope_positions=None,
+            contains_image_inputs=lambda: True,
+            contains_video_inputs=lambda: False,
+            contains_audio_inputs=lambda: False,
+        )
+
+        output = model(
+            input_ids=torch.empty(0, dtype=torch.int64),
+            positions=logical_positions,
+            forward_batch=idle_batch,
+        )
+
+        self.assertEqual(tuple(output.shape), (0, 4))
+        self.assertIs(seen["positions"], logical_positions)
+        self.assertFalse(idle_batch.glm5_next_has_image_inputs)
 
     def test_callbacks_select_the_matching_checkpoint_parameters(self):
         layer = self.model_module.Glm5NextDecoderLayer(self._config(), layer_idx=0)
@@ -1018,7 +1244,7 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
                 input_ids=None,
                 positions=torch.tensor([0]),
                 forward_batch=object(),
-                inputs_embeds=torch.ones(1, 4),
+                input_embeds=torch.ones(1, 4),
             )
 
         self.assertEqual(widths, [4, 8, 4])

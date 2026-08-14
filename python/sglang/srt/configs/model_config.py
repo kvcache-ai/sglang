@@ -205,7 +205,6 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
-                "Glm5NextForConditionalGeneration",
             ]
             if self.hf_config.architectures[0] in mm_disabled_models:
                 enable_multimodal = False
@@ -232,6 +231,14 @@ class ModelConfig:
         self.is_multimodal = enable_multimodal and is_multimodal_model(
             self.hf_config.architectures
         )
+        if self.is_glm5_next:
+            # The model constructor receives the HF config rather than this
+            # wrapper.  Preserve the resolved (including programmatic False
+            # and --language-only) decision on that exact config so GLM can
+            # construct or skip its ~1 GiB vision tower deterministically.
+            self.hf_config._glm5_next_multimodal_active = bool(
+                self.is_multimodal and not language_only
+            )
         self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
             self.hf_config.architectures
         )
@@ -1357,6 +1364,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",

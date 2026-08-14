@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +38,7 @@ class _FakeLoaderModel:
         end_layer=45,
         is_first_rank=True,
         is_last_rank=True,
+        multimodal_enabled=False,
     ):
         self.config = SimpleNamespace(
             n_routed_experts=num_experts,
@@ -60,6 +63,9 @@ class _FakeLoaderModel:
         self.skipped_session_ab_mtp_weights = ()
         self.skipped_pipeline_parallel_weight_count = 0
         self.checkpoint_runtime_default_parameters = ()
+        self.multimodal_enabled = multimodal_enabled
+        self.visual_load_calls = []
+        self.mm_config = SimpleNamespace()
 
     def named_parameters(self):
         return self._parameters_for_test.items()
@@ -69,6 +75,13 @@ class _FakeLoaderModel:
         del name, loaded_weight, params_dict
         return False
 
+    def _load_visual_weight(
+        self, canonical_source_name, loaded_weight, params_dict
+    ):
+        del params_dict
+        assert loaded_weight.dtype is torch.bfloat16
+        self.visual_load_calls.append(canonical_source_name)
+
 
 @pytest.fixture(scope="module")
 def model_module():
@@ -77,8 +90,15 @@ def model_module():
     return support._load_model_module(config_module)
 
 
-def _consume(model_module, fake, names, *, require_complete=True):
-    weights = [(name, torch.empty(1)) for name in names]
+def _consume(
+    model_module,
+    fake,
+    names,
+    *,
+    require_complete=True,
+    dtype=torch.float32,
+):
+    weights = [(name, torch.empty(1, dtype=dtype)) for name in names]
     return list(
         model_module.Glm5NextForConditionalGeneration._normalized_text_weights(
             fake,
@@ -86,6 +106,328 @@ def _consume(model_module, fake, names, *, require_complete=True):
             require_complete=require_complete,
         )
     )
+
+
+def _visual_runtime_parameter_names(*, include_dead=True):
+    """Return the pinned GLM-5-Next visual runtime namespace.
+
+    Packed QKV and gate/up parameters deliberately appear once here: the
+    reverse contract must expand them into the checkpoint's source shards.
+    """
+
+    block_suffixes = (
+        "attn.k_norm.weight",
+        "attn.proj.bias",
+        "attn.proj.weight",
+        "attn.q_norm.weight",
+        "attn.qkv_proj.bias",
+        "attn.qkv_proj.weight",
+        "mlp.down_proj.bias",
+        "mlp.down_proj.weight",
+        "mlp.gate_up_proj.bias",
+        "mlp.gate_up_proj.weight",
+        "norm1.weight",
+        "norm2.weight",
+    )
+    names = {
+        f"visual.blocks.{layer_idx}.{suffix}"
+        for layer_idx in range(24)
+        for suffix in block_suffixes
+    }
+    names.update(
+        {
+            "visual.downsample.bias",
+            "visual.downsample.weight",
+            "visual.merger.down_proj.weight",
+            "visual.merger.gate_up_proj.weight",
+            "visual.merger.post_projection_norm.bias",
+            "visual.merger.post_projection_norm.weight",
+            "visual.merger.proj.weight",
+            "visual.patch_embed.proj.bias",
+            "visual.patch_embed.proj.weight",
+            "visual.post_layernorm.weight",
+        }
+    )
+    if include_dead:
+        names.update(
+            {
+                "visual.embeddings.position_embedding.weight",
+                "visual.post_conv_layernorm.weight",
+            }
+        )
+    return names
+
+
+def test_visual_reverse_contract_is_exactly_347_and_skips_dead_runtime_modules(
+    model_module,
+):
+    runtime_names = _visual_runtime_parameter_names()
+    expected = model_module._glm5_next_vision_checkpoint_source_contract(
+        runtime_names
+    )
+
+    assert len(runtime_names) == 300
+    assert len(expected) == 347
+    assert len(expected) == model_module.GLM5_NEXT_PINNED_VISION_SOURCE_TENSOR_COUNT
+
+    assert "model.visual.blocks.0.attn.qkv.weight" in expected
+    assert "model.visual.blocks.0.attn.qkv.bias" in expected
+    assert "model.visual.blocks.0.attn.qkv_proj.weight" not in expected
+    assert "model.visual.blocks.23.mlp.gate_proj.weight" in expected
+    assert "model.visual.blocks.23.mlp.up_proj.weight" in expected
+    assert "model.visual.merger.gate_proj.weight" in expected
+    assert "model.visual.merger.up_proj.weight" in expected
+    assert not any(name.startswith("model.visual.embeddings.") for name in expected)
+    assert not any(
+        name.startswith("model.visual.post_conv_layernorm.") for name in expected
+    )
+
+
+def test_enabled_visual_contract_consumes_all_347_bf16_sources(model_module):
+    runtime_names = _visual_runtime_parameter_names()
+    expected = model_module._glm5_next_vision_checkpoint_source_contract(
+        runtime_names
+    )
+    fake = _FakeLoaderModel(
+        model_module,
+        runtime_names,
+        multimodal_enabled=True,
+    )
+
+    outputs = _consume(
+        model_module,
+        fake,
+        sorted(expected),
+        dtype=torch.bfloat16,
+    )
+
+    assert outputs == []
+    assert fake.visual_load_calls == sorted(expected)
+    assert fake._checkpoint_expected_visual_source_names == expected
+    assert fake._checkpoint_seen_visual_source_names == expected
+
+
+def test_visual_duplicate_scope_resets_for_a_later_weight_update(model_module):
+    runtime_names = {
+        "visual.blocks.0.attn.qkv_proj.weight",
+        "visual.post_layernorm.weight",
+    }
+    expected = model_module._glm5_next_vision_checkpoint_source_contract(
+        runtime_names
+    )
+    fake = _FakeLoaderModel(
+        model_module,
+        runtime_names,
+        multimodal_enabled=True,
+    )
+
+    _consume(model_module, fake, sorted(expected), dtype=torch.bfloat16)
+    _consume(
+        model_module,
+        fake,
+        sorted(expected),
+        require_complete=False,
+        dtype=torch.bfloat16,
+    )
+
+    assert fake.visual_load_calls == sorted(expected) * 2
+    assert fake._checkpoint_seen_visual_source_names == expected
+
+
+def test_enabled_visual_contract_rejects_unknown_duplicate_dead_and_missing(
+    model_module,
+):
+    runtime_names = {
+        "visual.blocks.0.attn.qkv_proj.weight",
+        "visual.blocks.0.mlp.gate_up_proj.weight",
+        "visual.post_layernorm.weight",
+        "visual.embeddings.position_embedding.weight",
+        "visual.post_conv_layernorm.weight",
+    }
+    expected = model_module._glm5_next_vision_checkpoint_source_contract(
+        runtime_names
+    )
+    assert expected == {
+        "model.visual.blocks.0.attn.qkv.weight",
+        "model.visual.blocks.0.mlp.gate_proj.weight",
+        "model.visual.blocks.0.mlp.up_proj.weight",
+        "model.visual.post_layernorm.weight",
+    }
+
+    with pytest.raises(RuntimeError, match="rejected unknown tensor"):
+        _consume(
+            model_module,
+            _FakeLoaderModel(
+                model_module,
+                runtime_names,
+                multimodal_enabled=True,
+            ),
+            ["model.visual.typo.weight"],
+            require_complete=False,
+            dtype=torch.bfloat16,
+        )
+
+    with pytest.raises(RuntimeError, match="rejected unknown tensor"):
+        _consume(
+            model_module,
+            _FakeLoaderModel(
+                model_module,
+                runtime_names,
+                multimodal_enabled=True,
+            ),
+            ["model.visual.embeddings.position_embedding.weight"],
+            require_complete=False,
+            dtype=torch.bfloat16,
+        )
+
+    source_name = "model.visual.blocks.0.attn.qkv.weight"
+    with pytest.raises(RuntimeError, match="duplicate tensor"):
+        _consume(
+            model_module,
+            _FakeLoaderModel(
+                model_module,
+                runtime_names,
+                multimodal_enabled=True,
+            ),
+            [source_name, source_name.removeprefix("model.")],
+            require_complete=False,
+            dtype=torch.bfloat16,
+        )
+
+    with pytest.raises(RuntimeError, match="missing 4 required tensor"):
+        _consume(
+            model_module,
+            _FakeLoaderModel(
+                model_module,
+                runtime_names,
+                multimodal_enabled=True,
+            ),
+            [],
+        )
+
+
+def test_visual_weight_loader_maps_packed_shards_and_requires_bf16(
+    model_module,
+    monkeypatch,
+):
+    pad_calls = []
+    loader_calls = []
+
+    vision_utils = types.ModuleType(
+        "sglang.srt.layers.attention.vision_utils"
+    )
+
+    def pad_vit_attn_dummy_heads(mm_config, runtime_name, loaded_weight):
+        pad_calls.append((mm_config, runtime_name, loaded_weight.dtype))
+        return loaded_weight
+
+    vision_utils.pad_vit_attn_dummy_heads = pad_vit_attn_dummy_heads
+
+    weight_utils = types.ModuleType("sglang.srt.model_loader.weight_utils")
+
+    def default_weight_loader(param, loaded_weight):
+        loader_calls.append((param.runtime_name, (), loaded_weight.dtype))
+
+    weight_utils.default_weight_loader = default_weight_loader
+
+    package_names = (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.layers",
+        "sglang.srt.layers.attention",
+        "sglang.srt.model_loader",
+    )
+    packages = {}
+    for package_name in package_names:
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+        packages[package_name] = package
+        monkeypatch.setitem(sys.modules, package_name, package)
+    packages["sglang"].srt = packages["sglang.srt"]
+    packages["sglang.srt"].layers = packages["sglang.srt.layers"]
+    packages["sglang.srt.layers"].attention = packages[
+        "sglang.srt.layers.attention"
+    ]
+    packages["sglang.srt.layers.attention"].vision_utils = vision_utils
+    packages["sglang.srt"].model_loader = packages["sglang.srt.model_loader"]
+    packages["sglang.srt.model_loader"].weight_utils = weight_utils
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.attention.vision_utils",
+        vision_utils,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.weight_utils",
+        weight_utils,
+    )
+
+    def make_param(runtime_name):
+        param = SimpleNamespace(runtime_name=runtime_name)
+
+        def weight_loader(param, loaded_weight, *shard_id):
+            loader_calls.append(
+                (param.runtime_name, shard_id, loaded_weight.dtype)
+            )
+
+        param.weight_loader = weight_loader
+        return param
+
+    params_dict = {
+        name: make_param(name)
+        for name in (
+            "visual.blocks.0.attn.qkv_proj.weight",
+            "visual.blocks.0.mlp.gate_up_proj.weight",
+            "visual.post_layernorm.weight",
+            "visual.embeddings.position_embedding.weight",
+        )
+    }
+    fake = SimpleNamespace(mm_config=object())
+    load_visual = (
+        model_module.Glm5NextForConditionalGeneration._load_visual_weight
+    )
+    sources = (
+        "model.visual.blocks.0.attn.qkv.weight",
+        "model.visual.blocks.0.mlp.gate_proj.weight",
+        "model.visual.blocks.0.mlp.up_proj.weight",
+        "model.visual.post_layernorm.weight",
+    )
+    for source_name in sources:
+        load_visual(
+            fake,
+            source_name,
+            torch.empty(1, dtype=torch.bfloat16),
+            params_dict,
+        )
+
+    assert [(name, shard) for name, shard, _ in loader_calls] == [
+        ("visual.blocks.0.attn.qkv_proj.weight", ()),
+        ("visual.blocks.0.mlp.gate_up_proj.weight", (0,)),
+        ("visual.blocks.0.mlp.gate_up_proj.weight", (1,)),
+        ("visual.post_layernorm.weight", ()),
+    ]
+    assert [name for _, name, _ in pad_calls] == [
+        "visual.blocks.0.attn.qkv_proj.weight",
+        "visual.blocks.0.mlp.gate_up_proj.weight",
+        "visual.blocks.0.mlp.gate_up_proj.weight",
+        "visual.post_layernorm.weight",
+    ]
+    assert all(dtype is torch.bfloat16 for _, _, dtype in loader_calls)
+
+    with pytest.raises(RuntimeError, match="must be BF16"):
+        load_visual(
+            fake,
+            sources[0],
+            torch.empty(1, dtype=torch.float32),
+            params_dict,
+        )
+    with pytest.raises(RuntimeError, match="unknown or dead runtime parameter"):
+        load_visual(
+            fake,
+            "model.visual.embeddings.position_embedding.weight",
+            torch.empty(1, dtype=torch.bfloat16),
+            params_dict,
+        )
 
 
 def test_reverse_contract_covers_packed_experts_fp8_scales_and_runtime_defaults(

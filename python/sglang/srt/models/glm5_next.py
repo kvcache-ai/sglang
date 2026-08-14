@@ -1,9 +1,9 @@
-"""Text-only GLM-5-Next model skeleton.
+"""GLM-5-Next text runtime with an isolated single-image vision path.
 
 This module intentionally reuses the KT Kimi/DeepSeek building blocks.  The
 GLM-specific KDA, DSA/KPool, mHC, and vision implementations are wired through
-small seams so that those later integrations do not have to modify the shared
-Kimi model or loosen behavior for existing architectures.
+small seams so the integration does not modify the shared Kimi model or loosen
+behavior for existing architectures.
 """
 
 from __future__ import annotations
@@ -64,10 +64,17 @@ from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator
 
 
-# Vision support is scheduled for phase 7.  Keep this whitelist exact: a
-# substring check such as ``"visual" in name`` can accidentally discard a
-# future text parameter and hide a corrupt checkpoint.
+# This historical constant name is retained for compatibility with Session AB
+# loader tests.  Session D now consumes the same exact prefixes when vision is
+# enabled and skips them only in the explicit text-only fallback.  A substring
+# check such as ``"visual" in name`` could discard a future text parameter and
+# hide a corrupt checkpoint.
 GLM5_NEXT_PHASE7_VISUAL_WEIGHT_PREFIXES = ("visual.", "model.visual.")
+GLM5_NEXT_PINNED_VISION_SOURCE_TENSOR_COUNT = 347
+_GLM5_NEXT_DEAD_VISION_RUNTIME_PREFIXES = (
+    "visual.embeddings.",
+    "visual.post_conv_layernorm.",
+)
 
 _GLM5_NEXT_LAYER_WEIGHT_RE = re.compile(r"^model\.layers\.(\d+)\.")
 _GLM5_NEXT_EXPERT_PARAMETER_RE = re.compile(
@@ -145,10 +152,12 @@ def _glm5_next_checkpoint_source_contract(
 
 
 def normalize_glm5_next_weight_name(name: str) -> Optional[str]:
-    """Map the HF wrapper prefix to the text-only SGLang module namespace.
+    """Map the HF wrapper prefix to the SGLang text-module namespace.
 
-    ``None`` means that the tensor belongs to the explicitly deferred phase-7
-    vision tower.  No other unknown weight is classified as skippable here.
+    Visual sources are handled by the strict Session D loader before this
+    helper when multimodal mode is active.  ``None`` therefore means either an
+    already-classified visual source or a visual tensor skipped by the explicit
+    text-only fallback.  No other unknown weight is classified as skippable.
     """
 
     if name.startswith(GLM5_NEXT_PHASE7_VISUAL_WEIGHT_PREFIXES):
@@ -160,6 +169,45 @@ def normalize_glm5_next_weight_name(name: str) -> Optional[str]:
         name = "model." + name.removeprefix("language_model.")
 
     return name
+
+
+def _canonical_glm5_next_visual_source_name(name: str) -> Optional[str]:
+    if name.startswith("model.visual."):
+        return name
+    if name.startswith("visual."):
+        return "model." + name
+    return None
+
+
+def _glm5_next_vision_checkpoint_source_contract(
+    parameter_names: Iterable[str],
+) -> frozenset[str]:
+    """Reverse live GLM vision parameters into checkpoint source names."""
+
+    expected_sources: set[str] = set()
+    for parameter_name in parameter_names:
+        if not parameter_name.startswith("visual."):
+            continue
+        if parameter_name.startswith(_GLM5_NEXT_DEAD_VISION_RUNTIME_PREFIXES):
+            # GlmOcrVisionModel inherits these GLM4V modules, but its forward
+            # never reads them and the GLM5 checkpoint intentionally omits them.
+            continue
+
+        source_name = "model." + parameter_name
+        if ".attn.qkv_proj." in source_name:
+            expected_sources.add(
+                source_name.replace(".attn.qkv_proj.", ".attn.qkv.")
+            )
+        elif ".gate_up_proj." in source_name:
+            expected_sources.add(
+                source_name.replace(".gate_up_proj.", ".gate_proj.")
+            )
+            expected_sources.add(
+                source_name.replace(".gate_up_proj.", ".up_proj.")
+            )
+        else:
+            expected_sources.add(source_name)
+    return frozenset(expected_sources)
 
 
 def _kda_construction_config(config: Glm5NextTextConfig) -> Glm5NextTextConfig:
@@ -713,13 +761,13 @@ class Glm5NextModel(KimiLinearModel):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.pp_group.is_first_rank:
             hidden_states = (
-                inputs_embeds
-                if inputs_embeds is not None
+                input_embeds
+                if input_embeds is not None
                 else self.embed_tokens(input_ids)
             )
             residual = None
@@ -766,7 +814,7 @@ class Glm5NextModel(KimiLinearModel):
 
 
 class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
-    """GLM-5-Next text runtime; the vision tower remains deferred to phase 7."""
+    """GLM-5-Next text runtime with an isolated single-image vision path."""
 
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -794,10 +842,42 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         super().__init__()
         self.mm_config = config if hasattr(config, "text_config") else None
         self.vision_config = getattr(config, "vision_config", None)
+        self.multimodal_enabled = bool(
+            getattr(config, "_glm5_next_multimodal_active", False)
+        )
         self.visual = None
+
+        if self.multimodal_enabled:
+            if self.mm_config is None or self.vision_config is None:
+                raise ValueError(
+                    "GLM-5-Next multimodal mode requires the root config and "
+                    "its vision_config."
+                )
+            # Keep imports and the ~1 GiB allocation out of the explicit
+            # programmatic text-only path.
+            from sglang.srt.layers.attention import vision_utils
+            from sglang.srt.models.glm_ocr import GlmOcrVisionModel
+
+            vision_utils.update_vit_attn_dummy_heads_config(config)
+            self.visual = GlmOcrVisionModel(
+                self.vision_config,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "visual"),
+                use_data_parallel=False,
+                num_dummy_heads=getattr(self.vision_config, "num_dummy_heads", 0),
+                merger_context_dim=self.vision_config.projection_intermediate_size,
+            )
 
         text_config = getattr(config, "text_config", config)
         self.config = text_config
+        # The processor/scheduler may retain GLM4V-style MRoPE metadata, but
+        # this pinned checkpoint has qk_rope_head_dim=0.  KT's DSA KPool uses
+        # the 1-D scheduler positions for cache/index updates, so forward must
+        # not replace them with the [3, N] metadata tensor used by the generic
+        # upstream VLM path (which would also break CUDA-graph batch size 4).
+        self.is_mrope_enabled = "mrope_section" in (
+            getattr(self.config, "rope_scaling", None) or {}
+        )
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         self.pp_group = get_pp_group()
@@ -829,6 +909,22 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             None
         )
         self._checkpoint_source_contract_complete = False
+        self._checkpoint_expected_visual_source_names: Optional[
+            frozenset[str]
+        ] = None
+        self._checkpoint_seen_visual_source_names: frozenset[str] = frozenset()
+        self._checkpoint_visual_source_contract_complete = False
+        if self.multimodal_enabled:
+            visual_sources = _glm5_next_vision_checkpoint_source_contract(
+                name for name, _ in self.named_parameters()
+            )
+            if len(visual_sources) != GLM5_NEXT_PINNED_VISION_SOURCE_TENSOR_COUNT:
+                raise RuntimeError(
+                    "GLM-5-Next pinned vision runtime must reverse-map to "
+                    f"{GLM5_NEXT_PINNED_VISION_SOURCE_TENSOR_COUNT} checkpoint "
+                    f"tensors; got {len(visual_sources)}."
+                )
+            self._checkpoint_expected_visual_source_names = visual_sources
 
         # GLM's DSA layers use the same latent hand-off contract as the NSA
         # DeepSeek path.  NSA keeps scattered-input mode disabled, but the
@@ -846,18 +942,56 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
     def end_layer(self) -> int:
         return self.model.end_layer
 
-    @staticmethod
-    def _require_phase7_vision() -> None:
+    def _require_multimodal_enabled(self) -> None:
+        if self.multimodal_enabled and self.visual is not None:
+            return
         raise RuntimeError(
-            "GLM-5-Next vision inputs are intentionally unavailable in the "
-            "phase-3 text runtime; enable them after the phase-7 vision integration."
+            "GLM-5-Next received vision input while multimodal support is disabled."
         )
 
-    def get_image_feature(self, *args, **kwargs):
-        self._require_phase7_vision()
+    def pad_input_ids(self, input_ids, mm_inputs):
+        self._require_multimodal_enabled()
+        from sglang.srt.managers.mm_utils import (
+            MultiModalityDataPaddingPatternMultimodalTokens,
+        )
+
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def get_image_feature(self, items) -> torch.Tensor:
+        self._require_multimodal_enabled()
+        if not items:
+            raise ValueError("GLM-5-Next image feature extraction needs image items.")
+        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+            device=self.visual.device, dtype=self.visual.dtype
+        )
+        # GLM4V/GLM-OCR build the spatial index with CPU ``torch.arange`` and
+        # move only the resulting position ids into the vision tower.  Keep
+        # the tiny grid descriptor on CPU; placing it on CUDA would mix device
+        # scalars with those CPU allocations before the explicit transfer.
+        image_grid_thw = torch.cat(
+            [item.image_grid_thw for item in items], dim=0
+        ).to(device="cpu", dtype=torch.int32)
+        if pixel_values.ndim != 2 or image_grid_thw.ndim != 2:
+            raise ValueError(
+                "GLM-5-Next vision expects 2-D pixel patches and image_grid_thw."
+            )
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        expected_rows = sum(
+            int(grid.prod().item())
+            // (self.vision_config.spatial_merge_size**2)
+            for grid in image_grid_thw
+        )
+        if image_embeds.ndim != 2 or image_embeds.shape[0] != expected_rows:
+            raise RuntimeError(
+                "GLM-5-Next visual embedding rows do not match image placeholders: "
+                f"expected {expected_rows}, got {tuple(image_embeds.shape)}."
+            )
+        return image_embeds
 
     def get_video_feature(self, *args, **kwargs):
-        self._require_phase7_vision()
+        del args, kwargs
+        raise ValueError("GLM-5-Next Session D does not support video input.")
 
     @torch.no_grad()
     def forward(
@@ -868,18 +1002,72 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        contains_mm_inputs = getattr(forward_batch, "contains_mm_inputs", None)
-        if callable(contains_mm_inputs) and contains_mm_inputs():
-            self._require_phase7_vision()
+        contains_image_inputs = getattr(
+            forward_batch, "contains_image_inputs", None
+        )
+        has_image_inputs = bool(
+            callable(contains_image_inputs) and contains_image_inputs()
+        )
+        forward_mode_name = getattr(
+            getattr(forward_batch, "forward_mode", None), "name", None
+        )
+        is_image_extend = has_image_inputs and forward_mode_name == "EXTEND"
+        # Real scheduler batches expose this Session-D marker as a dataclass
+        # field.  Keep the historical lightweight/unit-test forward contract
+        # usable for text-only calls, while refusing to silently lose the
+        # marker for an actual image batch.
+        try:
+            forward_batch.glm5_next_has_image_inputs = is_image_extend
+        except (AttributeError, TypeError):
+            if is_image_extend:
+                raise RuntimeError(
+                    "GLM-5-Next image dispatch requires a mutable ForwardBatch "
+                    "with the multimodal scheduling marker."
+                )
 
-        with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors,
+        contains_video_inputs = getattr(
+            forward_batch, "contains_video_inputs", None
+        )
+        if callable(contains_video_inputs) and contains_video_inputs():
+            raise ValueError("GLM-5-Next Session D does not support video input.")
+        contains_audio_inputs = getattr(
+            forward_batch, "contains_audio_inputs", None
+        )
+        if callable(contains_audio_inputs) and contains_audio_inputs():
+            raise ValueError("GLM-5-Next Session D does not support audio input.")
+
+        if has_image_inputs and not self.multimodal_enabled:
+            self._require_multimodal_enabled()
+        if has_image_inputs and forward_mode_name not in ("EXTEND", "DECODE", "IDLE"):
+            raise RuntimeError(
+                "GLM-5-Next Session D accepts image data only in plain EXTEND; "
+                f"got ForwardMode.{forward_mode_name}."
             )
+        with get_attn_tp_context().maybe_input_scattered(forward_batch):
+            if self.multimodal_enabled and is_image_extend:
+                from sglang.srt.managers.mm_utils import general_mm_embed_routine
+
+                hidden_states = general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=self.model,
+                    multimodal_model=self,
+                    positions=positions,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            else:
+                # Preserve the Session-C text/decode call shape exactly.  In
+                # particular, pure text must not be forced through the generic
+                # multimodal embedding routine merely because the vision tower
+                # was enabled at startup; this also keeps its CUDA-graph and
+                # layerwise-prefill behavior isolated from Session D.
+                hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    input_embeds,
+                    pp_proxy_tensors,
+                )
         if self.pp_group.is_last_rank:
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
@@ -924,13 +1112,71 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             return True
         return False
 
+    def _load_visual_weight(
+        self,
+        canonical_source_name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, nn.Parameter],
+    ) -> None:
+        """Load one canonical visual source without buffering checkpoint data."""
+
+        if loaded_weight.dtype is not torch.bfloat16:
+            raise RuntimeError(
+                "GLM-5-Next pinned visual tensors must be BF16; "
+                f"{canonical_source_name!r} has dtype {loaded_weight.dtype}."
+            )
+
+        runtime_name = canonical_source_name.removeprefix("model.")
+        shard_id = None
+        if ".attn.qkv." in runtime_name:
+            runtime_name = runtime_name.replace(
+                ".attn.qkv.", ".attn.qkv_proj."
+            )
+        elif ".gate_proj." in runtime_name:
+            runtime_name = runtime_name.replace(
+                ".gate_proj.", ".gate_up_proj."
+            )
+            shard_id = 0
+        elif ".up_proj." in runtime_name:
+            runtime_name = runtime_name.replace(
+                ".up_proj.", ".gate_up_proj."
+            )
+            shard_id = 1
+
+        param = params_dict.get(runtime_name)
+        if param is None or runtime_name.startswith(
+            _GLM5_NEXT_DEAD_VISION_RUNTIME_PREFIXES
+        ):
+            raise RuntimeError(
+                "GLM-5-Next visual checkpoint source mapped to an unknown or "
+                f"dead runtime parameter: source={canonical_source_name!r}, "
+                f"runtime={runtime_name!r}."
+            )
+
+        from sglang.srt.layers.attention import vision_utils
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+        loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+            self.mm_config, runtime_name, loaded_weight
+        )
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        if shard_id is None:
+            weight_loader(param, loaded_weight)
+        else:
+            weight_loader(param, loaded_weight, shard_id)
+
     def _normalized_text_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
         *,
         require_complete: bool = True,
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        params_dict = dict(self.named_parameters())
+        all_params_dict = dict(self.named_parameters())
+        params_dict = {
+            name: parameter
+            for name, parameter in all_params_dict.items()
+            if not name.startswith("visual.")
+        }
         expected_sources = getattr(self, "_checkpoint_expected_source_names", None)
         runtime_defaults = getattr(
             self,
@@ -950,13 +1196,52 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         skipped_visual: list[str] = []
         skipped_mtp: list[str] = []
         skipped_pp_count = 0
+        multimodal_enabled = bool(getattr(self, "multimodal_enabled", False))
+        expected_visual_sources = getattr(
+            self, "_checkpoint_expected_visual_source_names", None
+        )
+        if multimodal_enabled and expected_visual_sources is None:
+            expected_visual_sources = _glm5_next_vision_checkpoint_source_contract(
+                all_params_dict
+            )
+            self._checkpoint_expected_visual_source_names = expected_visual_sources
+        # Duplicate detection is scoped to one load transaction, matching the
+        # text-source contract above.  The first complete startup load remains
+        # strict, while later online weight updates may legally present the
+        # same visual names again (or update only a subset).
+        seen_visual_sources: set[str] = set()
 
         num_hidden_layers = self.config.num_hidden_layers
         num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)
 
         for source_name, loaded_weight in weights:
+            visual_source_name = _canonical_glm5_next_visual_source_name(source_name)
+            if visual_source_name is not None:
+                if not multimodal_enabled:
+                    skipped_visual.append(source_name)
+                    continue
+                if visual_source_name in seen_visual_sources:
+                    raise RuntimeError(
+                        "GLM-5-Next visual checkpoint source contract found a "
+                        f"duplicate tensor {visual_source_name!r}; latest raw "
+                        f"name is {source_name!r}."
+                    )
+                if visual_source_name not in expected_visual_sources:
+                    raise RuntimeError(
+                        "GLM-5-Next visual checkpoint source contract rejected "
+                        f"unknown tensor: raw={source_name!r}, "
+                        f"canonical={visual_source_name!r}."
+                    )
+                self._load_visual_weight(
+                    visual_source_name, loaded_weight, all_params_dict
+                )
+                seen_visual_sources.add(visual_source_name)
+                continue
+
             normalized_name = normalize_glm5_next_weight_name(source_name)
             if normalized_name is None:
+                # All exact visual prefixes were handled above.  Retain this
+                # defensive branch for direct calls to the historical helper.
                 skipped_visual.append(source_name)
                 continue
 
@@ -1033,6 +1318,7 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         self.skipped_session_ab_mtp_weights = tuple(skipped_mtp)
         self.skipped_pipeline_parallel_weight_count = skipped_pp_count
         self.checkpoint_runtime_default_parameters = tuple(sorted(runtime_defaults))
+        self._checkpoint_seen_visual_source_names = frozenset(seen_visual_sources)
 
         if require_complete:
             missing_sources = sorted(expected_sources - seen_sources)
@@ -1043,6 +1329,19 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
                     f"{len(missing_sources)} required current-rank tensor(s); "
                     f"examples: {examples}"
                 )
+            if multimodal_enabled:
+                missing_visual_sources = sorted(
+                    expected_visual_sources - seen_visual_sources
+                )
+                if missing_visual_sources:
+                    examples = ", ".join(
+                        repr(name) for name in missing_visual_sources[:16]
+                    )
+                    raise RuntimeError(
+                        "GLM-5-Next visual checkpoint source contract is missing "
+                        f"{len(missing_visual_sources)} required tensor(s); "
+                        f"examples: {examples}"
+                    )
 
     def load_weights(
         self,
@@ -1064,6 +1363,9 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             is_nextn=False,
         )
         self._checkpoint_source_contract_complete = True
+        self._checkpoint_visual_source_contract_complete = bool(
+            self.multimodal_enabled
+        )
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None) -> None:
         DeepseekV2WeightLoaderMixin.post_load_weights(
