@@ -1,14 +1,12 @@
-"""CPU-only contracts for exact GLM-5-Next block-FP8 layerwise prefill."""
+"""CPU-only contracts for GLM-5-Next's generic FP8 prefill path."""
 
-import ast
+import contextlib
 import importlib.util
-import inspect
-import subprocess
+import math
 import sys
 import types
 import unittest
 from collections import namedtuple
-from multiprocessing import shared_memory
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -41,7 +39,9 @@ def _load_test_target():
         "sglang.srt": _package("sglang.srt"),
         "sglang.srt.layers": _package("sglang.srt.layers"),
         "sglang.srt.layers.moe": _package("sglang.srt.layers.moe"),
-        "sglang.srt.layers.quantization": _package("sglang.srt.layers.quantization"),
+        "sglang.srt.layers.quantization": _package(
+            "sglang.srt.layers.quantization"
+        ),
         "sglang.srt.distributed": _module(
             "sglang.srt.distributed",
             get_tensor_model_parallel_rank=lambda: 0,
@@ -94,44 +94,6 @@ def _load_test_target():
 kt_ep_wrapper = _load_test_target()
 
 
-class _RecordingEvent:
-    def __init__(self, name, log):
-        self.name = name
-        self.log = log
-
-    def record(self, stream=None):
-        self.log.append(("record", self.name, getattr(stream, "name", stream)))
-
-
-class _RecordingStream:
-    def __init__(self, name, log):
-        self.name = name
-        self.log = log
-
-    def wait_event(self, event):
-        self.log.append(("wait_event", self.name, event.name))
-
-    def synchronize(self):
-        self.log.append(("synchronize", self.name))
-
-
-class _StateSlot:
-    def __init__(self, index, log):
-        self.index = index
-        self.state = "EMPTY"
-        self.layer_idx = None
-        self.epoch = -1
-        self.has_consumed_event = False
-        self.reuse_guard = None
-        self.ready_event = _RecordingEvent(f"ready{index}", log)
-        self.consumed_event = _RecordingEvent(f"consumed{index}", log)
-
-    def invalidate(self):
-        self.state = "EMPTY"
-        self.layer_idx = None
-        self.epoch = -1
-
-
 class _StandardCombineInput:
     def __init__(self, hidden_states):
         self.hidden_states = hidden_states
@@ -161,35 +123,59 @@ def _runtime_stubs():
     }
 
 
-class TestGlm5NextFp8Gates(unittest.TestCase):
+class _GpuMethod:
+    def __init__(self, fill_value):
+        self.fill_value = fill_value
+        self.calls = []
+
+    def apply(self, layer, dispatch_output):
+        self.calls.append((layer, dispatch_output))
+        return _StandardCombineInput(
+            torch.full_like(dispatch_output.hidden_states, self.fill_value)
+        )
+
+
+class TestGlm5NextFp8GenericRouting(unittest.TestCase):
     def setUp(self):
-        kt_ep_wrapper._GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY.clear()
-        kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS.clear()
+        kt_ep_wrapper._SHARED_FULL_CONTEXT = None
+        kt_ep_wrapper._MXFP4_LAYERWISE_MANAGERS.clear()
+        kt_ep_wrapper._MXFP4_LAYERWISE_DISABLED_REASONS.clear()
 
     @staticmethod
-    def _wrapper(*, exact=True, method="FP8", threshold=4096, mode="EXTEND"):
+    def _wrapper(*, exact=True, threshold=1024, mode="EXTEND"):
         wrapper = object.__new__(kt_ep_wrapper.KTEPWrapperMethod)
         wrapper.tp_rank = 1
         wrapper.kt_config = SimpleNamespace(
             layer_idx=3,
-            method=method,
+            method="FP8",
             is_glm5_next=exact,
             kt_enable_dynamic_expert_update=False,
         )
         wrapper.gpu_prefill_token_threshold = threshold
-        wrapper._glm5_next_forward_mode = SimpleNamespace(name=mode)
-        wrapper._glm5_next_fp8_pipeline_signature = ("glm", "cuda:0")
+        if mode is not None:
+            wrapper._glm5_next_forward_mode = SimpleNamespace(name=mode)
+        wrapper._glm5_next_has_image_inputs = False
         wrapper.gpu_experts_mask = torch.tensor([True])
         wrapper.gpu_experts_mask_cuda = torch.tensor([True])
+        wrapper.logical_to_gpu_index = torch.tensor([0], dtype=torch.int32)
         wrapper.logical_to_gpu_index_cuda = torch.tensor([0], dtype=torch.int32)
         wrapper.num_gpu_experts = 1
         wrapper._cpu_stream = None
-        wrapper.gpu_method = SimpleNamespace(
-            apply=lambda _layer, dispatch: _StandardCombineInput(
-                torch.full_like(dispatch.hidden_states, 7)
-            )
-        )
+        wrapper.gpu_method = _GpuMethod(fill_value=7)
+        wrapper._full_init_args = (4096, 512, torch.bfloat16)
+        wrapper.global_num_experts = 288
+        wrapper.moe_runner_config = object()
+        wrapper.wrapper = object()
         return wrapper
+
+    @staticmethod
+    def _layer():
+        return SimpleNamespace(
+            w13_weight=object(),
+            w13_weight_scale_inv=object(),
+            w2_weight=object(),
+            w2_weight_scale_inv=object(),
+        )
 
     @staticmethod
     def _dispatch(num_tokens):
@@ -201,7 +187,7 @@ class TestGlm5NextFp8Gates(unittest.TestCase):
         )
         return _DispatchOutput(hidden_states=hidden, topk_output=topk)
 
-    def _apply(self, wrapper, num_tokens):
+    def _apply(self, wrapper, layer, num_tokens):
         with (
             mock.patch.dict(sys.modules, _runtime_stubs()),
             mock.patch.object(
@@ -209,674 +195,453 @@ class TestGlm5NextFp8Gates(unittest.TestCase):
                 "mask_and_remap_expert_ids",
                 side_effect=lambda ids, *_args: ids,
             ),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
         ):
-            return wrapper.apply(SimpleNamespace(), self._dispatch(num_tokens))
+            return wrapper.apply(layer, self._dispatch(num_tokens))
 
-    def test_gate_is_exact_glm_block_fp8_only(self):
-        self.assertTrue(
-            kt_ep_wrapper._glm5_next_fp8_pipeline_requested(self._wrapper())
-        )
-        self.assertFalse(
-            kt_ep_wrapper._glm5_next_fp8_pipeline_requested(self._wrapper(exact=False))
-        )
-        self.assertFalse(
-            kt_ep_wrapper._glm5_next_fp8_pipeline_requested(
-                self._wrapper(method="MXFP4")
-            )
-        )
-        self.assertFalse(
-            kt_ep_wrapper._glm5_next_fp8_pipeline_requested(self._wrapper(threshold=0))
-        )
-
-    def test_every_extend_chunk_uses_required_manager_below_threshold(self):
-        wrapper = self._wrapper(threshold=4096, mode="EXTEND")
-        manager = mock.Mock()
-        manager.apply.return_value = "required-layerwise"
-        kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS[
-            wrapper._glm5_next_fp8_pipeline_signature
-        ] = manager
-
-        result = self._apply(wrapper, num_tokens=17)
-
-        self.assertEqual(result, "required-layerwise")
-        manager.apply.assert_called_once()
-
-    def test_decode_and_idle_never_touch_manager(self):
-        for mode in ("DECODE", "IDLE"):
-            with self.subTest(mode=mode):
-                wrapper = self._wrapper(mode=mode)
-                manager = mock.Mock()
-                kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS[
-                    wrapper._glm5_next_fp8_pipeline_signature
-                ] = manager
-
-                result = self._apply(wrapper, num_tokens=1)
-
-                manager.apply.assert_not_called()
-                manager.abort_round.assert_not_called()
-                torch.testing.assert_close(
-                    result.hidden_states, torch.full((1, 2), 7.0)
-                )
-
-    def test_image_extend_bypasses_layerwise_and_uses_hybrid_path(self):
-        wrapper = self._wrapper(mode="EXTEND")
-        wrapper._glm5_next_has_image_inputs = True
-        manager = mock.Mock()
-        kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS[
-            wrapper._glm5_next_fp8_pipeline_signature
-        ] = manager
-
-        result = self._apply(wrapper, num_tokens=17)
-
-        manager.apply.assert_not_called()
-        self.assertEqual(wrapper._glm5_next_mm_hybrid_extend_count, 1)
-        torch.testing.assert_close(
-            result.hidden_states, torch.full((17, 2), 7.0)
-        )
-
-    def test_unsupported_modes_and_missing_manager_fail_closed(self):
-        for mode in ("MIXED", "TARGET_VERIFY", "SPLIT_PREFILL", "DLLM_EXTEND"):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(RuntimeError, "supports only plain EXTEND"):
-                    self._apply(self._wrapper(mode=mode), num_tokens=8)
-
-        with self.assertRaisesRegex(RuntimeError, "refusing fallback"):
-            self._apply(self._wrapper(mode="EXTEND"), num_tokens=8)
-
-    def test_generic_fp8_does_not_enter_glm_manager(self):
-        wrapper = self._wrapper(exact=False, mode="EXTEND")
-        manager = mock.Mock()
-        kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS[
-            wrapper._glm5_next_fp8_pipeline_signature
-        ] = manager
-
-        result = self._apply(wrapper, num_tokens=1)
-
-        manager.apply.assert_not_called()
-        torch.testing.assert_close(result.hidden_states, torch.full((1, 2), 7.0))
-
-
-class TestGlm5NextFp8Manager(unittest.TestCase):
-    def setUp(self):
-        kt_ep_wrapper._GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY.clear()
-        kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS.clear()
-
-    def _manager(self):
-        signature = ("glm", "state")
-        log = []
-        methods = {
-            layer_idx: SimpleNamespace(
-                kt_config=SimpleNamespace(layer_idx=layer_idx), tp_rank=1
-            )
-            for layer_idx in range(3, 45)
-        }
-        layers = {layer_idx: object() for layer_idx in methods}
-        kt_ep_wrapper._GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY[signature] = {
-            layer_idx: (methods[layer_idx], layers[layer_idx]) for layer_idx in methods
-        }
-        manager = object.__new__(kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager)
-        manager.signature = signature
-        manager.context = SimpleNamespace(
+    @staticmethod
+    def _generic_context(fill_value=11):
+        return SimpleNamespace(
             gpu_layer=object(),
-            gpu_method=SimpleNamespace(
-                apply=lambda _layer, dispatch: (
-                    log.append(("compute", dispatch)) or dispatch
-                )
-            ),
+            gpu_method=_GpuMethod(fill_value=fill_value),
+            load=mock.Mock(),
+            initialize_cpu_buffers=mock.Mock(),
+            _initialize_glm5_next_fp8_transport=mock.Mock(),
+            _cleanup_cpu_buffers_after_failure=mock.Mock(),
+            _is_mxfp4_quant=False,
         )
-        manager.slots = (_StateSlot(0, log), _StateSlot(1, log))
-        manager.device = torch.device("cpu")
-        manager.epoch = -1
-        manager.last_layer_position = None
-        manager.current_slot_index = None
-        manager.round_active = False
-        manager.failure_reason = None
-        manager.visited_layer_indices = []
-        manager.apply_count = 0
-        manager.prime_count = 0
-        manager.prefetch_hit_count = 0
-        manager.completed_round_count = 0
-        manager.fallback_count = 0
 
-        def load_slot(slot, layer_idx, _method, _layer):
-            log.append(("load", layer_idx, slot.index, manager.epoch))
-            slot.state = "READY"
-            slot.layer_idx = layer_idx
-            slot.epoch = manager.epoch
-            slot.reuse_guard = "ready"
+    def test_1023_is_hybrid_and_1024_lazily_builds_one_shared_context(self):
+        wrapper = self._wrapper()
+        layer = self._layer()
+        context = self._generic_context()
 
-        return manager, methods, layers, log, load_slot
-
-    def test_two_slots_cover_every_moe_layer_and_complete_epoch(self):
-        manager, methods, layers, log, load_slot = self._manager()
-        stream = _RecordingStream("main", log)
         with (
-            mock.patch.object(manager, "_load_slot", side_effect=load_slot),
             mock.patch.object(
-                manager,
-                "_bind_slot",
-                side_effect=lambda slot: log.append(("bind", slot.index)),
-            ),
-            mock.patch.object(manager, "_record_raw_backing_on_stream"),
-            mock.patch.object(manager, "_commit_tp_runtime_phase"),
-            mock.patch.object(torch.cuda, "current_stream", return_value=stream),
+                kt_ep_wrapper, "SharedFullContext", return_value=context
+            ) as context_ctor,
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_validate_glm5_next_fp8_shared_full_context",
+                return_value=(1_812_381_696, 12_585_984),
+            ) as validate_context,
         ):
-            for layer_idx in range(3, 45):
-                self.assertEqual(
-                    manager.apply(
-                        methods[layer_idx], layers[layer_idx], f"layer-{layer_idx}"
-                    ),
-                    f"layer-{layer_idx}",
-                )
+            below = self._apply(wrapper, layer, 1023)
+            context_ctor.assert_not_called()
+            context.load.assert_not_called()
+            validate_context.assert_not_called()
 
-        self.assertEqual(manager.apply_count, 42)
-        self.assertEqual(manager.prime_count, 1)
-        self.assertEqual(manager.prefetch_hit_count, 41)
-        self.assertEqual(manager.completed_round_count, 1)
-        self.assertEqual(manager.fallback_count, 0)
-        self.assertFalse(manager.round_active)
+            at_threshold = self._apply(wrapper, layer, 1024)
+            second_layer = self._layer()
+            wrapper.kt_config.layer_idx = 4
+            second = self._apply(wrapper, second_layer, 1024)
+
+        torch.testing.assert_close(
+            below.hidden_states, torch.full((1023, 2), 7.0)
+        )
+        torch.testing.assert_close(
+            at_threshold.hidden_states, torch.full((1024, 2), 11.0)
+        )
+        torch.testing.assert_close(
+            second.hidden_states, torch.full((1024, 2), 11.0)
+        )
+        context_ctor.assert_called_once_with(
+            layer=layer,
+            init_args=(4096, 512, torch.bfloat16),
+            global_num_experts=288,
+            moe_runner_config=wrapper.moe_runner_config,
+            defer_cpu_buffers=True,
+        )
+        context.initialize_cpu_buffers.assert_called_once_with()
+        context._initialize_glm5_next_fp8_transport.assert_called_once_with()
+        self.assertIs(kt_ep_wrapper._SHARED_FULL_CONTEXT, context)
+        validate_context.assert_called_once_with(context)
+        self.assertEqual(context.load.call_count, 2)
         self.assertEqual(
-            [entry[2] for entry in log if entry[0] == "load"],
-            [index % 2 for index in range(42)],
-        )
-
-    def test_two_consecutive_extend_epochs_keep_monotonic_state(self):
-        manager, methods, layers, _log, load_slot = self._manager()
-        with (
-            mock.patch.object(manager, "_load_slot", side_effect=load_slot),
-            mock.patch.object(manager, "_bind_slot"),
-            mock.patch.object(manager, "_record_raw_backing_on_stream"),
-            mock.patch.object(manager, "_commit_tp_runtime_phase"),
-            mock.patch.object(
-                torch.cuda,
-                "current_stream",
-                return_value=_RecordingStream("main", []),
-            ),
-        ):
-            for _epoch in range(2):
-                for layer_idx in range(3, 45):
-                    manager.apply(
-                        methods[layer_idx], layers[layer_idx], layer_idx
-                    )
-
-        self.assertEqual(manager.epoch, 1)
-        self.assertEqual(manager.apply_count, 84)
-        self.assertEqual(manager.prime_count, 2)
-        self.assertEqual(manager.prefetch_hit_count, 82)
-        self.assertEqual(manager.completed_round_count, 2)
-        self.assertEqual(manager.fallback_count, 0)
-        self.assertFalse(manager.round_active)
-
-    def test_skip_poison_is_sticky_and_never_falls_back(self):
-        manager, methods, layers, _log, load_slot = self._manager()
-        with (
-            mock.patch.object(manager, "_load_slot", side_effect=load_slot),
-            mock.patch.object(manager, "_bind_slot"),
-            mock.patch.object(manager, "_record_raw_backing_on_stream"),
-            mock.patch.object(manager, "_commit_tp_runtime_phase"),
-            mock.patch.object(
-                torch.cuda,
-                "current_stream",
-                return_value=_RecordingStream("main", []),
-            ),
-        ):
-            manager.apply(methods[3], layers[3], object())
-            with self.assertRaisesRegex(RuntimeError, "layer order mismatch"):
-                manager.apply(methods[5], layers[5], object())
-            with self.assertRaisesRegex(RuntimeError, "manager is poisoned"):
-                manager.apply(methods[4], layers[4], object())
-
-        self.assertEqual(manager.fallback_count, 0)
-
-    def test_manager_uses_events_without_global_cuda_synchronize(self):
-        target_path = (
-            Path(__file__).resolve().parents[2]
-            / "python/sglang/srt/layers/moe/kt_ep_wrapper.py"
-        )
-        module_source = target_path.read_text(encoding="utf-8")
-        tree = ast.parse(module_source)
-        node = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "_Glm5NextFp8LayerwisePrefillManager"
-        )
-        source = ast.get_source_segment(module_source, node)
-        self.assertNotIn("torch.cuda.synchronize", source)
-        self.assertIn("self.transfer_stream", source)
-        self.assertIn("__atomic_load_8", source)
-        self.assertIn("__atomic_store_8", source)
-        self.assertIn("_CONTROL_CACHELINE_BYTES = 64", source)
-        self.assertIn("slot.ready_event", source)
-        self.assertIn("slot.ready_event.synchronize()", source)
-        self.assertIn("slot.consumed_event", source)
-        self.assertNotIn("get_tp_group().device_group", source)
-        load_source = inspect.getsource(
-            kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager._load_slot
-        )
-        self.assertNotIn("dist.all_reduce", load_source)
-
-    def test_atomic_control_is_cacheline_isolated_and_process_shared(self):
-        manager_type = kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-        offsets, control_nbytes = manager_type._build_control_offsets(2)
-        flat_offsets = sorted(
-            offset for group in offsets.values() for offset in group
-        )
-        self.assertTrue(
-            all(
-                right - left == manager_type._CONTROL_CACHELINE_BYTES
-                for left, right in zip(flat_offsets, flat_offsets[1:])
-            )
-        )
-
-        payload_offset = control_nbytes
-        handle = shared_memory.SharedMemory(
-            create=True, size=control_nbytes + 64
-        )
-        manager = object.__new__(manager_type)
-        manager.transport_abandoned = False
-        manager._CONTROL_TIMEOUT_SECONDS = 5.0
-        try:
-            handle.buf[:] = bytes(control_nbytes + 64)
-            manager._configure_atomic_access(handle, tp_size=2)
-            ready_offset = offsets["ready_generation"][0]
-            child_code = r"""
-import ctypes
-import sys
-from multiprocessing import shared_memory
-
-try:
-    handle = shared_memory.SharedMemory(
-        name=sys.argv[1], create=False, track=False
-    )
-except TypeError:
-    from multiprocessing import resource_tracker
-
-    handle = shared_memory.SharedMemory(name=sys.argv[1], create=False)
-    resource_tracker.unregister(handle._name, "shared_memory")
-anchor = ctypes.c_char.from_buffer(handle.buf)
-address = ctypes.addressof(anchor)
-store = getattr(ctypes.CDLL("libatomic.so.1"), "__atomic_store_8")
-store.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
-store.restype = None
-payload_offset = int(sys.argv[3])
-handle.buf[payload_offset : payload_offset + 9] = b"published"
-store(ctypes.c_void_p(address + int(sys.argv[2])), ctypes.c_uint64(7), 3)
-anchor = None
-handle.close()
-"""
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-c",
-                    child_code,
-                    handle.name,
-                    str(ready_offset),
-                    str(payload_offset),
-                ]
-            )
-            manager._wait_for_exact_control_value(
-                ready_offset, 7, "child publication"
-            )
-            self.assertEqual(
-                bytes(handle.buf[payload_offset : payload_offset + 9]),
-                b"published",
-            )
-            self.assertEqual(process.wait(timeout=10), 0)
-        finally:
-            manager._transport_control_anchor = None
-            handle.close()
-            handle.unlink()
-
-    def test_generation_drift_is_fail_closed(self):
-        manager_type = kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-        offsets, control_nbytes = manager_type._build_control_offsets(1)
-        handle = shared_memory.SharedMemory(create=True, size=control_nbytes)
-        manager = object.__new__(manager_type)
-        manager.transport_abandoned = False
-        try:
-            handle.buf[:] = bytes(control_nbytes)
-            manager._configure_atomic_access(handle, tp_size=1)
-            ready_offset = offsets["ready_generation"][0]
-            manager._atomic_store(ready_offset, 4)
-            with self.assertRaisesRegex(RuntimeError, "generation drift"):
-                manager._wait_for_exact_control_value(
-                    ready_offset, 3, "stale consumer"
-                )
-            self.assertTrue(manager.transport_abandoned)
-            self.assertEqual(
-                manager._atomic_load(offsets["global_error"][0]), 1
-            )
-        finally:
-            manager._transport_control_anchor = None
-            handle.close()
-            handle.unlink()
-
-    def test_sticky_global_error_immediately_aborts_generation_wait(self):
-        manager_type = kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-        offsets, control_nbytes = manager_type._build_control_offsets(1)
-        handle = shared_memory.SharedMemory(create=True, size=control_nbytes)
-        manager = object.__new__(manager_type)
-        manager.transport_abandoned = False
-        manager._CONTROL_TIMEOUT_SECONDS = 60.0
-        try:
-            handle.buf[:] = bytes(control_nbytes)
-            manager._configure_atomic_access(handle, tp_size=1)
-            manager._atomic_store(offsets["global_error"][0], 1)
-            with self.assertRaisesRegex(RuntimeError, "aborted by another"):
-                manager._wait_for_exact_control_value(
-                    offsets["ready_generation"][0],
-                    1,
-                    "failed writer publication",
-                )
-            self.assertTrue(manager.transport_abandoned)
-        finally:
-            manager._transport_control_anchor = None
-            handle.close()
-            handle.unlink()
-
-    def test_writer_descriptor_mismatch_poison_is_sticky(self):
-        manager_type = kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-        _offsets, control_nbytes = manager_type._build_control_offsets(1)
-        handle = shared_memory.SharedMemory(create=True, size=control_nbytes)
-        manager = object.__new__(manager_type)
-        manager.transport_abandoned = False
-        try:
-            handle.buf[:] = bytes(control_nbytes)
-            manager._configure_atomic_access(handle, tp_size=1)
-            manager._publish_writer_generation(
-                host_slot=0,
-                generation=1,
-                layer_idx=3,
-                expert_id=17,
-                writer_ok=True,
-            )
-            with self.assertRaisesRegex(RuntimeError, "descriptor mismatch"):
-                manager._consume_writer_generation(
-                    host_slot=0,
-                    generation=1,
+            context.load.call_args_list,
+            [
+                mock.call(
                     layer_idx=3,
-                    expert_id=18,
+                    wrapper=wrapper.wrapper,
+                    original_layer=layer,
+                    gpu_experts_mask=wrapper.gpu_experts_mask,
+                    logical_to_gpu_index=wrapper.logical_to_gpu_index,
+                ),
+                mock.call(
+                    layer_idx=4,
+                    wrapper=wrapper.wrapper,
+                    original_layer=second_layer,
+                    gpu_experts_mask=wrapper.gpu_experts_mask,
+                    logical_to_gpu_index=wrapper.logical_to_gpu_index,
+                ),
+            ],
+        )
+
+    def test_image_extend_and_decode_idle_bypass_generic_context(self):
+        cases = (("EXTEND", True), ("DECODE", False), ("IDLE", False))
+        for mode, has_image in cases:
+            with self.subTest(mode=mode, has_image=has_image):
+                kt_ep_wrapper._SHARED_FULL_CONTEXT = None
+                wrapper = self._wrapper(mode=mode)
+                wrapper._glm5_next_has_image_inputs = has_image
+                context = self._generic_context()
+                with mock.patch.object(
+                    kt_ep_wrapper, "SharedFullContext", return_value=context
+                ) as context_ctor:
+                    result = self._apply(wrapper, self._layer(), 1024)
+
+                context_ctor.assert_not_called()
+                context.load.assert_not_called()
+                torch.testing.assert_close(
+                    result.hidden_states, torch.full((1024, 2), 7.0)
                 )
-            self.assertTrue(manager.transport_abandoned)
-            self.assertTrue(manager._shared_transport_failed())
-        finally:
-            manager._transport_control_anchor = None
-            handle.close()
-            handle.unlink()
+                if has_image:
+                    self.assertEqual(wrapper._glm5_next_mm_hybrid_extend_count, 1)
 
-    def test_tp_contract_rejects_peer_mask_or_mapping_digest_drift(self):
-        signature = ("glm", "contract")
-        original_layer = SimpleNamespace(
-            **{
-                name: torch.empty(1)
-                for name in kt_ep_wrapper._Glm5NextFp8PrefillSlot.RAW_NAMES
-            }
-        )
-        method = SimpleNamespace(
-            gpu_experts_mask=torch.tensor([True, False]),
-            logical_to_gpu_index=torch.tensor([0, -1], dtype=torch.int32),
-            num_gpu_experts=1,
-            global_num_experts=2,
-            _full_init_args=(4, 2, torch.bfloat16),
-            kt_config=SimpleNamespace(weight_path="weights"),
-        )
-        kt_ep_wrapper._GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY[signature] = {
-            3: (method, original_layer)
-        }
-        manager = object.__new__(
-            kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-        )
-        manager.signature = signature
-        manager.device = torch.device("cpu")
-        manager.slots = (
-            SimpleNamespace(
-                **{
-                    name: torch.empty(1)
-                    for name in kt_ep_wrapper._Glm5NextFp8PrefillSlot.RAW_NAMES
-                }
-            ),
-        )
-
-        def inject_peer_drift(gathered, local, **_kwargs):
-            gathered[:] = [
-                local,
-                (local[0], "different-digest", local[2], None),
-            ]
+    def test_single_rank_slot_oom_fails_collectively_before_host_buffers(self):
+        wrapper = self._wrapper()
+        layer = self._layer()
 
         with (
             mock.patch.object(
-                kt_ep_wrapper.dist, "is_initialized", return_value=True
+                kt_ep_wrapper,
+                "SharedFullContext",
+                side_effect=torch.cuda.OutOfMemoryError("test slot OOM"),
+            ),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "CUDA out of memory"):
+                wrapper._build_full_context(layer)
+
+        self.assertIsNone(kt_ep_wrapper._SHARED_FULL_CONTEXT)
+
+    def test_cross_rank_validation_failure_cleans_host_buffers(self):
+        wrapper = self._wrapper()
+        context = self._generic_context()
+
+        with (
+            mock.patch.object(
+                kt_ep_wrapper, "SharedFullContext", return_value=context
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_validate_glm5_next_fp8_shared_full_context",
+                return_value=(1_812_381_696, 12_585_984),
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_all_tp_ranks_succeeded",
+                side_effect=(True, False),
+            ),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                wrapper._build_full_context(self._layer())
+
+        context.initialize_cpu_buffers.assert_called_once_with()
+        context._cleanup_cpu_buffers_after_failure.assert_called_once_with()
+        self.assertIsNone(kt_ep_wrapper._SHARED_FULL_CONTEXT)
+
+    def test_missing_and_unsupported_forward_modes_fail_before_allocation(self):
+        for mode, pattern in (
+            (None, "ForwardMode metadata"),
+            ("MIXED", "supports only plain EXTEND"),
+        ):
+            with self.subTest(mode=mode):
+                kt_ep_wrapper._SHARED_FULL_CONTEXT = None
+                wrapper = self._wrapper(mode=mode)
+                context = self._generic_context()
+                with mock.patch.object(
+                    kt_ep_wrapper, "SharedFullContext", return_value=context
+                ) as context_ctor:
+                    with self.assertRaisesRegex(RuntimeError, pattern):
+                        self._apply(wrapper, self._layer(), 1024)
+
+                context_ctor.assert_not_called()
+                context.load.assert_not_called()
+
+    def test_non_glm_keeps_the_existing_generic_threshold_behavior(self):
+        wrapper = self._wrapper(exact=False, mode=None)
+        layer = self._layer()
+        context = self._generic_context(fill_value=13)
+
+        with mock.patch.object(
+            kt_ep_wrapper, "SharedFullContext", return_value=context
+        ) as context_ctor:
+            below = self._apply(wrapper, layer, 1023)
+            at_threshold = self._apply(wrapper, layer, 1024)
+
+        torch.testing.assert_close(
+            below.hidden_states, torch.full((1023, 2), 7.0)
+        )
+        torch.testing.assert_close(
+            at_threshold.hidden_states, torch.full((1024, 2), 13.0)
+        )
+        context_ctor.assert_called_once()
+        context.load.assert_called_once()
+
+
+class _TensorMetadata:
+    def __init__(self, shape, dtype):
+        self.shape = torch.Size(shape)
+        self.dtype = dtype
+
+    def numel(self):
+        return math.prod(self.shape)
+
+    def element_size(self):
+        return torch.empty((), dtype=self.dtype).element_size()
+
+
+class _FakeSharedMemory:
+    instances = []
+
+    def __init__(self, *, name, create, size):
+        self.name = name
+        self.create = create
+        self.size = size
+        self.buf = bytearray(size)
+        self.unlinked = False
+        self.closed = False
+        self.instances.append(self)
+
+    def unlink(self):
+        self.unlinked = True
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeCudaEvent:
+    def __init__(self):
+        self.record_count = 0
+        self.synchronize_count = 0
+
+    def record(self, _stream):
+        self.record_count += 1
+
+    def synchronize(self):
+        self.synchronize_count += 1
+
+
+class _FakeCudaStream:
+    def __init__(self):
+        self.synchronize_count = 0
+        self.waited_streams = []
+
+    def synchronize(self):
+        self.synchronize_count += 1
+
+    def wait_stream(self, stream):
+        self.waited_streams.append(stream)
+
+
+class _FakeFp8Writer:
+    def __init__(self, context):
+        self.context = context
+        self.pending = None
+        self.submitted = []
+        self.sync_count = 0
+
+    def submit_write_weight_scale_to_buffer(
+        self,
+        tp_size,
+        expert_id,
+        w13_weight_ptrs,
+        w13_scale_ptrs,
+        w2_weight_ptrs,
+        w2_scale_ptrs,
+    ):
+        self.submitted.append((tp_size, expert_id))
+        base = self.context.cpu_buffers["w13_weight"].data_ptr()
+        per_slot_bytes = (
+            self.context.cpu_buffers["w13_weight"].numel()
+            // 2
+            * self.context.cpu_buffers["w13_weight"].element_size()
+        )
+        slot = (w13_weight_ptrs[0] - base) // per_slot_bytes
+        self.pending = (expert_id, slot)
+
+    def sync_write_weight_scale_to_buffer(self):
+        expert_id, slot = self.pending
+        for offset, name in enumerate(
+            kt_ep_wrapper.SharedFullContext.WEIGHT_NAMES_FP8
+        ):
+            self.context.cpu_buffers[name][slot].fill_(expert_id + offset * 10)
+        self.sync_count += 1
+        self.pending = None
+
+
+class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
+    def setUp(self):
+        kt_ep_wrapper._SHARED_FULL_CONTEXT = None
+        _FakeSharedMemory.instances.clear()
+
+    def test_generic_host_transport_allocates_exactly_two_expert_slots(self):
+        context = object.__new__(kt_ep_wrapper.SharedFullContext)
+        context.gpu_layer = SimpleNamespace(
+            num_experts=3,
+            w13_weight=_TensorMetadata((3, 4, 5), torch.float8_e4m3fn),
+            w13_weight_scale_inv=_TensorMetadata((3, 1, 1), torch.float32),
+            w2_weight=_TensorMetadata((3, 5, 2), torch.float8_e4m3fn),
+            w2_weight_scale_inv=_TensorMetadata((3, 1, 1), torch.float32),
+        )
+        context._is_mxfp4_quant = False
+        context._is_mxfp8_quant = False
+        context._is_fp8_quant = True
+        context._is_fp8_channel_quant = False
+        context._is_bf16_quant = False
+        context._commit_cpu_buffer_phase = mock.Mock()
+        context._collect_all_rank_buffer_pointers = mock.Mock(
+            return_value={name: [index + 1] for index, name in enumerate(
+                kt_ep_wrapper.SharedFullContext.WEIGHT_NAMES_FP8
+            )}
+        )
+        fake_numa = SimpleNamespace(
+            numa_available=lambda: 0,
+            numa_set_localalloc=lambda: None,
+        )
+
+        with (
+            mock.patch.object(kt_ep_wrapper.ctypes, "CDLL", return_value=fake_numa),
+            mock.patch.object(
+                kt_ep_wrapper.shared_memory,
+                "SharedMemory",
+                side_effect=_FakeSharedMemory,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_rank",
+                return_value=0,
             ),
             mock.patch.object(
                 kt_ep_wrapper,
                 "get_tensor_model_parallel_world_size",
-                return_value=2,
+                return_value=1,
+            ),
+            mock.patch.object(kt_ep_wrapper.dist, "is_initialized", return_value=False),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+        ):
+            context._create_cpu_buffers()
+
+        expected_shapes = {
+            "w13_weight": (2, 4, 5),
+            "w13_weight_scale_inv": (2, 1, 1),
+            "w2_weight": (2, 5, 2),
+            "w2_weight_scale_inv": (2, 1, 1),
+        }
+        self.assertEqual(set(context.cpu_buffers), set(expected_shapes))
+        for name, expected_shape in expected_shapes.items():
+            self.assertEqual(tuple(context.cpu_buffers[name].shape), expected_shape)
+        self.assertEqual(len(_FakeSharedMemory.instances), 4)
+        self.assertTrue(all(item.unlinked for item in _FakeSharedMemory.instances))
+
+    def test_exact_glm_transport_reuses_two_persistent_host_slot_events(self):
+        context = object.__new__(kt_ep_wrapper.SharedFullContext)
+        context._glm5_next_fp8_transport_initialized = True
+        context._glm5_next_fp8_copy_stream = _FakeCudaStream()
+        context._glm5_next_fp8_host_slot_events = (
+            _FakeCudaEvent(),
+            _FakeCudaEvent(),
+        )
+        context._glm5_next_fp8_host_slot_was_used = [False, False]
+        context._glm5_next_fp8_transport_status = None
+        context.gpu_layer = SimpleNamespace(num_experts=4)
+        context.cpu_buffers = {}
+        context.all_rank_buffer_ptrs = {}
+        for name in kt_ep_wrapper.SharedFullContext.WEIGHT_NAMES_FP8:
+            cpu_buffer = torch.empty((2, 1), dtype=torch.float32)
+            gpu_tensor = torch.empty((4, 1), dtype=torch.float32)
+            context.cpu_buffers[name] = cpu_buffer
+            context.all_rank_buffer_ptrs[name] = [cpu_buffer.data_ptr()]
+            setattr(context.gpu_layer, name, gpu_tensor)
+
+        writer = _FakeFp8Writer(context)
+        current_stream = _FakeCudaStream()
+        with (
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_rank",
+                return_value=0,
             ),
             mock.patch.object(
-                kt_ep_wrapper.dist,
-                "all_gather_object",
-                side_effect=inject_peer_drift,
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_world_size",
+                return_value=1,
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "stream",
+                side_effect=lambda _stream: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "current_stream",
+                return_value=current_stream,
             ),
         ):
-            with self.assertRaisesRegex(RuntimeError, "contract mismatch"):
-                manager.validate_tp_contract()
+            context._prepare_weight_fp8_glm5_next(writer)
 
-    def test_tp_contract_rejects_processed_or_repacked_original_gpu_tensor(self):
-        signature = ("glm", "raw-original")
-        names = kt_ep_wrapper._Glm5NextFp8PrefillSlot.RAW_NAMES
-        original_layer = SimpleNamespace(
-            **{name: torch.empty(1) for name in names}
-        )
-        original_layer.w13_weight = torch.empty(1, dtype=torch.int32)
-        method = SimpleNamespace(
-            gpu_experts_mask=torch.tensor([True, False]),
-            logical_to_gpu_index=torch.tensor([0, -1], dtype=torch.int32),
-            num_gpu_experts=1,
-            global_num_experts=2,
-            _full_init_args=(4, 2, torch.bfloat16),
-            kt_config=SimpleNamespace(weight_path="weights"),
-        )
-        kt_ep_wrapper._GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY[signature] = {
-            3: (method, original_layer)
-        }
-        manager = object.__new__(
-            kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-        )
-        manager.signature = signature
-        manager.device = torch.device("cpu")
-        manager.slots = (
-            SimpleNamespace(**{name: torch.empty(1) for name in names}),
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "failed to build") as raised:
-            manager.validate_tp_contract()
-        self.assertIn("dtype mismatch", str(raised.exception.__cause__))
-
-    def test_transport_control_disables_resource_tracking_when_supported(self):
-        opener = mock.Mock(return_value="untracked")
-        with mock.patch.object(kt_ep_wrapper.shared_memory, "SharedMemory", opener):
-            result = (
-                kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-                ._open_transport_shared_memory(name="control", create=False)
-            )
-
-        self.assertEqual(result, "untracked")
-        opener.assert_called_once_with(
-            name="control", create=False, track=False
-        )
-
-    def test_transport_control_tracking_fallback_is_for_old_python_only(self):
-        opener = mock.Mock(side_effect=[TypeError("no track"), "tracked"])
-        with mock.patch.object(kt_ep_wrapper.shared_memory, "SharedMemory", opener):
-            result = (
-                kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager
-                ._open_transport_shared_memory(name="control", create=False)
-            )
-
-        self.assertEqual(result, "tracked")
-        self.assertEqual(
-            opener.call_args_list,
-            [
-                mock.call(name="control", create=False, track=False),
-                mock.call(name="control", create=False),
-            ],
-        )
-
-    def test_bind_selects_only_the_four_stable_raw_tensors(self):
-        names = kt_ep_wrapper._Glm5NextFp8PrefillSlot.RAW_NAMES
-        old = {name: torch.nn.Parameter(torch.zeros(1)) for name in names}
-        new = {name: torch.nn.Parameter(torch.ones(1)) for name in names}
-        layer = SimpleNamespace(**old)
-        manager = object.__new__(kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager)
-        manager.context = SimpleNamespace(gpu_layer=layer)
-
-        manager._bind_slot(SimpleNamespace(**new))
-
-        for name in names:
-            self.assertIs(getattr(layer, name), new[name])
-        self.assertFalse(hasattr(layer, "_v4_marlin_weights"))
-
-    def test_writer_abi_uses_fp8_and_fp32_host_slot_offsets(self):
-        class HostBuffer:
-            def __init__(self, numel, element_size):
-                self._numel = numel
-                self._element_size = element_size
-
-            def numel(self):
-                return self._numel
-
-            def element_size(self):
-                return self._element_size
-
-        names = kt_ep_wrapper._Glm5NextFp8PrefillSlot.RAW_NAMES
-        buffers = {
-            names[0]: HostBuffer(200, 1),
-            names[1]: HostBuffer(80, 4),
-            names[2]: HostBuffer(120, 1),
-            names[3]: HostBuffer(40, 4),
-        }
-        pointers = {
-            name: [1000 + index * 100, 2000 + index * 100]
-            for index, name in enumerate(names)
-        }
-        manager = object.__new__(kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager)
-        manager.context = SimpleNamespace(
-            cpu_buffers=buffers, all_rank_buffer_ptrs=pointers
-        )
-        wrapper = mock.Mock()
-        method = SimpleNamespace(wrapper=wrapper)
-
-        with mock.patch.object(
-            kt_ep_wrapper, "get_tensor_model_parallel_world_size", return_value=2
+        self.assertEqual(writer.submitted, [(1, 0), (1, 1), (1, 2), (1, 3)])
+        self.assertEqual(writer.sync_count, 4)
+        for offset, name in enumerate(
+            kt_ep_wrapper.SharedFullContext.WEIGHT_NAMES_FP8
         ):
-            manager._submit_host_write(method, expert_id=17, host_slot=1)
-
-        args = wrapper.submit_write_weight_scale_to_buffer.call_args.args
-        self.assertEqual(args[:2], (2, 17))
-        for position, name in enumerate(names, 2):
-            offset = buffers[name].numel() // 2 * buffers[name].element_size()
-            self.assertEqual(
-                args[position], [pointer + offset for pointer in pointers[name]]
+            expected = torch.arange(4, dtype=torch.float32) + offset * 10
+            torch.testing.assert_close(
+                getattr(context.gpu_layer, name).flatten(), expected
             )
-        wrapper.sync_write_weight_scale_to_buffer.assert_called_once_with()
+        event0, event1 = context._glm5_next_fp8_host_slot_events
+        self.assertEqual(event0.record_count, 2)
+        self.assertEqual(event1.record_count, 2)
+        self.assertEqual(event0.synchronize_count, 1)
+        self.assertEqual(event1.synchronize_count, 1)
+        self.assertEqual(context._glm5_next_fp8_copy_stream.synchronize_count, 1)
 
+    def test_tp4_fp8_geometry_and_single_full_layer_slot_bytes(self):
+        num_experts = 288
+        hidden_size = 4096
+        global_intermediate_size = 2048
+        tp_size = 4
+        block_size = 128
+        intermediate_size = global_intermediate_size // tp_size
 
-class TestGlm5NextFp8AllocationContracts(unittest.TestCase):
-    def setUp(self):
-        kt_ep_wrapper._GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY.clear()
-        kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS.clear()
-
-    def test_exact_two_slot_capacity_is_reserved_before_kv_profile(self):
-        one_slot = kt_ep_wrapper._glm5_next_fp8_raw_slot_storage_nbytes(
-            num_experts=288,
-            hidden_size=4096,
-            intermediate_size=256,
-        )
-        self.assertEqual(one_slot, 906_190_848)
-        self.assertEqual(2 * one_slot, 1_812_381_696)
-
-        model_runner_source = (
-            Path(__file__).resolve().parents[2]
-            / "python/sglang/srt/model_executor/model_runner.py"
-        ).read_text(encoding="utf-8")
-        allocation_pos = model_runner_source.index(
-            "initialize_glm5_next_fp8_layerwise_prefill()"
-        )
-        pool_pos = model_runner_source.index("self.init_memory_pool()", allocation_pos)
-        self.assertLess(allocation_pos, pool_pos)
-
-    def test_registry_requires_all_42_exact_checkpoint_moe_layers(self):
-        mask = torch.zeros(288, dtype=torch.bool)
-        mask[:4] = True
-        mapping = torch.full((288,), -1, dtype=torch.int32)
-        mapping[:4] = torch.arange(4, dtype=torch.int32)
-        method = SimpleNamespace(
-            kt_config=SimpleNamespace(
-                is_glm5_next=True,
-                method="FP8",
-                num_layers=45,
-                kt_enable_dynamic_expert_update=False,
+        self.assertEqual(intermediate_size, 512)
+        gpu_tensors = {
+            "w13_weight": _TensorMetadata(
+                (num_experts, 2 * intermediate_size, hidden_size),
+                torch.float8_e4m3fn,
             ),
-            gpu_prefill_token_threshold=1,
-            tp_rank=0,
-            global_num_experts=288,
-            _full_init_args=(4096, 256, torch.bfloat16),
-            gpu_experts_mask=mask,
-            logical_to_gpu_index=mapping,
-            num_gpu_experts=4,
-        )
-        complete = {idx: (method, object()) for idx in range(3, 45)}
-        kt_ep_wrapper._validate_glm5_next_fp8_registry(("glm",), complete)
-
-        incomplete = dict(complete)
-        incomplete.pop(44)
-        with self.assertRaisesRegex(RuntimeError, "every MoE layer 3..44"):
-            kt_ep_wrapper._validate_glm5_next_fp8_registry(("glm",), incomplete)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "requires a CUDA device")
-    def test_registry_validates_cuda_resident_mask_and_mapping(self):
-        device = torch.device("cuda", torch.cuda.current_device())
-        mask = torch.zeros(288, dtype=torch.bool, device=device)
-        mask[:4] = True
-        mapping = torch.full((288,), -1, dtype=torch.int32, device=device)
-        mapping[:4] = torch.arange(4, dtype=torch.int32, device=device)
-        method = SimpleNamespace(
-            kt_config=SimpleNamespace(
-                is_glm5_next=True,
-                method="FP8",
-                num_layers=45,
-                kt_enable_dynamic_expert_update=False,
+            "w13_weight_scale_inv": _TensorMetadata(
+                (
+                    num_experts,
+                    math.ceil(2 * intermediate_size / block_size),
+                    math.ceil(hidden_size / block_size),
+                ),
+                torch.float32,
             ),
-            gpu_prefill_token_threshold=1,
-            tp_rank=0,
-            global_num_experts=288,
-            _full_init_args=(4096, 256, torch.bfloat16),
-            gpu_experts_mask=mask,
-            logical_to_gpu_index=mapping,
-            num_gpu_experts=4,
-        )
-        complete = {idx: (method, object()) for idx in range(3, 45)}
-
-        kt_ep_wrapper._validate_glm5_next_fp8_registry(("glm",), complete)
-
-    def test_context_accepts_only_raw_e4m3_and_fp32_128_scales(self):
-        class TensorMetadata:
-            def __init__(self, shape, dtype):
-                self.shape = shape
-                self.dtype = dtype
-
-        layer = SimpleNamespace(
-            w13_weight=TensorMetadata((288, 512, 4096), torch.float8_e4m3fn),
-            w13_weight_scale_inv=TensorMetadata((288, 4, 32), torch.float32),
-            w2_weight=TensorMetadata((288, 4096, 256), torch.float8_e4m3fn),
-            w2_weight_scale_inv=TensorMetadata((288, 32, 2), torch.float32),
-            moe_runner_config=SimpleNamespace(
-                glm5_next_hf_two_round_swiglu=True
+            "w2_weight": _TensorMetadata(
+                (num_experts, hidden_size, intermediate_size),
+                torch.float8_e4m3fn,
             ),
-        )
+            "w2_weight_scale_inv": _TensorMetadata(
+                (
+                    num_experts,
+                    math.ceil(hidden_size / block_size),
+                    math.ceil(intermediate_size / block_size),
+                ),
+                torch.float32,
+            ),
+        }
+        host_buffers = {
+            name: _TensorMetadata((2, *tensor.shape[1:]), tensor.dtype)
+            for name, tensor in gpu_tensors.items()
+        }
         context = SimpleNamespace(
             _is_fp8_quant=True,
+            _glm5_next_fp8_transport_initialized=True,
+            _glm5_next_fp8_copy_stream=object(),
+            _glm5_next_fp8_host_slot_events=(object(), object()),
             _get_base_quant_method=lambda: SimpleNamespace(
                 block_quant=True,
                 use_mxfp8=False,
@@ -885,133 +650,66 @@ class TestGlm5NextFp8AllocationContracts(unittest.TestCase):
                     runner_backend=SimpleNamespace(is_triton=lambda: True)
                 ),
             ),
-            gpu_layer=layer,
-        )
-        kt_ep_wrapper._validate_glm5_next_fp8_context(context)
-
-        layer.moe_runner_config.glm5_next_hf_two_round_swiglu = False
-        with self.assertRaisesRegex(RuntimeError, "private HF two-round"):
-            kt_ep_wrapper._validate_glm5_next_fp8_context(context)
-        layer.moe_runner_config.glm5_next_hf_two_round_swiglu = True
-
-        layer.w2_weight_scale_inv.dtype = torch.bfloat16
-        with self.assertRaisesRegex(RuntimeError, "dtype mismatch"):
-            kt_ep_wrapper._validate_glm5_next_fp8_context(context)
-
-        layer.w2_weight_scale_inv.dtype = torch.float32
-        context._get_base_quant_method = lambda: SimpleNamespace(
-            block_quant=True,
-            use_mxfp8=False,
-            weight_block_size=[128, 128],
-            runner=SimpleNamespace(
-                runner_backend=SimpleNamespace(is_triton=lambda: False)
+            gpu_layer=SimpleNamespace(
+                num_experts=num_experts,
+                moe_runner_config=SimpleNamespace(
+                    glm5_next_hf_two_round_swiglu=True
+                ),
+                **gpu_tensors,
             ),
+            cpu_buffers=host_buffers,
         )
-        with self.assertRaisesRegex(RuntimeError, "Triton MoE runner"):
-            kt_ep_wrapper._validate_glm5_next_fp8_context(context)
 
-    def test_tp0_writer_abi_is_probed_before_serving(self):
-        complete_wrapper = SimpleNamespace(
-            submit_write_weight_scale_to_buffer=lambda *_args: None,
-            sync_write_weight_scale_to_buffer=lambda: None,
-            moe=SimpleNamespace(write_weight_scale_to_buffer_task=object()),
-        )
-        registry = {
-            3: (SimpleNamespace(wrapper=complete_wrapper), object())
-        }
         with mock.patch.object(
-            kt_ep_wrapper, "get_tensor_model_parallel_rank", return_value=0
+            kt_ep_wrapper,
+            "get_tensor_model_parallel_world_size",
+            return_value=4,
         ):
-            kt_ep_wrapper._validate_glm5_next_fp8_writer_abi(registry)
-
-            incomplete = {
-                3: (
-                    SimpleNamespace(
-                        wrapper=SimpleNamespace(
-                            submit_write_weight_scale_to_buffer=lambda *_args: None,
-                            sync_write_weight_scale_to_buffer=lambda: None,
-                            moe=object(),
-                        )
-                    ),
-                    object(),
+            gpu_slot_bytes, host_buffer_bytes = (
+                kt_ep_wrapper._validate_glm5_next_fp8_shared_full_context(
+                    context
                 )
-            }
-            with self.assertRaisesRegex(
-                RuntimeError, "write_weight_scale_to_buffer_task"
-            ):
-                kt_ep_wrapper._validate_glm5_next_fp8_writer_abi(incomplete)
+            )
+        self.assertEqual(gpu_slot_bytes, 1_812_381_696)
+        self.assertEqual(host_buffer_bytes, 12_585_984)
 
-        with mock.patch.object(
-            kt_ep_wrapper, "get_tensor_model_parallel_rank", return_value=1
-        ):
-            kt_ep_wrapper._validate_glm5_next_fp8_writer_abi(incomplete)
-
-    def test_startup_oom_is_fatal_and_does_not_register_manager(self):
-        signature = ("glm", "oom")
-        mask = torch.zeros(288, dtype=torch.bool)
-        mapping = torch.full((288,), -1, dtype=torch.int32)
-        method = SimpleNamespace(
-            kt_config=SimpleNamespace(
-                is_glm5_next=True,
-                method="FP8",
-                num_layers=45,
-                kt_enable_dynamic_expert_update=False,
-            ),
-            gpu_prefill_token_threshold=1,
-            _full_init_args=(4096, 256, torch.bfloat16),
-            global_num_experts=288,
-            moe_runner_config=object(),
-            tp_rank=0,
-            gpu_experts_mask=mask,
-            logical_to_gpu_index=mapping,
-            num_gpu_experts=0,
+        context.cpu_buffers["w13_weight"] = _TensorMetadata(
+            (1, *gpu_tensors["w13_weight"].shape[1:]), torch.float8_e4m3fn
         )
-        registry = {idx: (method, object()) for idx in range(3, 45)}
         with (
-            mock.patch.object(torch.cuda, "is_available", return_value=True),
             mock.patch.object(
                 kt_ep_wrapper,
                 "get_tensor_model_parallel_world_size",
-                return_value=8,
+                return_value=4,
             ),
-            mock.patch.object(
-                kt_ep_wrapper,
-                "SharedFullContext",
-                side_effect=torch.cuda.OutOfMemoryError("slot 0"),
-            ) as context_ctor,
-            mock.patch.object(torch.cuda, "empty_cache"),
+            self.assertRaisesRegex(
+                RuntimeError, "exactly two expert Host slots"
+            ),
         ):
-            with self.assertRaisesRegex(RuntimeError, "refusing.*fallback"):
-                kt_ep_wrapper._initialize_glm5_next_fp8_layerwise_pipeline(
-                    signature, registry
-                )
+            kt_ep_wrapper._validate_glm5_next_fp8_shared_full_context(context)
 
-        context_ctor.assert_called_once()
-        self.assertNotIn(signature, kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS)
+    def test_private_glm_two_slot_pipeline_symbols_are_gone(self):
+        removed_symbols = (
+            "_GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY",
+            "_GLM5_NEXT_FP8_LAYERWISE_MANAGERS",
+            "_Glm5NextFp8PrefillSlot",
+            "_Glm5NextFp8LayerwisePrefillManager",
+            "_register_glm5_next_fp8_prefill_layer",
+            "_initialize_glm5_next_fp8_layerwise_pipeline",
+            "initialize_glm5_next_fp8_layerwise_prefill",
+            "_get_glm5_next_fp8_layerwise_manager",
+        )
+        for symbol in removed_symbols:
+            with self.subTest(symbol=symbol):
+                self.assertFalse(hasattr(kt_ep_wrapper, symbol))
 
-    def test_glm_manager_and_registry_are_not_mxfp4_state(self):
-        self.assertIsNot(
-            kt_ep_wrapper._GLM5_NEXT_FP8_PREFILL_LAYER_REGISTRY,
-            kt_ep_wrapper._MXFP4_PREFILL_LAYER_REGISTRY,
+        model_runner_source = (
+            Path(__file__).resolve().parents[2]
+            / "python/sglang/srt/model_executor/model_runner.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "initialize_glm5_next_fp8_layerwise_prefill", model_runner_source
         )
-        self.assertIsNot(
-            kt_ep_wrapper._GLM5_NEXT_FP8_LAYERWISE_MANAGERS,
-            kt_ep_wrapper._MXFP4_LAYERWISE_MANAGERS,
-        )
-        self.assertFalse(
-            issubclass(
-                kt_ep_wrapper._Glm5NextFp8LayerwisePrefillManager,
-                kt_ep_wrapper._Mxfp4LayerwisePrefillManager,
-            )
-        )
-
-    def test_initializer_has_no_lazy_or_disabled_fallback_branch(self):
-        source = inspect.getsource(
-            kt_ep_wrapper._initialize_glm5_next_fp8_layerwise_pipeline
-        )
-        self.assertNotIn("_MXFP4", source)
-        self.assertNotIn("DISABLED_REASONS", source)
-        self.assertIn("refusing hybrid/serialized fallback", source)
 
 
 if __name__ == "__main__":

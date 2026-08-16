@@ -48,7 +48,7 @@ class _FakeSGLang:
             return b"# graph counter deliberately absent\nsglang:running_requests 0\n"
         value = 10 if self.metrics_calls == 1 else 73
         lines = ["# TYPE sglang:cuda_graph_passes_total counter"]
-        for rank in range(8):
+        for rank in range(4):
             lines.append(
                 "sglang:cuda_graph_passes_total"
                 f'{{mode="decode_cuda_graph",tp_rank="{rank}"}} {value}'
@@ -141,6 +141,7 @@ def _collect(tmp_path, *, mode="graph", expose_graph_counter=True):
 
 
 def test_fixtures_are_stable_distinct_and_exact_graph_buckets():
+    assert _args(Path("/tmp")).tp_size == 4
     first = ACCEPTANCE.build_fixtures(154880)
     second = ACCEPTANCE.build_fixtures(154880)
 
@@ -276,7 +277,7 @@ def test_mocked_http_graph_acceptance_covers_exact_a_poison_a_contract(tmp_path)
 
     gate = payload["metrics"]["decode_cuda_graph_gate"]
     assert gate["pass"]
-    assert gate["delta"] == 504
+    assert gate["delta"] == 252
     assert all(item["graph_delta"] == 63 for item in gate["per_rank"].values())
     assert all(item["decode_none_delta"] == 0 for item in gate["per_rank"].values())
     assert gate["source"] == "HTTP /metrics only"

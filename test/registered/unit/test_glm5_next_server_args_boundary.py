@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SERVER_ARGS_PATH = REPO_ROOT / "python/sglang/srt/server_args.py"
+MODEL_RUNNER_PATH = REPO_ROOT / "python/sglang/srt/model_executor/model_runner.py"
 NSA_BACKEND_PATH = REPO_ROOT / "python/sglang/srt/layers/attention/nsa_backend.py"
 
 
@@ -98,7 +99,7 @@ def _boundary_args(**overrides):
         dllm_algorithm=None,
         dllm_algorithm_config=None,
         quantization="fp8",
-        tp_size=1,
+        tp_size=4,
         pp_size=1,
         dp_size=1,
         moe_dp_size=1,
@@ -247,16 +248,14 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self.validate(_boundary_args(**overrides))
 
-    def test_only_tp1_structural_and_tp8_production_widths_are_accepted(self):
-        for tp_size in (1, 8):
-            with self.subTest(tp_size=tp_size):
-                args = _boundary_args(tp_size=tp_size)
-                self.validate(args)
-                self.assertEqual(args.tp_size, tp_size)
+    def test_only_tp4_width_is_accepted(self):
+        args = _boundary_args(tp_size=4)
+        self.validate(args)
+        self.assertEqual(args.tp_size, 4)
 
-        for tp_size in (2, 4, 16):
+        for tp_size in (1, 2, 8, 16):
             with self.subTest(tp_size=tp_size):
-                with self.assertRaisesRegex(ValueError, "TP=8 production"):
+                with self.assertRaisesRegex(ValueError, "only TP=4"):
                     self.validate(_boundary_args(tp_size=tp_size))
 
     def test_only_tensor_parallel_topology_is_accepted(self):
@@ -317,29 +316,19 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                         )
                     )
 
-    def test_layerwise_prefill_requires_tp8_and_static_experts(self):
+    def test_layerwise_prefill_requires_tp4_and_static_experts(self):
         accepted = _boundary_args(
-            tp_size=8,
+            tp_size=4,
             kt_weight_path="stub/experts",
             kt_method="fp8",
             kt_gpu_prefill_token_threshold=4096,
         )
         self.validate(accepted)
 
-        with self.assertRaisesRegex(ValueError, "requires TP=8"):
-            self.validate(
-                _boundary_args(
-                    tp_size=1,
-                    kt_weight_path="stub/experts",
-                    kt_method="fp8",
-                    kt_gpu_prefill_token_threshold=4096,
-                )
-            )
-
         with self.assertRaisesRegex(ValueError, "dynamic-expert-update"):
             self.validate(
                 _boundary_args(
-                    tp_size=8,
+                    tp_size=4,
                     kt_weight_path="stub/experts",
                     kt_method="fp8",
                     kt_gpu_prefill_token_threshold=4096,
@@ -347,13 +336,11 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 )
             )
 
-        structural = _boundary_args(
-            tp_size=1,
-            kt_weight_path="stub/experts",
-            kt_method="fp8",
-            kt_gpu_prefill_token_threshold=0,
-        )
-        self.validate(structural)
+    def test_glm_layerwise_context_is_not_eagerly_initialized_by_model_runner(self):
+        source = MODEL_RUNNER_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn("initialize_glm5_next_fp8_layerwise_prefill", source)
+        self.assertNotIn("glm5_next_fp8_layerwise_prefill_allocated_bytes", source)
 
 
 class TestGlm5NextSessionABNSA(unittest.TestCase):
@@ -540,7 +527,7 @@ class TestGlm5NextBoundaryIsolation(unittest.TestCase):
             args = _boundary_args(moe_runner_backend="triton" if exact_glm else backend)
             args.quantization = "fp8"
             args.ep_size = 1
-            args.tp_size = 1
+            args.tp_size = 4 if exact_glm else 1
             args._validate_glm5_next_session_ab_boundary = lambda: validate(args)
             if exact_glm:
                 validate(args)

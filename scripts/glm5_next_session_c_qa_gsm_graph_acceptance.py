@@ -12,14 +12,14 @@ Examples::
 
     python scripts/glm5_next_session_c_qa_gsm_graph_acceptance.py qa \
       --base-url http://127.0.0.1:30100 --model /mnt/models/GLM-5-Next-0808 \
-      --output /mnt/artifacts/qa.json --tp-size 8
+      --output /mnt/artifacts/qa.json --tp-size 4
 
     python scripts/glm5_next_session_c_qa_gsm_graph_acceptance.py gsm8k \
       --base-url http://127.0.0.1:30100 --data-path /mnt/data/test.jsonl \
       --result-file /mnt/artifacts/gsm/result.jsonl \
       --raw-result-file /mnt/artifacts/gsm/raw.jsonl \
       --work-dir /mnt/artifacts/gsm/work \
-      --output /mnt/artifacts/gsm/acceptance.json --tp-size 8
+      --output /mnt/artifacts/gsm/acceptance.json --tp-size 4
 """
 
 from __future__ import annotations
@@ -1250,7 +1250,7 @@ def _sha256(value: str) -> str:
 def _common_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--tp-size", type=_positive_int, default=8)
+    parser.add_argument("--tp-size", type=_positive_int, default=4)
     parser.add_argument(
         "--minimum-graph-delta-per-rank", type=_positive_float, default=1.0
     )

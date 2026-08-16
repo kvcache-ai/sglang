@@ -1393,15 +1393,13 @@ class ServerArgs:
                 f"FP8 weight format; got quantization={self.quantization!r}."
             )
 
-        # Session AB accepts TP=1 for structural/component validation and TP=8
-        # for the pinned production checkpoint.  Intermediate TP widths and
-        # alternate PP/DP/CP/EP topologies have no acceptance evidence, and
-        # the mHC communicator intentionally rejects the scattered states
-        # produced by A2A MoE and dense fully-DP modes.
-        if self.tp_size not in (1, 8):
+        # Session AB accepts only the TP=4 runtime layout.  Other TP widths and
+        # alternate PP/DP/CP/EP topologies are deliberately outside the
+        # released boundary.  The mHC communicator intentionally rejects the
+        # scattered states produced by A2A MoE and dense fully-DP modes.
+        if self.tp_size != 4:
             raise ValueError(
-                "GLM-5-Next Session AB accepts only TP=1 structural validation "
-                "or the TP=8 production topology; "
+                "GLM-5-Next Session AB accepts only TP=4; "
                 f"got tp_size={self.tp_size}."
             )
 
@@ -1485,19 +1483,17 @@ class ServerArgs:
                 )
 
             # The positive threshold enables GLM's layerwise full-GPU prefill
-            # route.  Its two-slot FP8 pipeline is accepted only for the TP=8
-            # production layout.  Dynamic expert replacement mutates the
-            # resident set behind those slots and is deliberately excluded.
+            # route.  It is supported only by the TP=4 runtime layout.
+            # Dynamic expert replacement mutates the resident set behind the
+            # shared context and is deliberately excluded.
             prefill_threshold = getattr(
                 self, "kt_gpu_prefill_token_threshold", None
             )
             if prefill_threshold is not None and prefill_threshold > 0:
-                if self.tp_size != 8:
+                if self.tp_size != 4:
                     raise ValueError(
                         "GLM-5-Next KT layerwise prefill "
-                        "(--kt-gpu-prefill-token-threshold > 0) requires TP=8; "
-                        "TP=1 is structural-test-only and must keep the "
-                        "threshold unset or <= 0."
+                        "(--kt-gpu-prefill-token-threshold > 0) requires TP=4."
                     )
                 if getattr(self, "kt_enable_dynamic_expert_update", False):
                     raise ValueError(
