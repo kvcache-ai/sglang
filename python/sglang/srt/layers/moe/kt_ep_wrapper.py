@@ -25,6 +25,11 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
         Force GPU-experts apply() to a zero return; routed expert output
         comes purely from the CPU side. "Plan-C" fallback for diagnosing
         whether a regression sits in the GPU MoE path or the merge math.
+
+    SGLANG_KT_GLM5_NEXT_FP8_TRANSPORT=auto|native|legacy
+        Select the exact GLM-5-Next TP4 block-FP8 layer transport. ``auto``
+        uses the native batch API when present and otherwise falls back before
+        the first load; a native runtime failure never falls back.
 """
 
 import bisect
@@ -36,6 +41,7 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -76,6 +82,45 @@ logger = logging.getLogger(__name__)
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
+
+_GLM5_NEXT_FP8_TRANSPORT_ENV = "SGLANG_KT_GLM5_NEXT_FP8_TRANSPORT"
+_GLM5_NEXT_FP8_TRANSPORT_MODES = frozenset(("auto", "native", "legacy"))
+_GLM5_NEXT_FP8_CONTROL_BYTES = 4096
+_GLM5_NEXT_FP8_TRANSPORT_TIMEOUT_MS = 60_000
+_GLM5_NEXT_FP8_MOE_LAYER_INDICES = tuple(range(3, 45))
+
+
+def _glm5_next_fp8_transport_mode() -> str:
+    """Return the requested GLM transport without silently accepting typos."""
+
+    mode = os.environ.get(_GLM5_NEXT_FP8_TRANSPORT_ENV, "auto").strip().lower()
+    if mode not in _GLM5_NEXT_FP8_TRANSPORT_MODES:
+        raise ValueError(
+            f"{_GLM5_NEXT_FP8_TRANSPORT_ENV} must be one of "
+            f"{sorted(_GLM5_NEXT_FP8_TRANSPORT_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
+def _load_glm5_next_fp8_native_transport_api():
+    """Feature-probe the optional native transport before allocating resources."""
+
+    try:
+        from kt_kernel import kt_kernel_ext
+    except ImportError as exc:
+        return None, f"kt_kernel_ext import failed: {exc}"
+
+    missing = [
+        name
+        for name in (
+            "initialize_fp8_layerwise_control",
+            "FP8LayerwiseTransport",
+        )
+        if not hasattr(kt_kernel_ext, name)
+    ]
+    if missing:
+        return None, "kt_kernel_ext is missing " + ", ".join(missing)
+    return kt_kernel_ext, None
 
 
 @dataclass
@@ -293,6 +338,11 @@ _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS = {}
+# Exact GLM-5-Next block-FP8 has a deliberately separate registry/control
+# plane.  Registration is harmless for ``legacy`` transport, while manager
+# construction is hard-gated on the native TP4/gpu_experts=0 runtime below.
+_GLM5_NEXT_FP8_NATIVE_PREFETCH_LAYER_REGISTRY = {}
+_GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS = {}
 
 
 class SharedStagingBuffer:
@@ -787,6 +837,8 @@ class SharedFullContext:
     def _cleanup_cpu_buffers_after_failure(self) -> None:
         """Best-effort symmetric cleanup for a failed SHM setup phase."""
 
+        self._close_glm5_next_fp8_transport()
+
         if torch.cuda.is_available():
             for tensor in getattr(self, "_registered_host_buffers", []):
                 try:
@@ -818,6 +870,18 @@ class SharedFullContext:
             except Exception:
                 pass
         self.shm_handles = {}
+
+    def close(self) -> None:
+        """Stop native workers before releasing their Host-buffer mappings."""
+
+        self._cleanup_cpu_buffers_after_failure()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            # Interpreter shutdown can tear down torch and logging first.
+            pass
 
     def _commit_cpu_buffer_phase(
         self, local_error: Optional[Exception], phase: str
@@ -1162,8 +1226,301 @@ class SharedFullContext:
         w13_p.set_(w13_p.view(num_experts, w13_k // 16, w13_n * (num_bits // 2)))
         w2_p.set_(w2_p.view(num_experts, w2_k // 16, w2_n * (num_bits // 2)))
 
-    def _initialize_glm5_next_fp8_transport(self) -> None:
-        """Create the exact-GLM transport resources once per shared context."""
+    def _close_glm5_next_fp8_transport(self) -> None:
+        """Best-effort teardown; native workers must stop before SHM closes."""
+
+        # A successor task may be blocked in an event fence or native
+        # join/run/wait.  It owns the last possible access to both the Host
+        # slots and transport handle, so join it before closing either.
+        prefetch_manager = getattr(
+            self, "_glm5_next_fp8_native_prefetch_manager", None
+        )
+        self._glm5_next_fp8_native_prefetch_manager = None
+        if prefetch_manager is not None:
+            try:
+                prefetch_manager.close()
+            except Exception:
+                pass
+
+        transport = getattr(self, "_glm5_next_fp8_native_transport", None)
+        self._glm5_next_fp8_native_transport = None
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+        if getattr(self, "_glm5_next_fp8_transport_backend", None) == "legacy":
+            copy_stream = getattr(self, "_glm5_next_fp8_copy_stream", None)
+            if copy_stream is not None:
+                try:
+                    copy_stream.synchronize()
+                except Exception:
+                    pass
+
+        control_shm = getattr(self, "_glm5_next_fp8_control_shm", None)
+        self._glm5_next_fp8_control_shm = None
+        if control_shm is not None:
+            if getattr(self, "_glm5_next_fp8_control_owner", False):
+                try:
+                    control_shm.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+            try:
+                control_shm.close()
+            except Exception:
+                pass
+
+        self._glm5_next_fp8_transport_initialized = False
+        self._glm5_next_fp8_transport_backend = None
+
+    @staticmethod
+    def _tp_all_gather_object(value):
+        if (
+            not dist.is_initialized()
+            or get_tensor_model_parallel_world_size() == 1
+        ):
+            return [value]
+        values = [None] * get_tensor_model_parallel_world_size()
+        dist.all_gather_object(
+            values, value, group=get_tp_group().cpu_group
+        )
+        return values
+
+    def _glm5_next_fp8_pointer_layout(self):
+        """Build the ABI-ordered raw pointer arrays consumed by native code."""
+
+        names = tuple(self.WEIGHT_NAMES_FP8)
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        expert_nbytes = [
+            self.cpu_buffers[name].numel()
+            // 2
+            * self.cpu_buffers[name].element_size()
+            for name in names
+        ]
+        local_host_ptrs = [
+            int(self.cpu_buffers[name].data_ptr() + slot * expert_nbytes[index])
+            for slot in range(2)
+            for index, name in enumerate(names)
+        ]
+        gpu_tensors = [getattr(self.gpu_layer, name) for name in names]
+        for index, (name, tensor) in enumerate(zip(names, gpu_tensors)):
+            if not tensor.is_contiguous():
+                raise RuntimeError(
+                    "GLM-5-Next native transport requires expert-major "
+                    f"contiguous GPU tensor {name}, got stride={tensor.stride()}"
+                )
+            if tensor.shape[0] != self.gpu_layer.num_experts:
+                raise RuntimeError(
+                    "GLM-5-Next native transport GPU tensor has an invalid "
+                    f"expert axis: {name} shape={tuple(tensor.shape)}"
+                )
+            expected_nbytes = expert_nbytes[index]
+            actual_nbytes = tensor.numel() // tensor.shape[0] * tensor.element_size()
+            if actual_nbytes != expected_nbytes:
+                raise RuntimeError(
+                    "GLM-5-Next native transport Host/GPU expert stride "
+                    f"mismatch for {name}: host={expected_nbytes}, gpu={actual_nbytes}"
+                )
+        local_gpu_ptrs = [int(tensor.data_ptr()) for tensor in gpu_tensors]
+        all_rank_host_ptrs = []
+        if tp_rank == 0:
+            all_rank_host_ptrs = [
+                int(
+                    self.all_rank_buffer_ptrs[name][rank]
+                    + slot * expert_nbytes[index]
+                )
+                for slot in range(2)
+                for rank in range(tp_size)
+                for index, name in enumerate(names)
+            ]
+
+        if len(local_host_ptrs) != 8 or len(local_gpu_ptrs) != 4:
+            raise RuntimeError("invalid GLM-5-Next native pointer layout")
+        if tp_rank == 0 and len(all_rank_host_ptrs) != 2 * tp_size * 4:
+            raise RuntimeError("invalid GLM-5-Next all-rank Host pointer layout")
+        if any(pointer <= 0 for pointer in local_host_ptrs + local_gpu_ptrs):
+            raise RuntimeError("GLM-5-Next native transport received a null pointer")
+        if tp_rank == 0 and any(pointer <= 0 for pointer in all_rank_host_ptrs):
+            raise RuntimeError(
+                "GLM-5-Next native transport could not map every TP Host slot"
+            )
+        return (
+            local_host_ptrs,
+            local_gpu_ptrs,
+            all_rank_host_ptrs,
+            expert_nbytes,
+        )
+
+    def _initialize_glm5_next_fp8_native_transport(self, kt_kernel_ext) -> None:
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        control_name = f"kt_glm5_next_fp8_ctrl_{self.shm_unique_id}"
+        self._glm5_next_fp8_control_shm = None
+        self._glm5_next_fp8_control_owner = tp_rank == 0
+        self._glm5_next_fp8_native_transport = None
+
+        create_error = None
+        if tp_rank == 0:
+            try:
+                control_shm = shared_memory.SharedMemory(
+                    name=control_name,
+                    create=True,
+                    size=_GLM5_NEXT_FP8_CONTROL_BYTES,
+                )
+                self._glm5_next_fp8_control_shm = control_shm
+                control_ptr = ctypes.addressof(
+                    ctypes.c_char.from_buffer(control_shm.buf)
+                )
+                kt_kernel_ext.initialize_fp8_layerwise_control(
+                    control_ptr,
+                    _GLM5_NEXT_FP8_CONTROL_BYTES,
+                    tp_size,
+                )
+            except Exception as exc:
+                create_error = exc
+        self._commit_cpu_buffer_phase(create_error, "native control creation")
+
+        map_error = None
+        if tp_rank != 0:
+            try:
+                self._glm5_next_fp8_control_shm = shared_memory.SharedMemory(
+                    name=control_name,
+                    create=False,
+                )
+            except Exception as exc:
+                map_error = exc
+        self._commit_cpu_buffer_phase(map_error, "native control mapping")
+
+        handle_error = None
+        try:
+            control_shm = self._glm5_next_fp8_control_shm
+            if control_shm is None:
+                raise RuntimeError("native control SHM is not mapped")
+            control_ptr = ctypes.addressof(
+                ctypes.c_char.from_buffer(control_shm.buf)
+            )
+            (
+                local_host_ptrs,
+                local_gpu_ptrs,
+                all_rank_host_ptrs,
+                expert_nbytes,
+            ) = self._glm5_next_fp8_pointer_layout()
+            device = self.gpu_layer.w13_weight.device
+            cuda_device = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
+            self._glm5_next_fp8_native_transport = (
+                kt_kernel_ext.FP8LayerwiseTransport(
+                    control_ptr,
+                    _GLM5_NEXT_FP8_CONTROL_BYTES,
+                    tp_rank,
+                    tp_size,
+                    cuda_device,
+                    local_host_ptrs,
+                    local_gpu_ptrs,
+                    all_rank_host_ptrs,
+                    expert_nbytes,
+                    self.gpu_layer.num_experts,
+                    _GLM5_NEXT_FP8_TRANSPORT_TIMEOUT_MS,
+                )
+            )
+            # The native handle stores these destination addresses for its
+            # lifetime.  Exact-native loads reject any later rebind instead
+            # of silently writing an obsolete allocation.
+            self._glm5_next_fp8_native_gpu_ptrs = tuple(local_gpu_ptrs)
+        except Exception as exc:
+            handle_error = exc
+        self._commit_cpu_buffer_phase(handle_error, "native handle creation")
+
+        # Every process now owns a mapping. Remove the name immediately so a
+        # crashed server cannot strand a persistent control object in /dev/shm.
+        if tp_rank == 0:
+            try:
+                self._glm5_next_fp8_control_shm.unlink()
+            except FileNotFoundError:
+                pass
+        self._glm5_next_fp8_transport_epoch = 0
+        self._glm5_next_fp8_transport_poisoned = False
+        self._glm5_next_fp8_transport_backend = "native"
+        self._glm5_next_fp8_transport_initialized = True
+
+    def _initialize_glm5_next_fp8_transport(
+        self, wrapper=None, num_gpu_experts: int = 0
+    ) -> None:
+        """Select and initialize the exact-GLM transport once per context."""
+
+        if getattr(self, "_glm5_next_fp8_transport_initialized", False):
+            return
+        if get_tensor_model_parallel_world_size() != 4:
+            raise RuntimeError(
+                "GLM-5-Next layerwise prefill transport requires TP=4"
+            )
+        gpu_expert_counts = self._tp_all_gather_object(int(num_gpu_experts))
+        if any(count != gpu_expert_counts[0] for count in gpu_expert_counts):
+            raise RuntimeError(
+                "GLM-5-Next gpu_experts differs across TP ranks: "
+                f"{gpu_expert_counts}"
+            )
+        if gpu_expert_counts[0] != 0:
+            raise RuntimeError(
+                "GLM-5-Next layerwise prefill transport requires "
+                "gpu_experts=0"
+            )
+
+        raw_mode = os.environ.get(
+            _GLM5_NEXT_FP8_TRANSPORT_ENV, "auto"
+        ).strip().lower()
+        requested_modes = self._tp_all_gather_object(raw_mode)
+        if any(mode != requested_modes[0] for mode in requested_modes):
+            raise RuntimeError(
+                f"{_GLM5_NEXT_FP8_TRANSPORT_ENV} differs across TP ranks: "
+                f"{requested_modes}"
+            )
+        requested_mode = _glm5_next_fp8_transport_mode()
+
+        if requested_mode == "legacy":
+            self._initialize_glm5_next_fp8_legacy_transport()
+            return
+
+        kt_kernel_ext, missing_reason = (
+            _load_glm5_next_fp8_native_transport_api()
+        )
+        tp_rank = get_tensor_model_parallel_rank()
+        if tp_rank == 0 and not callable(
+            getattr(getattr(wrapper, "moe", None), "run_layerwise_fp8_batch", None)
+        ):
+            missing_reason = (
+                "KT FP8 writer is missing the direct native "
+                "moe.run_layerwise_fp8_batch API"
+            )
+        missing_reasons = self._tp_all_gather_object(missing_reason)
+        missing_reasons = [reason for reason in missing_reasons if reason]
+        if missing_reasons:
+            details = "; ".join(dict.fromkeys(missing_reasons))
+            if requested_mode == "native":
+                raise RuntimeError(
+                    "GLM-5-Next native FP8 transport was forced but is "
+                    f"unavailable: {details}"
+                )
+            if tp_rank == 0:
+                logger.warning(
+                    "KT GLM-5-Next native FP8 transport API is unavailable; "
+                    "falling back to legacy before the first layer load: %s",
+                    details,
+                )
+            self._initialize_glm5_next_fp8_legacy_transport()
+            return
+
+        self._initialize_glm5_next_fp8_native_transport(kt_kernel_ext)
+
+    def _initialize_glm5_next_fp8_legacy_transport(self) -> None:
+        """Create the legacy Python per-expert transport resources."""
 
         if getattr(self, "_glm5_next_fp8_transport_initialized", False):
             return
@@ -1179,10 +1536,12 @@ class SharedFullContext:
             if dist.is_initialized()
             else None
         )
+        self._glm5_next_fp8_transport_backend = "legacy"
+        self._glm5_next_fp8_transport_poisoned = False
         self._glm5_next_fp8_transport_initialized = True
 
-    def _prepare_weight_fp8_glm5_next(self, wrapper) -> None:
-        """Load one GLM layer with 2 Host expert slots and 1 GPU layer slot."""
+    def _prepare_weight_fp8_glm5_next_legacy(self, wrapper) -> None:
+        """Legacy Python per-expert writer/copy loop retained for A/B tests."""
 
         if not getattr(self, "_glm5_next_fp8_transport_initialized", False):
             raise RuntimeError(
@@ -1314,8 +1673,178 @@ class SharedFullContext:
 
         torch.cuda.current_stream(device).wait_stream(copy_stream)
 
-    def _prepare_weight_fp8(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                            logical_to_gpu_index=None):
+    def _prepare_weight_fp8_glm5_next_native(
+        self, wrapper, layer_idx: int
+    ) -> None:
+        """Run one complete layer transport without a Python expert loop."""
+
+        if getattr(self, "_glm5_next_fp8_transport_poisoned", False):
+            raise RuntimeError(
+                "GLM-5-Next native FP8 transport is poisoned; restart the "
+                "server before retrying"
+            )
+        transport = getattr(self, "_glm5_next_fp8_native_transport", None)
+        if transport is None:
+            raise RuntimeError(
+                "GLM-5-Next native FP8 transport was not initialized"
+            )
+
+        tp_rank = get_tensor_model_parallel_rank()
+        expert_count = int(self.gpu_layer.num_experts)
+        epoch = int(self._glm5_next_fp8_transport_epoch) + 1
+        self._glm5_next_fp8_transport_epoch = epoch
+        try:
+            transport.join(epoch, int(layer_idx), expert_count)
+            if tp_rank == 0:
+                # The public NativeMoEWrapper helper drains the process-wide
+                # CPUInfer pool on every invocation.  The exact-native manager
+                # establishes that drain once before its first prime and then
+                # serializes all layer writers in one worker.  Calling the
+                # bound C++ MoE directly here therefore preserves the same
+                # non-reentrancy invariant without putting a process-wide
+                # CPUInfer drain back into every successor's hot path.
+                run_batch = getattr(
+                    getattr(wrapper, "moe", None),
+                    "run_layerwise_fp8_batch",
+                    None,
+                )
+                if not callable(run_batch):
+                    raise RuntimeError(
+                        "KT FP8 writer lost direct "
+                        "moe.run_layerwise_fp8_batch after native transport "
+                        "initialization"
+                    )
+                run_batch(transport, epoch, int(layer_idx), expert_count)
+            stats = dict(transport.wait(epoch) or {})
+
+            expected = {
+                "epoch": epoch,
+                "layer_id": int(layer_idx),
+                "expert_count": expert_count,
+            }
+            for name, value in expected.items():
+                if name in stats and int(stats[name]) != value:
+                    raise RuntimeError(
+                        f"native transport returned stale {name}: "
+                        f"expected={value}, got={stats[name]}"
+                    )
+            if bool(stats.get("poisoned", False)) or int(
+                stats.get("error_code", 0)
+            ) != 0:
+                raise RuntimeError(
+                    "native transport reported an error: "
+                    f"code={stats.get('error_code', 0)} "
+                    f"rank={stats.get('error_rank', -1)}"
+                )
+        except Exception as exc:
+            self._glm5_next_fp8_transport_poisoned = True
+            try:
+                transport.close()
+            except Exception:
+                pass
+            self._glm5_next_fp8_native_transport = None
+            raise RuntimeError(
+                "GLM-5-Next native FP8 layer transport failed for "
+                f"epoch={epoch}, layer={layer_idx}; runtime fallback is disabled"
+            ) from exc
+
+        logger.debug(
+            "KT GLM-5-Next native FP8 transport: epoch=%d layer=%d rank=%d "
+            "experts=%d writer=%.2f ms slot_wait=%.2f ms h2d=%.2f ms "
+            "transport=%.2f ms bytes=%d",
+            epoch,
+            layer_idx,
+            tp_rank,
+            expert_count,
+            float(stats.get("writer_ms", 0.0)),
+            float(stats.get("slot_wait_ms", 0.0)),
+            float(stats.get("h2d_ms", 0.0)),
+            float(stats.get("total_ms", 0.0)),
+            int(stats.get("bytes", 0)),
+        )
+
+    def _validate_glm5_next_fp8_native_gpu_slot(self) -> None:
+        """Keep the native pointer ABI bound to exactly one GPU layer slot."""
+
+        expected = getattr(self, "_glm5_next_fp8_native_gpu_ptrs", None)
+        actual = tuple(
+            int(getattr(self.gpu_layer, name).data_ptr())
+            for name in self.WEIGHT_NAMES_FP8
+        )
+        if expected is None or actual != tuple(expected):
+            raise RuntimeError(
+                "GLM-5-Next native FP8 full-layer GPU slot was rebound; "
+                "restart the server instead of writing stale native pointers"
+            )
+
+    def load_glm5_next_fp8_native(
+        self,
+        *,
+        layer_idx: int,
+        wrapper,
+        consumed_event=None,
+    ) -> None:
+        """Load one exact-GLM layer without a device-wide synchronization.
+
+        ``consumed_event`` is recorded immediately after the previous MoE's
+        GPU apply is enqueued.  Waiting for that single event fences the only
+        full-layer destination slot while still allowing the successor H2D
+        transport to overlap later attention kernels on the main stream.
+        The native wait returns only after its private H2D stream has finished,
+        so the acquiring main thread can safely enqueue the next MoE.
+        """
+
+        if getattr(self, "_glm5_next_fp8_transport_backend", None) != "native":
+            raise RuntimeError(
+                "exact-native GLM load requires the native FP8 transport"
+            )
+        if getattr(self, "_glm5_next_fp8_transport_poisoned", False):
+            raise RuntimeError(
+                "GLM-5-Next native FP8 transport is poisoned; runtime "
+                "fallback is disabled"
+            )
+
+        fence_error = None
+        if consumed_event is not None:
+            try:
+                consumed_event.synchronize()
+            except Exception as exc:
+                fence_error = exc
+            if fence_error is not None:
+                self._glm5_next_fp8_transport_poisoned = True
+                raise RuntimeError(
+                    "GLM-5-Next native FP8 local consumed-event fence failed; "
+                    "runtime fallback is disabled"
+                ) from fence_error
+
+        try:
+            self._validate_glm5_next_fp8_native_gpu_slot()
+            self._prepare_weight_fp8_glm5_next_native(wrapper, layer_idx)
+            self._validate_glm5_next_fp8_native_gpu_slot()
+        except Exception:
+            self._glm5_next_fp8_transport_poisoned = True
+            raise
+
+    def _prepare_weight_fp8_glm5_next(self, wrapper, layer_idx: int) -> None:
+        backend = getattr(self, "_glm5_next_fp8_transport_backend", None)
+        if backend == "native":
+            self._prepare_weight_fp8_glm5_next_native(wrapper, layer_idx)
+            return
+        if backend == "legacy":
+            self._prepare_weight_fp8_glm5_next_legacy(wrapper)
+            return
+        raise RuntimeError(
+            "GLM-5-Next FP8 transport resources were not initialized"
+        )
+
+    def _prepare_weight_fp8(
+        self,
+        wrapper,
+        original_layer=None,
+        gpu_experts_mask=None,
+        logical_to_gpu_index=None,
+        layer_idx: Optional[int] = None,
+    ):
         """Prepare FP8 block quant weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -1342,7 +1871,11 @@ class SharedFullContext:
                 False,
             )
         ):
-            self._prepare_weight_fp8_glm5_next(wrapper)
+            if layer_idx is None:
+                raise RuntimeError(
+                    "GLM-5-Next FP8 transport requires the logical layer index"
+                )
+            self._prepare_weight_fp8_glm5_next(wrapper, layer_idx)
             return
 
         # Bind Python thread to specific CPU core (last cores for each rank)
@@ -1949,8 +2482,13 @@ class SharedFullContext:
             # When the inference layer is Marlin-repacked (int32), the
             # raw fp8 context layer can't share GPU→GPU copies.
             # Disable Phase 1 shortcut by passing original_layer=None.
-            self._prepare_weight_fp8(wrapper, None, gpu_experts_mask,
-                                     logical_to_gpu_index)
+            self._prepare_weight_fp8(
+                wrapper,
+                None,
+                gpu_experts_mask,
+                logical_to_gpu_index,
+                layer_idx=layer_idx,
+            )
         elif self._is_fp8_channel_quant:
             self._prepare_weight_fp8_channel(wrapper, None, gpu_experts_mask,
                                              logical_to_gpu_index)
@@ -2963,18 +3501,38 @@ def _validate_glm5_next_fp8_shared_full_context(
             "GLM-5-Next layerwise prefill requires runtime TP=4; "
             f"got TP={tp_size}"
         )
-    slot_events = getattr(
-        context, "_glm5_next_fp8_host_slot_events", None
-    )
-    if (
-        not getattr(context, "_glm5_next_fp8_transport_initialized", False)
-        or slot_events is None
-        or len(slot_events) != 2
-        or getattr(context, "_glm5_next_fp8_copy_stream", None) is None
-    ):
+    if not getattr(context, "_glm5_next_fp8_transport_initialized", False):
         raise RuntimeError(
-            "GLM-5-Next layerwise prefill requires one persistent H2D "
-            "stream and exactly two Host-slot completion events"
+            "GLM-5-Next layerwise prefill transport is not initialized"
+        )
+    transport_backend = getattr(
+        context, "_glm5_next_fp8_transport_backend", "legacy"
+    )
+    if transport_backend == "native":
+        if (
+            getattr(context, "_glm5_next_fp8_native_transport", None) is None
+            or getattr(context, "_glm5_next_fp8_control_shm", None) is None
+        ):
+            raise RuntimeError(
+                "GLM-5-Next native layerwise prefill requires a persistent "
+                "native handle and mapped control SHM"
+            )
+    elif transport_backend == "legacy":
+        slot_events = getattr(
+            context, "_glm5_next_fp8_host_slot_events", None
+        )
+        if (
+            slot_events is None
+            or len(slot_events) != 2
+            or getattr(context, "_glm5_next_fp8_copy_stream", None) is None
+        ):
+            raise RuntimeError(
+                "GLM-5-Next legacy layerwise prefill requires one persistent "
+                "H2D stream and exactly two Host-slot completion events"
+            )
+    else:
+        raise RuntimeError(
+            f"unknown GLM-5-Next transport backend {transport_backend!r}"
         )
     layer = context.gpu_layer
     runner_config = getattr(layer, "moe_runner_config", None)
@@ -3061,6 +3619,477 @@ def _validate_glm5_next_fp8_shared_full_context(
 def _glm5_next_forward_mode_name(mode) -> str:
     name = getattr(mode, "name", None)
     return str(name if name is not None else mode).upper()
+
+
+def _glm5_next_fp8_native_prefetch_signature(method, layer) -> tuple:
+    device = next(layer.parameters()).device
+    return (
+        str(device),
+        method.kt_config.weight_path,
+        method.kt_config.num_layers,
+        method.global_num_experts,
+        method._full_init_args,
+    )
+
+
+def _register_glm5_next_fp8_native_prefetch_layer(method, layer) -> None:
+    """Register exact-GLM MoE order during model construction."""
+
+    if not _glm5_next_fp8_pipeline_requested(method):
+        return
+    signature = _glm5_next_fp8_native_prefetch_signature(method, layer)
+    method._glm5_next_fp8_native_prefetch_signature = signature
+    registry = _GLM5_NEXT_FP8_NATIVE_PREFETCH_LAYER_REGISTRY.setdefault(
+        signature, {}
+    )
+    layer_idx = int(method.kt_config.layer_idx)
+    existing = registry.get(layer_idx)
+    if existing is not None and (
+        existing[0] is not method or existing[1] is not layer
+    ):
+        raise RuntimeError(
+            "duplicate exact GLM-5-Next native prefetch registration for "
+            f"layer {layer_idx}"
+        )
+    registry[layer_idx] = (method, layer)
+
+
+def _glm5_next_fp8_native_prefetch_runtime_supported(
+    method, context: SharedFullContext
+) -> bool:
+    """Hard-gate the successor worker without changing legacy behavior."""
+
+    if not _glm5_next_fp8_pipeline_requested(method):
+        return False
+    if getattr(context, "_glm5_next_fp8_transport_backend", None) != "native":
+        return False
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size != 4:
+        raise RuntimeError(
+            "exact GLM-5-Next native successor prefetch requires TP=4; "
+            f"got TP={tp_size}"
+        )
+    if int(method.num_gpu_experts) != 0:
+        raise RuntimeError(
+            "exact GLM-5-Next native successor prefetch requires "
+            "gpu_experts=0"
+        )
+    return True
+
+
+class _Glm5NextFp8NativeSingleSlotPrefetchManager:
+    """Overlap successor transport with attention using one GPU weight slot.
+
+    The manager deliberately owns no weight tensor.  ``context.gpu_layer`` is
+    the sole full-layer destination, protected by one consumed event.  A
+    single Python worker per TP rank executes only layer-granularity control;
+    the expert writer/H2D hot loop remains in the native transport.
+    """
+
+    def __init__(self, context: SharedFullContext, signature: tuple, registry):
+        self.context = context
+        self.signature = signature
+        self.registry = registry
+        self.layer_indices = tuple(sorted(registry))
+        if self.layer_indices != _GLM5_NEXT_FP8_MOE_LAYER_INDICES:
+            raise RuntimeError(
+                "exact GLM-5-Next native prefetch requires the complete MoE "
+                "registry for layers 3..44 before its first prime; got "
+                f"{self.layer_indices}"
+            )
+        for layer_idx, (method, _layer) in registry.items():
+            config = method.kt_config
+            if (
+                int(config.layer_idx) != layer_idx
+                or int(config.num_layers or 0) != 45
+                or not bool(config.is_glm5_next)
+                or (config.method or "").upper() != "FP8"
+            ):
+                raise RuntimeError(
+                    "exact GLM-5-Next native prefetch registry contains an "
+                    f"invalid layer entry for layer {layer_idx}"
+                )
+        self.first_layer_idx = self.layer_indices[0]
+        self.last_layer_idx = self.layer_indices[-1]
+        self._successors = {
+            layer_idx: (
+                self.layer_indices[index + 1]
+                if index + 1 < len(self.layer_indices)
+                else None
+            )
+            for index, layer_idx in enumerate(self.layer_indices)
+        }
+        self.device = context.gpu_layer.w13_weight.device
+        self.consumed_event = torch.cuda.Event()
+        self.executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=(
+                f"kt-glm5-fp8-prefetch-r{get_tensor_model_parallel_rank()}"
+            ),
+        )
+        self.future: Optional[Future] = None
+        self.future_layer_idx: Optional[int] = None
+        self.loaded_layer_idx: Optional[int] = None
+        self.last_acquired_layer_idx: Optional[int] = None
+        self.round_id = 0
+        self._cpu_infer_drained = False
+        self._poison_error: Optional[BaseException] = None
+        self._closed = False
+
+    def _mark_poisoned(self, error: BaseException) -> None:
+        if self._poison_error is None:
+            self._poison_error = error
+        self.context._glm5_next_fp8_transport_poisoned = True
+
+    def _raise_if_unusable(self) -> None:
+        if self._closed:
+            raise RuntimeError(
+                "GLM-5-Next native successor prefetch manager is closed"
+            )
+        if self._poison_error is not None or getattr(
+            self.context, "_glm5_next_fp8_transport_poisoned", False
+        ):
+            raise RuntimeError(
+                "GLM-5-Next native successor prefetch is poisoned; "
+                "runtime fallback is disabled"
+            ) from self._poison_error
+
+    def _commit_rank_local_error(
+        self, local_error: Optional[BaseException], phase: str
+    ) -> None:
+        if _all_tp_ranks_succeeded(local_error is None):
+            return
+        error = RuntimeError(
+            "GLM-5-Next native successor prefetch "
+            f"{phase} failed on at least one TP rank; runtime fallback is disabled"
+        )
+        self._mark_poisoned(error)
+        if local_error is not None:
+            raise error from local_error
+        raise error
+
+    def _drain_cpu_infer_once(self, method) -> None:
+        """Establish a clean writer boundary once, before the first epoch."""
+
+        if self._cpu_infer_drained:
+            return
+        local_error = None
+        if method.tp_rank == 0:
+            try:
+                cpu_infer = getattr(method.wrapper, "cpu_infer", None)
+                sync = getattr(cpu_infer, "sync", None)
+                if not callable(sync):
+                    raise RuntimeError(
+                        "exact GLM-5-Next native prime requires "
+                        "wrapper.cpu_infer.sync"
+                    )
+                sync()
+            except Exception as exc:
+                local_error = exc
+        self._commit_rank_local_error(local_error, "initial CPUInfer drain")
+        self._cpu_infer_drained = True
+
+    def _load_layer(
+        self, layer_idx: int, method, consumed_event
+    ) -> int:
+        self.context.load_glm5_next_fp8_native(
+            layer_idx=layer_idx,
+            wrapper=method.wrapper,
+            consumed_event=consumed_event,
+        )
+        return layer_idx
+
+    def _prime(self, layer_idx: int, method, consumed_event) -> None:
+        self._drain_cpu_infer_once(method)
+        self._load_layer(layer_idx, method, consumed_event)
+        self.loaded_layer_idx = layer_idx
+
+    def _finish_future(self, expected_layer_idx: int) -> None:
+        future = self.future
+        actual_expected = self.future_layer_idx
+        loaded_layer_idx = None
+        local_error = None
+        if future is None or actual_expected != expected_layer_idx:
+            local_error = RuntimeError(
+                "GLM-5-Next native successor prefetch acquired an invalid "
+                f"future: wanted layer={expected_layer_idx}, "
+                f"pending={actual_expected}"
+            )
+        else:
+            try:
+                loaded_layer_idx = int(future.result())
+            except Exception as exc:
+                local_error = exc
+        try:
+            if (
+                local_error is None
+                and loaded_layer_idx != expected_layer_idx
+            ):
+                local_error = RuntimeError(
+                    "GLM-5-Next native successor prefetch returned stale "
+                    f"weights: wanted layer={expected_layer_idx}, "
+                    f"got={loaded_layer_idx}"
+                )
+        finally:
+            self.future = None
+            self.future_layer_idx = None
+        # This consensus deliberately runs on the acquiring main thread, not
+        # inside the background worker.  It keeps torch.distributed control
+        # flow ordered with the model thread while propagating any rank-local
+        # event/native task failure before another successor is launched.
+        try:
+            self._commit_rank_local_error(
+                local_error, f"successor acquire for layer {expected_layer_idx}"
+            )
+        except Exception as exc:
+            self._mark_poisoned(exc)
+            raise
+        self.loaded_layer_idx = loaded_layer_idx
+
+    def _drain_interrupted_round(self) -> None:
+        if self.future is None:
+            return
+        expected = self.future_layer_idx
+        if expected is None:
+            error = RuntimeError(
+                "GLM-5-Next native successor prefetch lost its pending layer"
+            )
+            self._mark_poisoned(error)
+            raise error
+        # A canceled/short request can wrap before consuming the prefetched
+        # layer.  Finish that one writer first; one GPU slot cannot be
+        # overwritten by a second producer concurrently.
+        self._finish_future(expected)
+
+    def _acquire(self, method, layer) -> bool:
+        self._raise_if_unusable()
+        layer_idx = int(method.kt_config.layer_idx)
+        registered = self.registry.get(layer_idx)
+        if registered is None or registered[0] is not method or registered[1] is not layer:
+            error = RuntimeError(
+                "GLM-5-Next native successor prefetch received an "
+                f"unregistered layer {layer_idx}"
+            )
+            self._mark_poisoned(error)
+            raise error
+
+        is_wrap = (
+            self.last_acquired_layer_idx is not None
+            and layer_idx == self.first_layer_idx
+        )
+        if self.last_acquired_layer_idx is None:
+            if layer_idx != self.first_layer_idx:
+                error = RuntimeError(
+                    "GLM-5-Next native prefetch round must start at layer "
+                    f"{self.first_layer_idx}, got layer {layer_idx}"
+                )
+                self._mark_poisoned(error)
+                raise error
+            self.round_id = 1
+            self._prime(layer_idx, method, consumed_event=None)
+            prefetch_hit = False
+        elif is_wrap:
+            self._drain_interrupted_round()
+            self.round_id += 1
+            self.loaded_layer_idx = None
+            # The previous round's last (or last actually executed) MoE
+            # recorded this event.  Fence it before re-prime overwrites the
+            # sole layer slot; later attention remains free to overlap.
+            self._prime(layer_idx, method, self.consumed_event)
+            prefetch_hit = False
+        else:
+            expected = self._successors.get(self.last_acquired_layer_idx)
+            if expected != layer_idx:
+                error = RuntimeError(
+                    "GLM-5-Next native prefetch observed an out-of-order MoE: "
+                    f"after layer {self.last_acquired_layer_idx}, expected "
+                    f"{expected}, got {layer_idx}"
+                )
+                self._mark_poisoned(error)
+                raise error
+            self._finish_future(layer_idx)
+            prefetch_hit = True
+
+        if self.loaded_layer_idx != layer_idx:
+            error = RuntimeError(
+                "GLM-5-Next native prefetch did not acquire the requested "
+                f"layer: requested={layer_idx}, loaded={self.loaded_layer_idx}"
+            )
+            self._mark_poisoned(error)
+            raise error
+        self.last_acquired_layer_idx = layer_idx
+        return prefetch_hit
+
+    def _prefetch_successor(self, layer_idx: int) -> None:
+        successor_idx = self._successors[layer_idx]
+        if successor_idx is None:
+            # There is intentionally no speculative first-layer load here.
+            # The next chunk/request synchronously re-primes only after the
+            # last layer's consumed event has completed.
+            self.future = None
+            self.future_layer_idx = None
+            return
+        if self.future is not None:
+            error = RuntimeError(
+                "GLM-5-Next native successor prefetch already has a task in flight"
+            )
+            self._mark_poisoned(error)
+            raise error
+        successor_method, _ = self.registry[successor_idx]
+        self.future_layer_idx = successor_idx
+        try:
+            self.future = self.executor.submit(
+                self._load_layer,
+                successor_idx,
+                successor_method,
+                self.consumed_event,
+            )
+        except Exception as exc:
+            self.future_layer_idx = None
+            self._mark_poisoned(exc)
+            raise RuntimeError(
+                "GLM-5-Next native successor worker submission failed; "
+                "runtime fallback is disabled"
+            ) from exc
+
+    def apply(self, method, layer, dispatch_output):
+        layer_idx = int(method.kt_config.layer_idx)
+        prefetch_hit = self._acquire(method, layer)
+        main_stream = torch.cuda.current_stream(self.device)
+        result = None
+        compute_error = None
+        try:
+            process = getattr(
+                self.context.gpu_method, "process_weights_after_loading", None
+            )
+            if callable(process):
+                process(self.context.gpu_layer)
+            self.context._validate_glm5_next_fp8_native_gpu_slot()
+            result = self.context.gpu_method.apply(
+                self.context.gpu_layer, dispatch_output
+            )
+        except Exception as exc:
+            compute_error = exc
+        finally:
+            try:
+                # This event is the only overwrite fence for the one GPU slot.
+                # It is recorded after all weight-reading MoE work is enqueued,
+                # before the caller continues with postprocess/attention.
+                self.consumed_event.record(main_stream)
+            except Exception as exc:
+                if compute_error is None:
+                    compute_error = exc
+
+        try:
+            self._commit_rank_local_error(compute_error, "compute enqueue")
+        except Exception as exc:
+            self._mark_poisoned(exc)
+            raise
+        if compute_error is not None:
+            self._mark_poisoned(compute_error)
+            raise RuntimeError(
+                "GLM-5-Next native MoE compute enqueue failed; runtime "
+                "fallback is disabled"
+            ) from compute_error
+
+        # Submit only after every rank has published its consumed fence.  The
+        # main thread returns immediately; the single worker waits that event
+        # and runs native join/run/wait for the successor.
+        self._prefetch_successor(layer_idx)
+        if method.tp_rank == 0:
+            logger.debug(
+                "KT GLM-5-Next native single-slot prefetch: layer=%d "
+                "round=%d %s successor=%s",
+                layer_idx,
+                self.round_id,
+                "prefetch-hit" if prefetch_hit else "prime",
+                self._successors[layer_idx],
+            )
+        return result
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.future is not None:
+                try:
+                    self.future.result()
+                except Exception as exc:
+                    self._mark_poisoned(exc)
+                finally:
+                    self.future = None
+                    self.future_layer_idx = None
+        finally:
+            self.executor.shutdown(wait=True, cancel_futures=False)
+            if (
+                _GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS.get(self.signature)
+                is self
+            ):
+                _GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS.pop(self.signature, None)
+
+
+def _get_or_initialize_glm5_next_fp8_native_prefetch_manager(
+    method, layer, context: SharedFullContext
+) -> _Glm5NextFp8NativeSingleSlotPrefetchManager:
+    if getattr(context, "_glm5_next_fp8_transport_poisoned", False):
+        raise RuntimeError(
+            "exact GLM-5-Next native prefetch context is poisoned; runtime "
+            "fallback is disabled"
+        )
+    signature = getattr(
+        method, "_glm5_next_fp8_native_prefetch_signature", None
+    )
+    if signature is None:
+        context._glm5_next_fp8_transport_poisoned = True
+        raise RuntimeError(
+            "exact GLM-5-Next native prefetch layer was not registered during "
+            "create_weights"
+        )
+    registry = _GLM5_NEXT_FP8_NATIVE_PREFETCH_LAYER_REGISTRY.get(signature)
+    if registry is None or registry.get(int(method.kt_config.layer_idx)) != (
+        method,
+        layer,
+    ):
+        context._glm5_next_fp8_transport_poisoned = True
+        raise RuntimeError(
+            "exact GLM-5-Next native prefetch registry is incomplete"
+        )
+
+    manager = _GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS.get(signature)
+    if manager is not None:
+        if manager.context is not context:
+            context._glm5_next_fp8_transport_poisoned = True
+            raise RuntimeError(
+                "exact GLM-5-Next native prefetch signature reused with a "
+                "different full-layer context"
+            )
+        return manager
+
+    manager = None
+    local_error = None
+    try:
+        manager = _Glm5NextFp8NativeSingleSlotPrefetchManager(
+            context, signature, registry
+        )
+    except Exception as exc:
+        local_error = exc
+    if not _all_tp_ranks_succeeded(local_error is None):
+        context._glm5_next_fp8_transport_poisoned = True
+        if manager is not None:
+            manager.close()
+        raise RuntimeError(
+            "exact GLM-5-Next native single-slot prefetch setup failed on at "
+            "least one TP rank"
+        ) from local_error
+    if manager is None:
+        context._glm5_next_fp8_transport_poisoned = True
+        raise RuntimeError(
+            "exact GLM-5-Next native single-slot prefetch setup returned no manager"
+        )
+    _GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS[signature] = manager
+    context._glm5_next_fp8_native_prefetch_manager = manager
+    return manager
 
 
 def generate_front_loading_masks(
@@ -4038,6 +5067,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Registration happens during model construction, not on the first
         # request, so layer N can identify and prepare N+1 immediately.
         _register_mxfp4_prefill_layer(self, layer)
+        _register_glm5_next_fp8_native_prefetch_layer(self, layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -4438,6 +5468,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # serialized full-GPU fallback.
             ctx = self._build_full_context(layer)
 
+            if _glm5_next_fp8_native_prefetch_runtime_supported(self, ctx):
+                manager = (
+                    _get_or_initialize_glm5_next_fp8_native_prefetch_manager(
+                        self, layer, ctx
+                    )
+                )
+                return manager.apply(self, layer, dispatch_output)
+
             # Re-run quant post-processing on the full-expert gpu_layer
             # if supported (e.g. Marlin repack for Fp8MarlinMoEMethod).
             # The ctx.load() call writes raw fp8 weights; downstream apply()
@@ -4793,8 +5831,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
     def _build_full_context(self, layer: torch.nn.Module) -> "SharedFullContext":
         global _SHARED_FULL_CONTEXT
 
+        is_glm5_next_fp8 = _glm5_next_fp8_pipeline_requested(self)
         if _SHARED_FULL_CONTEXT is None:
-            is_glm5_next_fp8 = _glm5_next_fp8_pipeline_requested(self)
             if is_glm5_next_fp8:
                 # GPU tensors are allocated independently on each TP rank.
                 # Do not let a successful peer enter the Host-SHM collectives
@@ -4855,7 +5893,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 validation_result = None
                 validation_error = None
                 try:
-                    context._initialize_glm5_next_fp8_transport()
+                    context._initialize_glm5_next_fp8_transport(
+                        wrapper=self.wrapper,
+                        num_gpu_experts=self.num_gpu_experts,
+                    )
                     validation_result = (
                         _validate_glm5_next_fp8_shared_full_context(context)
                     )
@@ -4890,21 +5931,34 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     logger.info(
                         "KT GLM-5-Next FP8 layerwise prefill lazily allocated "
                         "generic SharedFullContext: gpu_full_layer_slots=1 "
-                        "host_expert_slots=2 gpu_slot_bytes=%d "
+                        "host_expert_slots=2 transport=%s gpu_slot_bytes=%d "
                         "host_buffer_bytes=%d device=%s",
+                        context._glm5_next_fp8_transport_backend,
                         gpu_slot_bytes,
                         host_buffer_bytes,
                         context.gpu_layer.w13_weight.device,
                     )
             _SHARED_FULL_CONTEXT = context
 
-        _SHARED_FULL_CONTEXT.load(
-            layer_idx=self.kt_config.layer_idx,
-            wrapper=self.wrapper,
-            original_layer=layer,
-            gpu_experts_mask=self.gpu_experts_mask,
-            logical_to_gpu_index=self.logical_to_gpu_index,
-        )
+        # Native exact GLM is loaded by its single-slot manager: synchronous
+        # prime for the first MoE, then event-fenced successor tasks.  Keeping
+        # it out of generic load() avoids both device-wide synchronizations.
+        if not (
+            is_glm5_next_fp8
+            and getattr(
+                _SHARED_FULL_CONTEXT,
+                "_glm5_next_fp8_transport_backend",
+                None,
+            )
+            == "native"
+        ):
+            _SHARED_FULL_CONTEXT.load(
+                layer_idx=self.kt_config.layer_idx,
+                wrapper=self.wrapper,
+                original_layer=layer,
+                gpu_experts_mask=self.gpu_experts_mask,
+                logical_to_gpu_index=self.logical_to_gpu_index,
+            )
         return _SHARED_FULL_CONTEXT
 
 

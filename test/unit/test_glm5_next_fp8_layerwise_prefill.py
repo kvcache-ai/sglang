@@ -2,8 +2,10 @@
 
 import contextlib
 import importlib.util
+import inspect
 import math
 import sys
+import threading
 import types
 import unittest
 from collections import namedtuple
@@ -140,6 +142,8 @@ class TestGlm5NextFp8GenericRouting(unittest.TestCase):
         kt_ep_wrapper._SHARED_FULL_CONTEXT = None
         kt_ep_wrapper._MXFP4_LAYERWISE_MANAGERS.clear()
         kt_ep_wrapper._MXFP4_LAYERWISE_DISABLED_REASONS.clear()
+        kt_ep_wrapper._GLM5_NEXT_FP8_NATIVE_PREFETCH_LAYER_REGISTRY.clear()
+        kt_ep_wrapper._GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS.clear()
 
     @staticmethod
     def _wrapper(*, exact=True, threshold=1024, mode="EXTEND"):
@@ -253,7 +257,10 @@ class TestGlm5NextFp8GenericRouting(unittest.TestCase):
             defer_cpu_buffers=True,
         )
         context.initialize_cpu_buffers.assert_called_once_with()
-        context._initialize_glm5_next_fp8_transport.assert_called_once_with()
+        context._initialize_glm5_next_fp8_transport.assert_called_once_with(
+            wrapper=wrapper.wrapper,
+            num_gpu_experts=wrapper.num_gpu_experts,
+        )
         self.assertIs(kt_ep_wrapper._SHARED_FULL_CONTEXT, context)
         validate_context.assert_called_once_with(context)
         self.assertEqual(context.load.call_count, 2)
@@ -472,10 +479,160 @@ class _FakeFp8Writer:
         self.pending = None
 
 
+class _FakeNativeTransport:
+    def __init__(self, args, calls):
+        self.args = args
+        self.calls = calls
+        self.last_join = None
+        self.close_count = 0
+
+    def join(self, epoch, layer_id, expert_count):
+        self.last_join = (epoch, layer_id, expert_count)
+        self.calls.append(("join", *self.last_join))
+
+    def wait(self, epoch):
+        self.calls.append(("wait", epoch))
+        joined_epoch, layer_id, expert_count = self.last_join
+        return {
+            "epoch": joined_epoch,
+            "layer_id": layer_id,
+            "expert_count": expert_count,
+            "rank": 0,
+            "writer_ms": 3.0,
+            "slot_wait_ms": 1.0,
+            "h2d_ms": 2.0,
+            "total_ms": 4.0,
+            "bytes": 64,
+            "poisoned": False,
+            "error_code": 0,
+            "error_rank": -1,
+        }
+
+    def close(self):
+        self.close_count += 1
+        self.calls.append(("close",))
+
+
+class _FakeNativeExtension:
+    def __init__(self, calls):
+        self.calls = calls
+        self.initialize_args = None
+        self.transport = None
+
+    def initialize_fp8_layerwise_control(self, control_ptr, control_size, tp_size):
+        self.initialize_args = (control_ptr, control_size, tp_size)
+        self.calls.append(("initialize", control_size, tp_size))
+
+    def FP8LayerwiseTransport(self, *args):
+        self.transport = _FakeNativeTransport(args, self.calls)
+        self.calls.append(("construct",))
+        return self.transport
+
+
+class _FakeNativeWriter:
+    def __init__(self, calls, fail=False):
+        self.calls = calls
+        self.fail = fail
+        self.moe = self
+        self.cpu_infer = SimpleNamespace(sync=mock.Mock())
+        self.public_run_count = 0
+
+    def run_layerwise_fp8_batch(
+        self, transport, epoch, layer_id, expert_count
+    ):
+        self.calls.append(("run", epoch, layer_id, expert_count))
+        if self.fail:
+            raise RuntimeError("injected producer failure")
+
+
+class _FakePrefetchEvent:
+    def __init__(self, calls):
+        self.calls = calls
+        self.recorded = threading.Event()
+
+    def record(self, stream):
+        self.calls.append(("consumed-record", stream))
+        self.recorded.set()
+
+    def synchronize(self):
+        self.calls.append(("consumed-wait",))
+        if not self.recorded.wait(timeout=1):
+            raise RuntimeError("consumed event was never recorded")
+
+
+class _FakePrefetchGpuMethod:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def process_weights_after_loading(self, _layer):
+        self.calls.append(("process",))
+
+    def apply(self, _layer, dispatch_output):
+        layer_idx = dispatch_output.layer_idx
+        self.calls.append(("apply", layer_idx))
+        return f"result-{layer_idx}"
+
+
+class _FakePrefetchContext:
+    def __init__(self, calls, fail_layer=None, successor_release=None):
+        self.calls = calls
+        self.fail_layer = fail_layer
+        self.successor_release = successor_release
+        self.successor_entered = threading.Event()
+        self._glm5_next_fp8_transport_poisoned = False
+        self.gpu_layer = SimpleNamespace(
+            w13_weight=torch.empty((1,), dtype=torch.float32)
+        )
+        self.gpu_method = _FakePrefetchGpuMethod(calls)
+
+    def load_glm5_next_fp8_native(
+        self, *, layer_idx, wrapper, consumed_event=None
+    ):
+        self.calls.append(("load-enter", layer_idx, wrapper.name))
+        if consumed_event is not None:
+            consumed_event.synchronize()
+        if layer_idx == 4 and self.successor_release is not None:
+            self.successor_entered.set()
+            if not self.successor_release.wait(timeout=1):
+                raise RuntimeError("test successor release timed out")
+        if layer_idx == self.fail_layer:
+            raise RuntimeError(f"injected layer {layer_idx} load failure")
+        self.calls.append(("load-done", layer_idx))
+
+    def _validate_glm5_next_fp8_native_gpu_slot(self):
+        self.calls.append(("validate-slot",))
+
+
+def _fake_prefetch_method(layer_idx, calls):
+    cpu_infer = SimpleNamespace(
+        sync=mock.Mock(side_effect=lambda: calls.append(("cpu-infer-sync",)))
+    )
+    writer = SimpleNamespace(
+        name=f"writer-{layer_idx}", cpu_infer=cpu_infer, moe=object()
+    )
+    method = SimpleNamespace(
+        kt_config=SimpleNamespace(
+            layer_idx=layer_idx,
+            num_layers=45,
+            is_glm5_next=True,
+            method="FP8",
+        ),
+        tp_rank=0,
+        wrapper=writer,
+    )
+    return method
+
+
 class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
     def setUp(self):
         kt_ep_wrapper._SHARED_FULL_CONTEXT = None
         _FakeSharedMemory.instances.clear()
+        for manager in list(
+            kt_ep_wrapper._GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS.values()
+        ):
+            manager.close()
+        kt_ep_wrapper._GLM5_NEXT_FP8_NATIVE_PREFETCH_LAYER_REGISTRY.clear()
+        kt_ep_wrapper._GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS.clear()
 
     def test_generic_host_transport_allocates_exactly_two_expert_slots(self):
         context = object.__new__(kt_ep_wrapper.SharedFullContext)
@@ -539,6 +696,7 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
     def test_exact_glm_transport_reuses_two_persistent_host_slot_events(self):
         context = object.__new__(kt_ep_wrapper.SharedFullContext)
         context._glm5_next_fp8_transport_initialized = True
+        context._glm5_next_fp8_transport_backend = "legacy"
         context._glm5_next_fp8_copy_stream = _FakeCudaStream()
         context._glm5_next_fp8_host_slot_events = (
             _FakeCudaEvent(),
@@ -580,7 +738,7 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
                 return_value=current_stream,
             ),
         ):
-            context._prepare_weight_fp8_glm5_next(writer)
+            context._prepare_weight_fp8_glm5_next(writer, layer_idx=3)
 
         self.assertEqual(writer.submitted, [(1, 0), (1, 1), (1, 2), (1, 3)])
         self.assertEqual(writer.sync_count, 4)
@@ -597,6 +755,428 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
         self.assertEqual(event0.synchronize_count, 1)
         self.assertEqual(event1.synchronize_count, 1)
         self.assertEqual(context._glm5_next_fp8_copy_stream.synchronize_count, 1)
+
+    @staticmethod
+    def _native_context():
+        context = object.__new__(kt_ep_wrapper.SharedFullContext)
+        context.shm_unique_id = "native_test"
+        context._commit_cpu_buffer_phase = mock.Mock()
+        context.cpu_buffers = {}
+        context.all_rank_buffer_ptrs = {}
+        gpu_tensors = {}
+        for index, name in enumerate(
+            kt_ep_wrapper.SharedFullContext.WEIGHT_NAMES_FP8
+        ):
+            cpu_buffer = torch.empty((2, index + 1), dtype=torch.float32)
+            gpu_tensor = torch.empty((3, index + 1), dtype=torch.float32)
+            context.cpu_buffers[name] = cpu_buffer
+            context.all_rank_buffer_ptrs[name] = [
+                cpu_buffer.data_ptr() + rank * 1_000_000
+                for rank in range(4)
+            ]
+            gpu_tensors[name] = gpu_tensor
+        context.gpu_layer = SimpleNamespace(num_experts=3, **gpu_tensors)
+        return context
+
+    def test_native_transport_uses_fixed_flattened_pointer_abi(self):
+        context = self._native_context()
+        calls = []
+        extension = _FakeNativeExtension(calls)
+        writer = _FakeNativeWriter(calls)
+
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"SGLANG_KT_GLM5_NEXT_FP8_TRANSPORT": "native"},
+                clear=False,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_load_glm5_next_fp8_native_transport_api",
+                return_value=(extension, None),
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_world_size",
+                return_value=4,
+            ),
+            mock.patch.object(kt_ep_wrapper.dist, "is_initialized", return_value=False),
+            mock.patch.object(
+                kt_ep_wrapper.shared_memory,
+                "SharedMemory",
+                side_effect=_FakeSharedMemory,
+            ),
+            mock.patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            context._initialize_glm5_next_fp8_transport(
+                wrapper=writer, num_gpu_experts=0
+            )
+
+        self.assertEqual(
+            extension.initialize_args[1:],
+            (kt_ep_wrapper._GLM5_NEXT_FP8_CONTROL_BYTES, 4),
+        )
+        args = extension.transport.args
+        self.assertEqual(args[1:5], (4096, 0, 4, 0))
+        local_host_ptrs = args[5]
+        local_gpu_ptrs = args[6]
+        all_rank_host_ptrs = args[7]
+        expert_nbytes = args[8]
+        self.assertEqual(len(local_host_ptrs), 8)
+        self.assertEqual(len(local_gpu_ptrs), 4)
+        self.assertEqual(len(all_rank_host_ptrs), 32)
+        self.assertEqual(expert_nbytes, [4, 8, 12, 16])
+
+        expected_local = []
+        expected_all_rank = []
+        names = kt_ep_wrapper.SharedFullContext.WEIGHT_NAMES_FP8
+        for slot in range(2):
+            for index, name in enumerate(names):
+                expected_local.append(
+                    context.cpu_buffers[name].data_ptr()
+                    + slot * expert_nbytes[index]
+                )
+            for rank in range(4):
+                for index, name in enumerate(names):
+                    expected_all_rank.append(
+                        context.all_rank_buffer_ptrs[name][rank]
+                        + slot * expert_nbytes[index]
+                    )
+        self.assertEqual(local_host_ptrs, expected_local)
+        self.assertEqual(all_rank_host_ptrs, expected_all_rank)
+        self.assertEqual(
+            local_gpu_ptrs,
+            [getattr(context.gpu_layer, name).data_ptr() for name in names],
+        )
+        self.assertEqual(args[9:], (3, 60_000))
+        self.assertEqual(context._glm5_next_fp8_transport_backend, "native")
+        self.assertTrue(context._glm5_next_fp8_control_shm.unlinked)
+
+    def test_native_prepare_is_one_join_run_wait_per_layer_and_epochs_advance(self):
+        context = self._native_context()
+        calls = []
+        extension = _FakeNativeExtension(calls)
+        transport = extension.FP8LayerwiseTransport()
+        context._glm5_next_fp8_native_transport = transport
+        context._glm5_next_fp8_transport_backend = "native"
+        context._glm5_next_fp8_transport_initialized = True
+        context._glm5_next_fp8_transport_poisoned = False
+        context._glm5_next_fp8_transport_epoch = 0
+        writer = _FakeNativeWriter(calls)
+
+        with mock.patch.object(
+            kt_ep_wrapper,
+            "get_tensor_model_parallel_rank",
+            return_value=0,
+        ):
+            context._prepare_weight_fp8_glm5_next(writer, layer_idx=3)
+            context._prepare_weight_fp8_glm5_next(writer, layer_idx=4)
+
+        self.assertEqual(
+            [call for call in calls if call[0] in ("join", "run", "wait")],
+            [
+                ("join", 1, 3, 3),
+                ("run", 1, 3, 3),
+                ("wait", 1),
+                ("join", 2, 4, 3),
+                ("run", 2, 4, 3),
+                ("wait", 2),
+            ],
+        )
+        writer.cpu_infer.sync.assert_not_called()
+        source = inspect.getsource(
+            kt_ep_wrapper.SharedFullContext._prepare_weight_fp8_glm5_next_native
+        )
+        self.assertNotIn("dist.", source)
+        self.assertNotIn(".item()", source)
+        self.assertNotIn("for expert", source)
+
+    def test_native_runtime_failure_poisoned_without_legacy_fallback(self):
+        context = self._native_context()
+        calls = []
+        extension = _FakeNativeExtension(calls)
+        transport = extension.FP8LayerwiseTransport()
+        context._glm5_next_fp8_native_transport = transport
+        context._glm5_next_fp8_transport_backend = "native"
+        context._glm5_next_fp8_transport_initialized = True
+        context._glm5_next_fp8_transport_poisoned = False
+        context._glm5_next_fp8_transport_epoch = 0
+        writer = _FakeNativeWriter(calls, fail=True)
+        context._prepare_weight_fp8_glm5_next_legacy = mock.Mock()
+
+        with mock.patch.object(
+            kt_ep_wrapper,
+            "get_tensor_model_parallel_rank",
+            return_value=0,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "runtime fallback is disabled"):
+                context._prepare_weight_fp8_glm5_next(writer, layer_idx=3)
+            with self.assertRaisesRegex(RuntimeError, "poisoned"):
+                context._prepare_weight_fp8_glm5_next(writer, layer_idx=4)
+
+        self.assertTrue(context._glm5_next_fp8_transport_poisoned)
+        self.assertEqual(transport.close_count, 1)
+        context._prepare_weight_fp8_glm5_next_legacy.assert_not_called()
+
+    def test_transport_mode_fallback_and_hard_gates(self):
+        context = self._native_context()
+        context._initialize_glm5_next_fp8_legacy_transport = mock.Mock()
+        writer = _FakeNativeWriter([])
+        with (
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_world_size",
+                return_value=4,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper.dist, "is_initialized", return_value=False
+            ),
+            mock.patch.dict(
+                "os.environ",
+                {"SGLANG_KT_GLM5_NEXT_FP8_TRANSPORT": "auto"},
+                clear=False,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_load_glm5_next_fp8_native_transport_api",
+                return_value=(None, "missing test API"),
+            ),
+        ):
+            context._initialize_glm5_next_fp8_transport(
+                wrapper=writer, num_gpu_experts=0
+            )
+        context._initialize_glm5_next_fp8_legacy_transport.assert_called_once_with()
+
+        context._initialize_glm5_next_fp8_legacy_transport.reset_mock()
+        with (
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_world_size",
+                return_value=4,
+            ),
+            mock.patch.object(kt_ep_wrapper.dist, "is_initialized", return_value=False),
+            mock.patch.dict(
+                "os.environ",
+                {"SGLANG_KT_GLM5_NEXT_FP8_TRANSPORT": "native"},
+                clear=False,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_load_glm5_next_fp8_native_transport_api",
+                return_value=(None, "missing test API"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "was forced"):
+                context._initialize_glm5_next_fp8_transport(
+                    wrapper=writer, num_gpu_experts=0
+                )
+            with self.assertRaisesRegex(RuntimeError, "gpu_experts=0"):
+                context._initialize_glm5_next_fp8_transport(
+                    wrapper=writer, num_gpu_experts=1
+                )
+        context._initialize_glm5_next_fp8_legacy_transport.assert_not_called()
+
+    def test_native_single_slot_state_machine_prefetches_and_wraps(self):
+        calls = []
+        successor_release = threading.Event()
+        context = _FakePrefetchContext(
+            calls, successor_release=successor_release
+        )
+        method3 = _fake_prefetch_method(3, calls)
+        method4 = _fake_prefetch_method(4, calls)
+        layer3 = object()
+        layer4 = object()
+        registry = {3: (method3, layer3), 4: (method4, layer4)}
+        event = _FakePrefetchEvent(calls)
+        main_stream = object()
+
+        with (
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_GLM5_NEXT_FP8_MOE_LAYER_INDICES",
+                (3, 4),
+            ),
+            mock.patch.object(
+                torch.cuda, "current_stream", return_value=main_stream
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_all_tp_ranks_succeeded",
+                side_effect=lambda success: success,
+            ),
+        ):
+            manager = (
+                kt_ep_wrapper._Glm5NextFp8NativeSingleSlotPrefetchManager(
+                    context, ("test",), registry
+                )
+            )
+            try:
+                first = manager.apply(
+                    method3, layer3, SimpleNamespace(layer_idx=3)
+                )
+                self.assertEqual(first, "result-3")
+                self.assertTrue(context.successor_entered.wait(timeout=1))
+                self.assertIsNotNone(manager.future)
+                self.assertFalse(manager.future.done())
+
+                # The main thread has already returned from layer 3 while its
+                # sole worker remains in successor transport.
+                successor_release.set()
+                second = manager.apply(
+                    method4, layer4, SimpleNamespace(layer_idx=4)
+                )
+                self.assertEqual(second, "result-4")
+                self.assertIsNone(manager.future)  # last layer never prefetches
+
+                # A new chunk/request wraps to the first MoE.  It synchronously
+                # fences layer 4 and re-primes the same GPU slot.
+                wrapped = manager.apply(
+                    method3, layer3, SimpleNamespace(layer_idx=3)
+                )
+                self.assertEqual(wrapped, "result-3")
+                successor = manager.apply(
+                    method4, layer4, SimpleNamespace(layer_idx=4)
+                )
+                self.assertEqual(successor, "result-4")
+            finally:
+                manager.close()
+
+        self.assertEqual(
+            [call[:2] for call in calls if call[0] == "load-enter"],
+            [
+                ("load-enter", 3),
+                ("load-enter", 4),
+                ("load-enter", 3),
+                ("load-enter", 4),
+            ],
+        )
+        self.assertEqual(calls.count(("cpu-infer-sync",)), 1)
+        method3.wrapper.cpu_infer.sync.assert_called_once_with()
+        method4.wrapper.cpu_infer.sync.assert_not_called()
+        self.assertEqual(manager.round_id, 2)
+        self.assertEqual(manager.last_acquired_layer_idx, 4)
+        self.assertFalse(manager.context._glm5_next_fp8_transport_poisoned)
+
+    def test_native_prefetch_rejects_partial_glm_registry_before_prime(self):
+        calls = []
+        context = _FakePrefetchContext(calls)
+        method3 = _fake_prefetch_method(3, calls)
+        with self.assertRaisesRegex(RuntimeError, "complete MoE registry"):
+            kt_ep_wrapper._Glm5NextFp8NativeSingleSlotPrefetchManager(
+                context, ("partial",), {3: (method3, object())}
+            )
+        self.assertNotIn(("cpu-infer-sync",), calls)
+        self.assertFalse(
+            any(call[0] == "load-enter" for call in calls if call)
+        )
+
+    def test_native_successor_failure_poisoned_without_fallback(self):
+        calls = []
+        context = _FakePrefetchContext(calls, fail_layer=4)
+        method3 = _fake_prefetch_method(3, calls)
+        method4 = _fake_prefetch_method(4, calls)
+        layer3 = object()
+        layer4 = object()
+        registry = {3: (method3, layer3), 4: (method4, layer4)}
+        event = _FakePrefetchEvent(calls)
+
+        with (
+            mock.patch.object(torch.cuda, "Event", return_value=event),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_GLM5_NEXT_FP8_MOE_LAYER_INDICES",
+                (3, 4),
+            ),
+            mock.patch.object(torch.cuda, "current_stream", return_value=object()),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            mock.patch.object(
+                kt_ep_wrapper,
+                "_all_tp_ranks_succeeded",
+                side_effect=lambda success: success,
+            ),
+        ):
+            manager = (
+                kt_ep_wrapper._Glm5NextFp8NativeSingleSlotPrefetchManager(
+                    context, ("failure-test",), registry
+                )
+            )
+            try:
+                manager.apply(method3, layer3, SimpleNamespace(layer_idx=3))
+                with self.assertRaisesRegex(
+                    RuntimeError, "runtime fallback is disabled"
+                ):
+                    manager.apply(
+                        method4, layer4, SimpleNamespace(layer_idx=4)
+                    )
+                with self.assertRaisesRegex(RuntimeError, "poisoned"):
+                    manager.apply(
+                        method3, layer3, SimpleNamespace(layer_idx=3)
+                    )
+            finally:
+                manager.close()
+
+        self.assertTrue(context._glm5_next_fp8_transport_poisoned)
+        self.assertNotIn("legacy", " ".join(map(str, calls)).lower())
+
+    def test_native_prefetch_source_contracts(self):
+        exact_load_source = inspect.getsource(
+            kt_ep_wrapper.SharedFullContext.load_glm5_next_fp8_native
+        )
+        self.assertIn("consumed_event.synchronize()", exact_load_source)
+        self.assertNotIn("torch.cuda.synchronize", exact_load_source)
+        self.assertNotIn("_all_tp_ranks_succeeded", exact_load_source)
+
+        native_prepare_source = inspect.getsource(
+            kt_ep_wrapper.SharedFullContext._prepare_weight_fp8_glm5_next_native
+        )
+        self.assertIn('getattr(wrapper, "moe", None)', native_prepare_source)
+        self.assertNotIn("cpu_infer.sync", native_prepare_source)
+
+        worker_source = inspect.getsource(
+            kt_ep_wrapper._Glm5NextFp8NativeSingleSlotPrefetchManager._load_layer
+        )
+        self.assertNotIn("dist.", worker_source)
+        self.assertNotIn("_all_tp_ranks_succeeded", worker_source)
+
+        create_source = inspect.getsource(
+            kt_ep_wrapper.KTEPWrapperMethod.create_weights
+        )
+        self.assertIn(
+            "_register_glm5_next_fp8_native_prefetch_layer", create_source
+        )
+
+        close_source = inspect.getsource(
+            kt_ep_wrapper.SharedFullContext._close_glm5_next_fp8_transport
+        )
+        self.assertLess(
+            close_source.index("prefetch_manager.close()"),
+            close_source.index("transport.close()"),
+        )
 
     def test_tp4_fp8_geometry_and_single_full_layer_slot_bytes(self):
         num_experts = 288
