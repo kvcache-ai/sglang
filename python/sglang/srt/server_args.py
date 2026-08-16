@@ -3528,6 +3528,16 @@ class ServerArgs:
         ),
         NS("model"),
     ] = 1800
+    enable_hbm_expert_source: A[
+        bool,
+        "Register daemon-owned routed-expert tensors as Mooncake HBM restore sources.",
+        NS("model"),
+    ] = False
+    hbm_expert_source_ib_device: A[
+        Optional[str],
+        "Mooncake IB device configuration for daemon HBM expert sources.",
+        NS("model"),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins

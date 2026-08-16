@@ -65,6 +65,11 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
+from .expert_source import ExpertSourceDirectory
+from .mooncake_expert_source import (
+    MooncakeExpertSourceDescriptor,
+    initialize_mooncake_expert_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +199,13 @@ def build_weight_cache_daemon_command(
         cmd += ["--trust-remote-code"]
     if server_args.revision:
         cmd += ["--revision", server_args.revision]
+    if getattr(server_args, "enable_hbm_expert_source", False):
+        cmd.append("--enable-hbm-expert-source")
+    if getattr(server_args, "hbm_expert_source_ib_device", None):
+        cmd += [
+            "--hbm-expert-source-ib-device",
+            server_args.hbm_expert_source_ib_device,
+        ]
     return cmd
 
 
@@ -235,6 +247,8 @@ class WeightCacheDaemon:
         self.trust_remote_code = server_args.trust_remote_code
         self.revision = server_args.revision
         self.dist_init_method = dist_init_method
+        self.enable_hbm_expert_source = server_args.enable_hbm_expert_source
+        self.hbm_expert_source_ib_device = server_args.hbm_expert_source_ib_device
 
         self.socket_path = get_socket_path(
             compute_global_rank(self.tp_size, pp_rank, tp_rank)
@@ -247,6 +261,7 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.expert_source_descriptor: Optional[MooncakeExpertSourceDescriptor] = None
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -441,11 +456,37 @@ class WeightCacheDaemon:
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
+        if self.enable_hbm_expert_source:
+            self._init_hbm_expert_source()
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
             f"Exported {len(self.state_entries)} tensors as IPC handles. "
             f"Ready to serve."
+        )
+
+    def _init_hbm_expert_source(self) -> None:
+        routed_experts = getattr(self.model, "routed_experts_weights_of_layer", None)
+        if routed_experts is None:
+            raise RuntimeError(
+                "--enable-hbm-expert-source requires routed_experts_weights_of_layer"
+            )
+        directory = ExpertSourceDirectory.from_routed_experts(routed_experts)
+        source_id = (
+            f"pp={self.pp_rank}/tp={self.tp_rank}/"
+            f"moe_dp={self.config.moe_dp_rank}/moe_ep={self.config.moe_ep_rank}"
+        )
+        self.expert_source_descriptor = initialize_mooncake_expert_source(
+            directory,
+            source_id=source_id,
+            gpu_id=self.gpu_id,
+            ib_device=self.hbm_expert_source_ib_device,
+        )
+        logger.info(
+            "[WeightCacheDaemon gpu=%d] registered %d MoE HBM regions and %d slots",
+            self.gpu_id,
+            len(directory.memory_regions),
+            len(list(directory.items())),
         )
 
     @staticmethod
@@ -645,6 +686,18 @@ class WeightCacheDaemon:
 
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
+
+        elif req.get("type") == "fetch_expert_source":
+            if self.expert_source_descriptor is None:
+                send_msg(conn, {"status": "unavailable"})
+            else:
+                send_msg(
+                    conn,
+                    {
+                        "status": "ok",
+                        "descriptor": self.expert_source_descriptor.to_wire(),
+                    },
+                )
 
         else:
             send_msg(
