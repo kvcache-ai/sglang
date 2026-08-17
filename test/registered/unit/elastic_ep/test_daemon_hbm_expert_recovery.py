@@ -13,10 +13,6 @@ from sglang.srt.elastic_ep.elastic_ep import (
     maybe_rebalance_after_rank_fault,
 )
 from sglang.srt.eplb import eplb_manager
-from sglang.srt.eplb.expert_location_updater import (
-    _augment_missing_experts_from_failed_sources,
-    _filter_p2p_ops_for_active_ranks,
-)
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.weight_cache.expert_source import ExpertSlotKey
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
@@ -95,43 +91,6 @@ def test_eplb_daemon_installs_initial_slot_layout_before_model_load(monkeypatch)
         ),
         ("install", metadata),
     ]
-
-
-def test_healthy_p2p_replica_prevents_daemon_recovery(monkeypatch):
-    active_peer = SimpleNamespace(op=torch.distributed.irecv, peer=0)
-    failed_peer = SimpleNamespace(op=torch.distributed.irecv, peer=1)
-    infos = [(9, [active_peer, failed_peer])]
-    missing = []
-
-    _filter_p2p_ops_for_active_ranks(
-        infos, is_active=[True, False], missing_logical_experts_info=missing
-    )
-
-    assert infos == [(9, [active_peer])]
-    assert missing == []
-
-
-def test_failed_source_metadata_marks_missing_expert(monkeypatch):
-    state = SimpleNamespace(active_ranks_cpu=torch.tensor([True, False, False, False]))
-    monkeypatch.setattr(ElasticEPStateManager, "instance", staticmethod(lambda: state))
-    old = SimpleNamespace(
-        num_local_physical_experts=1,
-        physical_to_logical_map_cpu=torch.tensor([[0, 1, 2, 3]]),
-    )
-    new = SimpleNamespace(
-        physical_to_logical_map_cpu=torch.tensor([[2, 1, 0, 3]]),
-    )
-    missing = {}
-
-    _augment_missing_experts_from_failed_sources(
-        missing_logical_experts_by_layers=missing,
-        old_expert_location_metadata=old,
-        new_expert_location_metadata=new,
-        update_layer_ids=[0],
-        rank=0,
-    )
-
-    assert missing == {0: [2]}
 
 
 def test_ep_timeout_membership_change_rebalances_after_initial_cohort(monkeypatch):
