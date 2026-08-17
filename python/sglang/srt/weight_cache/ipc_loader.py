@@ -21,6 +21,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
+    _post_load_weights,
 )
 
 from .protocol import (
@@ -131,24 +132,13 @@ class IpcModelLoader(BaseModelLoader):
 
         quant_config = _get_quantization_config(model_config, self.load_config)
 
-        model = self._load_zero_copy_mode(
+        model, tensor_replacements = self._load_zero_copy_mode(
             model_config,
             device_config,
             entries,
             quant_config,
         )
-
-        # Skip _post_load_weights: the daemon already ran
-        # process_weights_after_loading on the weights before exporting
-        # IPC handles. Running it again would double-process (e.g.,
-        # re-quantize already-quantized weights), corrupting tensor data.
-
-        # Rebuild stale tensor views. Some modules store tensor views as
-        # plain attributes (not parameters/buffers) during __init__. When
-        # the model is initialized on meta device and then weights are
-        # replaced via IPC mapping, these views still point to the old
-        # meta storage. We must recreate them from the now-valid tensors.
-        self._rebuild_stale_views(model)
+        self._finalize_model_after_ipc_mapping(model, tensor_replacements)
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
@@ -223,6 +213,25 @@ class IpcModelLoader(BaseModelLoader):
         return quant_method, quant_config
 
     @staticmethod
+    def _finalize_model_after_ipc_mapping(model, tensor_replacements) -> None:
+        """Rebuild derived model state after replacing meta tensors via IPC."""
+        # The daemon has already quantized the shared tensors. This hook only
+        # rebuilds model-owned derived state, such as DeepSeek MLA w_kc/w_vc.
+        _post_load_weights(model)
+        IpcModelLoader._rebuild_stale_views(model)
+
+        from sglang.srt.layers.moe.topk import (
+            refresh_topk_config_tensor_references,
+        )
+
+        refreshed = refresh_topk_config_tensor_references(model, tensor_replacements)
+        if refreshed:
+            logger.info(
+                "[IpcModelLoader] Refreshed %d cached TopK tensor reference(s)",
+                refreshed,
+            )
+
+    @staticmethod
     def _rebuild_stale_views(model):
         """Rebuild tensor views that went stale after IPC weight replacement.
 
@@ -270,6 +279,7 @@ class IpcModelLoader(BaseModelLoader):
         for part in parts[:-1]:
             obj = getattr(obj, part)
         leaf_name = parts[-1]
+        previous_tensor = getattr(obj, leaf_name, None)
         if is_param:
             # requires_grad=False: the IPC memory is shared/read-only and SGLang
             # is inference-only, so autograd must never write into it.
@@ -286,13 +296,25 @@ class IpcModelLoader(BaseModelLoader):
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
 
+        replacement_tensor = getattr(obj, leaf_name)
+        return (
+            previous_tensor if isinstance(previous_tensor, torch.Tensor) else None,
+            replacement_tensor,
+        )
+
+    @staticmethod
+    def _restore_tensor_metadata(tensor: torch.Tensor, metadata: dict) -> None:
+        """Restore daemon post-load metadata lost by CUDA IPC deserialization."""
+        if metadata.get("format_ue8m0", False):
+            tensor.format_ue8m0 = True
+
     def _load_zero_copy_mode(
         self,
         model_config,
         device_config,
         entries,
         quant_config,
-    ) -> nn.Module:
+    ) -> tuple[nn.Module, dict[int, torch.Tensor]]:
         """Zero-copy load: map IPC tensors directly as param.data.
 
         The model is initialized on the meta device (no memory allocation),
@@ -333,6 +355,7 @@ class IpcModelLoader(BaseModelLoader):
         imported_count = 0
         mismatched = []
         new_params_count = 0
+        tensor_replacements = {}
         map_tic = time.perf_counter()
 
         # Iterate over ALL daemon entries (not just model params/buffers).
@@ -360,7 +383,14 @@ class IpcModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            previous_tensor, replacement_tensor = self._set_module_tensor(
+                model, name, imported_tensor, is_param=is_param
+            )
+            self._restore_tensor_metadata(
+                replacement_tensor, entry.get("metadata", {})
+            )
+            if previous_tensor is not None:
+                tensor_replacements[id(previous_tensor)] = replacement_tensor
             imported_refs.append(imported_tensor)
             imported_count += 1
 
@@ -427,7 +457,7 @@ class IpcModelLoader(BaseModelLoader):
             f"({new_params_count} new post-quant), time={map_elapsed:.3f}s"
         )
 
-        return model
+        return model, tensor_replacements
 
     def _fetch_from_cache(self, model_config) -> Optional[dict]:
         """Connect to daemon, validate config, fetch IPC handles.
@@ -478,7 +508,7 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_exec, get_parallel
+            from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
             ps = get_parallel()
             tp_size = ps.tp_size
@@ -517,10 +547,16 @@ class IpcModelLoader(BaseModelLoader):
                 attn_cp_size=ps.attn_cp_size,
                 moe_dense_tp_size=ps.moe_dense_tp_size,
                 moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+                attention_backend=get_exec().kernel.attention_backend or "",
+                prefill_attention_backend=get_exec().kernel.prefill_attention_backend
+                or "",
+                decode_attention_backend=get_exec().kernel.decode_attention_backend
+                or "",
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
+                random_seed=get_device().random_seed,
                 **compute_env_stamp(),
             )
 

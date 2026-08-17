@@ -108,8 +108,10 @@ class ExpertBackupClient:
                 logger.warning("Register fails. Stop using expert weight backup!")
                 break
 
-    def update_weights(self, weight_name_filter=None):
-        global_expert_location_metadata = get_global_expert_location_metadata()
+    def update_weights(self, weight_name_filter=None, expert_location_metadata=None):
+        global_expert_location_metadata = (
+            expert_location_metadata or get_global_expert_location_metadata()
+        )
         num_experts = (
             self.model_config.hf_config.n_routed_experts
             + get_exec().moe.ep_num_redundant_experts

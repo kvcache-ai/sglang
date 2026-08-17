@@ -36,20 +36,18 @@ class EPLBManager:
         ps: Any,
         get_model: Callable[[], nn.Module],
         get_expert_location_updater: Callable[[], ExpertLocationUpdater],
-        get_expert_backup_client: Callable[[], Any],
-        get_weight_updater: Callable[[], Any],
+        get_daemon_hbm_source_client: Callable[[], Any],
     ):
         super().__init__()
         # These collaborators are set on ModelRunner AFTER EPLBManager is
-        # constructed (model load, expert_backup_client, weight_updater), so
+        # constructed (model load and daemon-HBM source client), so
         # they are read through getters at rebalance time, not captured here.
         self._server_args = server_args
         self._model_config = model_config
         self._ps = ps
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
-        self._get_expert_backup_client = get_expert_backup_client
-        self._get_weight_updater = get_weight_updater
+        self._get_daemon_hbm_source_client = get_daemon_hbm_source_client
         self._rebalance_layers_per_chunk = (
             self._server_args.eplb_rebalance_layers_per_chunk
         )
@@ -167,8 +165,7 @@ class EPLBManager:
                     else self._ps.tp_rank
                 ),
                 use_flat_topology=is_post_scale_rebalance,
-                expert_backup_client=self._get_expert_backup_client(),
-                update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
+                daemon_hbm_source_client=self._get_daemon_hbm_source_client(),
                 ep_dispatch_algorithm=self._server_args.ep_dispatch_algorithm,
                 init_lplb_solvers_callable=lambda: init_lplb_solvers(
                     model_config=self._model_config
@@ -308,10 +305,9 @@ def update_expert_location_with_recovery(
     nnodes: int,
     tp_rank: int,
     use_flat_topology: bool = False,
-    expert_backup_client,
-    update_weights_from_disk_callable,
     ep_dispatch_algorithm: str,
     init_lplb_solvers_callable,
+    daemon_hbm_source_client=None,
 ):
     p2p_missing_logical_experts = expert_location_updater.update(
         model.routed_experts_weights_of_layer,
@@ -320,33 +316,27 @@ def update_expert_location_with_recovery(
         nnodes=nnodes,
         rank=tp_rank,
         use_flat_topology=use_flat_topology,
+        commit=False,
     )
 
     if len(p2p_missing_logical_experts) > 0:
-        # Load the missing expert weights from disk
-        if callable(getattr(model, "generate_weight_name_filter", None)):
-            # Filter and load only missing expert weights
-            weight_name_filter = model.generate_weight_name_filter(
-                p2p_missing_logical_experts
+        if daemon_hbm_source_client is None:
+            raise RuntimeError(
+                "[DaemonHBMExpertRecovery] missing daemon-HBM source for "
+                "faulted expert recovery"
             )
-        else:
-            # Do a full reload from disk/DRAM
-            logger.info(
-                "[Elastic EP] Model does not implement generate_weight_name_filter. "
-                "Performing full weight reload."
-            )
-            weight_name_filter = None
+        # Do not publish the new mapping until every missing expert has been
+        # restored from retained daemon HBM. DRAM and disk fallback use a
+        # separate ownership protocol and are intentionally not part of this
+        # fault-recovery path.
+        daemon_hbm_source_client.restore_missing_experts(
+            missing_logical_experts_by_layers=p2p_missing_logical_experts,
+            old_expert_location_metadata=get_global_expert_location_metadata(),
+            new_expert_location_metadata=new_expert_location_metadata,
+        )
 
-        if expert_backup_client is not None and expert_backup_client.use_backup:
-            # Load the missing weights from the DRAM backup
-            expert_backup_client.update_weights(weight_name_filter)
-        else:
-            # Load the missing weights from disk
-            update_weights_from_disk_callable(
-                get_model().model_path,
-                get_model().load_format,
-                weight_name_filter=weight_name_filter,
-            )
+    # Publish the new location only after P2P and daemon-HBM copies finish.
+    expert_location_updater.commit(new_expert_location_metadata, update_layer_ids)
 
     # Re-init LPLB solvers after expert location update
     if ep_dispatch_algorithm == "lp":
