@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import copy
 import importlib.util
@@ -15,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGE3_TEST_PATH = REPO_ROOT / "test/registered/unit/test_glm5_next_stage3.py"
 MODEL_CONFIG_PATH = REPO_ROOT / "python/sglang/srt/configs/model_config.py"
 PROCESSOR_PATH = REPO_ROOT / "python/sglang/srt/multimodal/processors/glm5_next.py"
+CHAT_TEMPLATE_PATH = REPO_ROOT / "examples/chat_template/glm5_next_multimodal.jinja"
 GLM_OCR_MODEL_PATH = REPO_ROOT / "python/sglang/srt/models/glm_ocr.py"
 GLM5_MODEL_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next.py"
 
@@ -188,6 +190,42 @@ def _compile_checkpoint_image_config_parser():
     }
     exec(compile(module, str(PROCESSOR_PATH), "exec"), namespace)
     return namespace["from_checkpoint_config"], expected_values
+
+
+def _compile_multi_image_request_harness(mrope_embedding):
+    tree = ast.parse(
+        PROCESSOR_PATH.read_text(encoding="utf-8"), filename=str(PROCESSOR_PATH)
+    )
+    processor = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Glm5NextSGLangProcessor"
+    )
+    method_names = {
+        "_count_image_placeholders",
+        "_get_multi_image_mrope",
+        "process_mm_data_async",
+    }
+    methods = [
+        copy.deepcopy(node)
+        for node in processor.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in method_names
+    ]
+    assert {method.name for method in methods} == method_names
+    for method in methods:
+        method.decorator_list = []
+    module = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
+    namespace = {
+        "MRotaryEmbedding": mrope_embedding,
+        "torch": pytest.importorskip("torch"),
+    }
+    exec(compile(module, str(PROCESSOR_PATH), "exec"), namespace)
+    return type(
+        "_Glm5NextMultiImageRequestHarness",
+        (),
+        {method_name: namespace[method_name] for method_name in method_names},
+    )
 
 
 def test_exact_checkpoint_token_ids_and_vision_defaults():
@@ -388,3 +426,188 @@ def test_processor_and_shared_glm_ocr_changes_remain_isolated():
     assert "merger_context_dim=self.vision_config.projection_intermediate_size" in (
         glm5_source
     )
+
+
+def test_glm5_multimodal_chat_template_preserves_image_order():
+    jinja2 = pytest.importorskip("jinja2")
+    source = CHAT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    def raise_exception(message):
+        raise ValueError(message)
+
+    template = jinja2.Environment().from_string(source)
+    rendered = template.render(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "image"},
+                    {"type": "text", "text": "compare in order"},
+                ],
+            }
+        ],
+        add_generation_prompt=True,
+        raise_exception=raise_exception,
+    )
+    assert rendered == (
+        "[gMASK]<sop><|user|>\n<|image|><|image|>compare in order<|assistant|>\n"
+    )
+
+    text_only = template.render(
+        messages=[{"role": "user", "content": "hello"}],
+        add_generation_prompt=True,
+        raise_exception=raise_exception,
+    )
+    assert text_only == "[gMASK]<sop><|user|>\nhello<|assistant|>\n"
+
+    with pytest.raises(ValueError, match="only text and image"):
+        template.render(
+            messages=[
+                {"role": "user", "content": [{"type": "video"}]},
+            ],
+            add_generation_prompt=True,
+            raise_exception=raise_exception,
+        )
+
+
+def test_multi_image_request_cardinality_offsets_and_feature_contract():
+    torch = pytest.importorskip("torch")
+
+    class _MRotaryEmbedding:
+        @staticmethod
+        def get_rope_index_glm4v(input_ids, **kwargs):
+            del kwargs
+            seq_len = input_ids.shape[-1]
+            return (
+                torch.zeros((3, 1, seq_len), dtype=torch.long),
+                torch.zeros((1, 1), dtype=torch.long),
+            )
+
+    harness = _compile_multi_image_request_harness(_MRotaryEmbedding)
+
+    def run_request(
+        grids,
+        *,
+        image_data=None,
+        prompt_count=None,
+        loaded_count=None,
+        offsets_override=None,
+        feature_rows=None,
+        video_data=None,
+        audio_data=None,
+        adjacent_placeholders=False,
+    ):
+        image_count = len(grids)
+        image_data = (
+            [f"image-{index}" for index in range(image_count)]
+            if image_data is None
+            else image_data
+        )
+        prompt_count = len(image_data) if prompt_count is None else prompt_count
+        loaded_count = len(image_data) if loaded_count is None else loaded_count
+        grid_tensor = torch.tensor(grids, dtype=torch.long)
+        patch_counts = [int(grid.prod().item()) for grid in grid_tensor]
+        token_counts = [patch_count // 4 for patch_count in patch_counts]
+
+        input_ids = [101]
+        offsets = []
+        for index, token_count in enumerate(token_counts):
+            start = len(input_ids)
+            input_ids.extend([7] * token_count)
+            offsets.append((start, len(input_ids) - 1))
+            if not adjacent_placeholders:
+                input_ids.append(102 + index)
+        if adjacent_placeholders:
+            offsets = [(1, len(input_ids) - 1)]
+            input_ids.append(102)
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        if offsets_override is not None:
+            offsets = offsets_override
+
+        expected_feature_rows = sum(patch_counts)
+        feature_rows = expected_feature_rows if feature_rows is None else feature_rows
+        item = SimpleNamespace(
+            feature=torch.zeros((feature_rows, 1176), dtype=torch.float32),
+            offsets=offsets,
+            is_image=lambda: True,
+        )
+        ret = SimpleNamespace(
+            image_grid_thw=grid_tensor,
+            attention_mask=torch.ones_like(input_ids).unsqueeze(0),
+        )
+
+        processor = harness()
+        processor.VIDEO_TOKEN = "<|video|>"
+        processor.VIDEO_TOKEN_ID = 8
+        processor.IMAGE_TOKEN = "<|image|>"
+        processor.IM_TOKEN_ID = 7
+        processor.IMAGE_START_TOKEN_ID = 9
+        processor.IMAGE_END_TOKEN_ID = 10
+        processor.spatial_merge_size = 2
+        processor.hf_config = SimpleNamespace()
+        processor.mm_tokens = object()
+        processor.load_mm_data = lambda **kwargs: SimpleNamespace(
+            images=[object()] * loaded_count,
+            videos=[],
+            audios=[],
+        )
+        processor.process_and_combine_mm_data = lambda *args, **kwargs: (
+            [item],
+            input_ids,
+            ret,
+        )
+        prompt_separator = "" if adjacent_placeholders else " compare "
+        prompt = prompt_separator.join(["<|image|>"] * prompt_count)
+        request = SimpleNamespace(video_data=video_data)
+        result = asyncio.run(
+            processor.process_mm_data_async(
+                image_data,
+                [] if audio_data is None else audio_data,
+                prompt,
+                request,
+            )
+        )
+        return result
+
+    cases = (
+        [[1, 8, 20]],
+        [[1, 8, 20], [1, 4, 12]],
+        [[1, 4, 4]] * 4,
+        [[1, 4, 4]] * 8,
+    )
+    for grids in cases:
+        result = run_request(grids)
+        assert len(result["mm_items"][0].offsets) == len(grids)
+        assert tuple(result["mrope_positions"].shape) == (
+            3,
+            len(result["input_ids"]),
+        )
+
+    adjacent_result = run_request([[1, 8, 20], [1, 4, 12]], adjacent_placeholders=True)
+    assert adjacent_result["mm_items"][0].offsets == [(1, 40), (41, 52)]
+    assert adjacent_result["mrope_positions"][:, 0].tolist() == [0, 0, 0]
+    assert adjacent_result["mrope_positions"][:, 1].tolist() == [1, 1, 1]
+    assert adjacent_result["mrope_positions"][:, 40].tolist() == [1, 4, 10]
+    assert adjacent_result["mrope_positions"][:, 41].tolist() == [11, 11, 11]
+    assert adjacent_result["mrope_positions"][:, 52].tolist() == [11, 12, 16]
+    assert adjacent_result["mrope_positions"][:, 53].tolist() == [17, 17, 17]
+    assert adjacent_result["mrope_position_delta"].tolist() == [[-36]]
+
+    two_grids = [[1, 8, 20], [1, 4, 12]]
+    with pytest.raises(ValueError, match="at least one image"):
+        run_request(two_grids, image_data=[], prompt_count=0)
+    with pytest.raises(ValueError, match="count/placeholder count mismatch"):
+        run_request(two_grids, prompt_count=1)
+    with pytest.raises(ValueError, match="processor_output"):
+        run_request(two_grids, image_data=["image-0", {"format": "processor_output"}])
+    with pytest.raises(ValueError, match="does not support video"):
+        run_request(two_grids, video_data=["video-0"])
+    with pytest.raises(ValueError, match="does not support audio"):
+        run_request(two_grids, audio_data=["audio-0"])
+    with pytest.raises(ValueError, match="changed the request cardinality"):
+        run_request(two_grids, loaded_count=1)
+    with pytest.raises(RuntimeError, match="offsets do not cover"):
+        run_request(two_grids, offsets_override=[(1, 40), (42, 54)])
+    with pytest.raises(RuntimeError, match="feature/grid mismatch"):
+        run_request(two_grids, feature_rows=207)

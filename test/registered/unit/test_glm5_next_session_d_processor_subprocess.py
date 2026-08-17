@@ -171,6 +171,18 @@ def _assert_image_output(output, tokenizer, torch):
     assert int((output.mm_token_type_ids == 1).sum().item()) == 40
 
 
+def _assert_multi_image_output(output, tokenizer, torch, image_count):
+    image_token_id = tokenizer.convert_tokens_to_ids("<|image|>")
+    assert tuple(output.image_grid_thw.shape) == (image_count, 3)
+    patch_counts = [int(grid.prod().item()) for grid in output.image_grid_thw]
+    expected_tokens = sum(patch_count // 4 for patch_count in patch_counts)
+    assert tuple(output.pixel_values.shape) == (sum(patch_counts), 1176)
+    assert output.pixel_values.dtype == torch.float32
+    assert bool(output.pixel_values.isfinite().all())
+    assert int((output.input_ids == image_token_id).sum().item()) == expected_tokens
+    assert int((output.mm_token_type_ids == 1).sum().item()) == expected_tokens
+
+
 def _run_image_and_processor_parity(glm5_module, dependencies):
     np, torch, Image, hf_image_module, Glm46VVideoProcessor = dependencies
 
@@ -208,6 +220,17 @@ def _run_image_and_processor_parity(glm5_module, dependencies):
         return_mm_token_type_ids=True,
     )
     _assert_image_output(output, tokenizer, torch)
+    second_image = Image.fromarray(
+        np.arange(211 * 97 * 3, dtype=np.uint8).reshape(211, 97, 3),
+        "RGB",
+    )
+    multi_output = processor(
+        images=[image, second_image],
+        text=["<|image|> describe <|image|>"],
+        return_tensors="pt",
+        return_mm_token_type_ids=True,
+    )
+    _assert_multi_image_output(multi_output, tokenizer, torch, 2)
 
     reference_config = copy.deepcopy(CHECKPOINT_IMAGE_CONFIG)
     reference_config.pop("image_processor_type")
@@ -241,11 +264,18 @@ def _run_image_and_processor_parity(glm5_module, dependencies):
     hf_image_module.smart_resize = _expanded_smart_resize
     try:
         reference_output = reference(images=[image], return_tensors="pt")
+        reference_multi_output = reference(
+            images=[image, second_image], return_tensors="pt"
+        )
     finally:
         hf_image_module.smart_resize = original_smart_resize
 
     assert torch.equal(output.image_grid_thw, reference_output.image_grid_thw)
     assert torch.equal(output.pixel_values, reference_output.pixel_values)
+    assert torch.equal(
+        multi_output.image_grid_thw, reference_multi_output.image_grid_thw
+    )
+    assert torch.equal(multi_output.pixel_values, reference_multi_output.pixel_values)
 
     _assert_raises(
         ValueError,
@@ -256,7 +286,7 @@ def _run_image_and_processor_parity(glm5_module, dependencies):
         ),
         "does not support video input",
     )
-    return image, tokenizer, output
+    return [image, second_image], tokenizer, output
 
 
 def _install_hf_utils_stubs(PretrainedConfig):
@@ -384,7 +414,7 @@ def _write_processor_config(path: Path, processor_config: dict):
 
 def _run_get_processor_smoke(
     glm5_module,
-    image,
+    images,
     tokenizer,
     torch,
     PretrainedConfig,
@@ -455,18 +485,25 @@ def _run_get_processor_smoke(
         assert processor.image_processor.patch_expand_factor == 2
 
         output = processor(
-            images=[image],
+            images=[images[0]],
             text=["<|image|> describe"],
             return_tensors="pt",
             return_mm_token_type_ids=True,
         )
         _assert_image_output(output, processor.tokenizer, torch)
+        multi_output = processor(
+            images=images,
+            text=["<|image|> describe <|image|>"],
+            return_tensors="pt",
+            return_mm_token_type_ids=True,
+        )
+        _assert_multi_image_output(multi_output, processor.tokenizer, torch, 2)
         _assert_raises(
             ValueError,
             lambda: processor(
-                images=[image],
+                images=[images[0]],
                 text=["<|image|> describe"],
-                videos=[image],
+                videos=[images[0]],
             ),
             "does not support video input",
         )
@@ -510,12 +547,12 @@ def _child_main() -> int:
         hf_image_module,
         Glm46VVideoProcessor,
     )
-    image, tokenizer, _output = _run_image_and_processor_parity(
+    images, tokenizer, _output = _run_image_and_processor_parity(
         glm5_module, dependencies
     )
     _run_get_processor_smoke(
         glm5_module,
-        image,
+        images,
         tokenizer,
         torch,
         PretrainedConfig,
@@ -525,7 +562,8 @@ def _child_main() -> int:
     )
     print(
         f"{SUCCESS_MARKER}: transformers-kt={installed_version}; "
-        "resize=112x280; grid=[1,8,20]; patches=160; tokens=40"
+        "single_and_multi_image_parity=pass; resize=112x280; "
+        "grid=[1,8,20]; patches=160; tokens=40"
     )
     return 0
 
