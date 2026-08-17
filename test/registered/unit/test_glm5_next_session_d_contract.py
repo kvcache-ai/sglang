@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGE3_TEST_PATH = REPO_ROOT / "test/registered/unit/test_glm5_next_stage3.py"
 MODEL_CONFIG_PATH = REPO_ROOT / "python/sglang/srt/configs/model_config.py"
 PROCESSOR_PATH = REPO_ROOT / "python/sglang/srt/multimodal/processors/glm5_next.py"
+CHAT_TEMPLATE_PATH = REPO_ROOT / "examples/chat_template/glm5_next_multimodal.jinja"
 GLM_OCR_MODEL_PATH = REPO_ROOT / "python/sglang/srt/models/glm_ocr.py"
 GLM5_MODEL_PATH = REPO_ROOT / "python/sglang/srt/models/glm5_next.py"
 
@@ -200,7 +201,11 @@ def _compile_multi_image_request_harness(mrope_embedding):
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "Glm5NextSGLangProcessor"
     )
-    method_names = {"_count_image_placeholders", "process_mm_data_async"}
+    method_names = {
+        "_count_image_placeholders",
+        "_get_multi_image_mrope",
+        "process_mm_data_async",
+    }
     methods = [
         copy.deepcopy(node)
         for node in processor.body
@@ -211,7 +216,10 @@ def _compile_multi_image_request_harness(mrope_embedding):
     for method in methods:
         method.decorator_list = []
     module = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
-    namespace = {"MRotaryEmbedding": mrope_embedding}
+    namespace = {
+        "MRotaryEmbedding": mrope_embedding,
+        "torch": pytest.importorskip("torch"),
+    }
     exec(compile(module, str(PROCESSOR_PATH), "exec"), namespace)
     return type(
         "_Glm5NextMultiImageRequestHarness",
@@ -420,6 +428,49 @@ def test_processor_and_shared_glm_ocr_changes_remain_isolated():
     )
 
 
+def test_glm5_multimodal_chat_template_preserves_image_order():
+    jinja2 = pytest.importorskip("jinja2")
+    source = CHAT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    def raise_exception(message):
+        raise ValueError(message)
+
+    template = jinja2.Environment().from_string(source)
+    rendered = template.render(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "image"},
+                    {"type": "text", "text": "compare in order"},
+                ],
+            }
+        ],
+        add_generation_prompt=True,
+        raise_exception=raise_exception,
+    )
+    assert rendered == (
+        "[gMASK]<sop><|user|>\n<|image|><|image|>compare in order<|assistant|>\n"
+    )
+
+    text_only = template.render(
+        messages=[{"role": "user", "content": "hello"}],
+        add_generation_prompt=True,
+        raise_exception=raise_exception,
+    )
+    assert text_only == "[gMASK]<sop><|user|>\nhello<|assistant|>\n"
+
+    with pytest.raises(ValueError, match="only text and image"):
+        template.render(
+            messages=[
+                {"role": "user", "content": [{"type": "video"}]},
+            ],
+            add_generation_prompt=True,
+            raise_exception=raise_exception,
+        )
+
+
 def test_multi_image_request_cardinality_offsets_and_feature_contract():
     torch = pytest.importorskip("torch")
 
@@ -535,6 +586,13 @@ def test_multi_image_request_cardinality_offsets_and_feature_contract():
 
     adjacent_result = run_request([[1, 8, 20], [1, 4, 12]], adjacent_placeholders=True)
     assert adjacent_result["mm_items"][0].offsets == [(1, 40), (41, 52)]
+    assert adjacent_result["mrope_positions"][:, 0].tolist() == [0, 0, 0]
+    assert adjacent_result["mrope_positions"][:, 1].tolist() == [1, 1, 1]
+    assert adjacent_result["mrope_positions"][:, 40].tolist() == [1, 4, 10]
+    assert adjacent_result["mrope_positions"][:, 41].tolist() == [11, 11, 11]
+    assert adjacent_result["mrope_positions"][:, 52].tolist() == [11, 12, 16]
+    assert adjacent_result["mrope_positions"][:, 53].tolist() == [17, 17, 17]
+    assert adjacent_result["mrope_position_delta"].tolist() == [[-36]]
 
     two_grids = [[1, 8, 20], [1, 4, 12]]
     with pytest.raises(ValueError, match="at least one image"):

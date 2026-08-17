@@ -1,0 +1,28 @@
+{%- macro render_content(content) -%}
+{%- if content is string -%}
+{{ content }}
+{%- else -%}
+{%- for item in content -%}
+{%- if item['type'] == 'text' -%}
+{{ item['text'] }}
+{%- elif item['type'] == 'image' -%}
+{{ '<|image|>' }}
+{%- else -%}
+{{ raise_exception('GLM-5-Next supports only text and image chat content.') }}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endmacro -%}
+{%- if messages and messages[0]['role'] == 'system' -%}
+{{ '[gMASK]<sop><|system|>\n' }}{{ render_content(messages[0]['content']) }}
+{%- set loop_messages = messages[1:] -%}
+{%- else -%}
+{{ '[gMASK]<sop>' }}
+{%- set loop_messages = messages -%}
+{%- endif -%}
+{%- for message in loop_messages -%}
+{{ '<|' + message['role'] + '|>\n' }}{{ render_content(message['content']) }}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{ '<|assistant|>\n' }}
+{%- endif -%}
