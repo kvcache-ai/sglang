@@ -200,7 +200,7 @@ class Glm5NextProcessor(Glm46VProcessor):
 
 
 class Glm5NextSGLangProcessor(Glm4vImageProcessor):
-    """Strict one-image request adapter registered only for GLM-5-Next."""
+    """Strict image-only request adapter registered only for GLM-5-Next."""
 
     models = [Glm5NextForConditionalGeneration]
 
@@ -286,22 +286,23 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
             raise ValueError("GLM-5-Next Session D does not support audio input.")
         if getattr(request_obj, "video_data", None):
             raise ValueError("GLM-5-Next Session D does not support video input.")
-        if not isinstance(image_data, list) or len(image_data) != 1:
+        if not isinstance(image_data, list) or not image_data:
             count = len(image_data) if isinstance(image_data, list) else 0
             raise ValueError(
-                "GLM-5-Next Session D requires exactly one image per request; "
+                "GLM-5-Next requires at least one image per image request; "
                 f"got {count}."
             )
-        if isinstance(image_data[0], dict):
+        image_count = len(image_data)
+        if any(isinstance(image, dict) for image in image_data):
             raise ValueError(
-                "GLM-5-Next Session D does not accept processor_output or "
+                "GLM-5-Next does not accept processor_output or "
                 "precomputed_embedding image inputs."
             )
         placeholder_count = self._count_image_placeholders(input_text)
-        if placeholder_count != 1:
+        if placeholder_count != image_count:
             raise ValueError(
-                "GLM-5-Next Session D requires exactly one image placeholder; "
-                f"got {placeholder_count}."
+                "GLM-5-Next image count/placeholder count mismatch: "
+                f"images={image_count}, placeholders={placeholder_count}."
             )
 
         # load_mm_data is synchronous: it submits image I/O to the processor's
@@ -313,9 +314,14 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
             video_data=None,
             multimodal_tokens=self.mm_tokens,
         )
-        if len(base_output.images) != 1 or base_output.videos or base_output.audios:
+        if (
+            len(base_output.images) != image_count
+            or base_output.videos
+            or base_output.audios
+        ):
             raise ValueError(
-                "GLM-5-Next image loading must produce exactly one still image."
+                "GLM-5-Next image loading changed the request cardinality: "
+                f"expected={image_count}, loaded={len(base_output.images)}."
             )
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(
@@ -324,26 +330,95 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
         image_grid_thw = getattr(ret, "image_grid_thw", None)
         if image_grid_thw is None and isinstance(ret, dict):
             image_grid_thw = ret.get("image_grid_thw")
-        if image_grid_thw is None or tuple(image_grid_thw.shape) != (1, 3):
+        expected_grid_shape = (image_count, 3)
+        if image_grid_thw is None or tuple(image_grid_thw.shape) != expected_grid_shape:
+            actual_grid_shape = (
+                None if image_grid_thw is None else tuple(image_grid_thw.shape)
+            )
             raise RuntimeError(
-                "GLM-5-Next processor must return image_grid_thw with shape (1, 3)."
+                "GLM-5-Next processor returned an invalid image_grid_thw shape: "
+                f"expected={expected_grid_shape}, got={actual_grid_shape}."
             )
         if len(mm_items) != 1 or not mm_items[0].is_image():
             raise RuntimeError(
-                "GLM-5-Next processor must return exactly one image item."
+                "GLM-5-Next processor must return one bundled image item."
             )
-        expected_tokens = int(image_grid_thw[0].prod().item()) // (
-            self.spatial_merge_size**2
-        )
+
+        merge_area = self.spatial_merge_size**2
+        patch_counts = [int(grid.prod().item()) for grid in image_grid_thw]
+        if any(patch_count % merge_area for patch_count in patch_counts):
+            raise RuntimeError(
+                "GLM-5-Next image patch counts must be divisible by the spatial "
+                f"merge area {merge_area}; got {patch_counts}."
+            )
+        expected_tokens_per_image = [
+            patch_count // merge_area for patch_count in patch_counts
+        ]
+        expected_tokens = sum(expected_tokens_per_image)
         actual_tokens = int((input_ids == self.IM_TOKEN_ID).sum().item())
         if actual_tokens != expected_tokens:
             raise RuntimeError(
                 "GLM-5-Next image placeholder/feature mismatch: "
                 f"expected {expected_tokens} image tokens, got {actual_tokens}."
             )
-        if len(mm_items[0].offsets) != 1:
+
+        source_offsets = mm_items[0].offsets or []
+        covered_positions = []
+        for start, end in source_offsets:
+            start, end = int(start), int(end)
+            if end < start:
+                raise RuntimeError(
+                    "GLM-5-Next processor returned an inverted image offset: "
+                    f"start={start}, end={end}."
+                )
+            covered_positions.extend(range(start, end + 1))
+        image_token_positions = (
+            (input_ids == self.IM_TOKEN_ID).nonzero(as_tuple=True)[0].tolist()
+        )
+        if covered_positions != image_token_positions:
             raise RuntimeError(
-                "GLM-5-Next processor must return one contiguous image offset."
+                "GLM-5-Next processor image offsets do not cover exactly the "
+                "expanded image tokens."
+            )
+
+        # Adjacent placeholders form one token run in the generic processor.
+        # Split by the per-image grid sizes so the scheduler still receives one
+        # ordered offset per source image.
+        normalized_offsets = []
+        token_cursor = 0
+        for image_index, expected_tokens_for_image in enumerate(
+            expected_tokens_per_image
+        ):
+            positions = image_token_positions[
+                token_cursor : token_cursor + expected_tokens_for_image
+            ]
+            token_cursor += expected_tokens_for_image
+            is_contiguous = len(positions) == expected_tokens_for_image and all(
+                right == left + 1 for left, right in zip(positions, positions[1:])
+            )
+            if not is_contiguous:
+                raise RuntimeError(
+                    "GLM-5-Next image offset/token mismatch at image "
+                    f"{image_index}: expected={expected_tokens_for_image}, "
+                    f"positions={positions}."
+                )
+            normalized_offsets.append((positions[0], positions[-1]))
+        mm_items[0].offsets = normalized_offsets
+
+        feature = mm_items[0].feature
+        feature_shape = getattr(feature, "shape", None)
+        if feature_shape is None:
+            feature_shape = getattr(getattr(feature, "info_data", None), "shape", None)
+        expected_feature_rows = sum(patch_counts)
+        if (
+            feature_shape is None
+            or len(feature_shape) == 0
+            or int(feature_shape[0]) != expected_feature_rows
+        ):
+            raise RuntimeError(
+                "GLM-5-Next image feature/grid mismatch: "
+                f"expected_rows={expected_feature_rows}, "
+                f"feature_shape={None if feature_shape is None else tuple(feature_shape)}."
             )
 
         attention_mask = getattr(ret, "attention_mask", None)
