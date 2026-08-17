@@ -2372,3 +2372,19 @@ def build_precomputed_topk_output(
 # ops (and their torch.compile fake impls) were retired here — both CUDA gate
 # paths now route through the unified Triton router (kernels/ops/moe/moe_fused_gate.py),
 # whose Python impl is traceable directly, so no register_fake shim is needed.
+
+
+def refresh_topk_config_tensor_references(
+    model: torch.nn.Module, replacements: dict[int, torch.Tensor]
+) -> int:
+    """Rebind cached TopK tensors after a loader replaces model tensors."""
+    refreshed = 0
+    for module in model.modules():
+        if not isinstance(module, TopK):
+            continue
+        correction_bias = module.topk_config.correction_bias
+        replacement = replacements.get(id(correction_bias))
+        if replacement is not None:
+            module.topk_config.correction_bias = replacement
+            refreshed += 1
+    return refreshed

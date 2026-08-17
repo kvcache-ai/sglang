@@ -175,6 +175,8 @@ def build_weight_cache_daemon_command(
         server_args.load_format,
         "--dtype",
         server_args.dtype,
+        "--random-seed",
+        str(server_args.random_seed),
         "--dist-init-method",
         dist_init_method,
     ]
@@ -188,6 +190,28 @@ def build_weight_cache_daemon_command(
         cmd += ["--moe-a2a-backend", server_args.moe_a2a_backend]
     if server_args.deepep_mode != "auto":
         cmd += ["--deepep-mode", server_args.deepep_mode]
+    # Attention backend selection participates in model initialization. Keep
+    # child daemons on the same backend as the process that launches them so
+    # the CacheConfig fingerprint describes the tensors actually exported.
+    if server_args.attention_backend:
+        cmd += ["--attention-backend", server_args.attention_backend]
+    if server_args.prefill_attention_backend:
+        cmd += ["--prefill-attention-backend", server_args.prefill_attention_backend]
+    if server_args.decode_attention_backend:
+        cmd += ["--decode-attention-backend", server_args.decode_attention_backend]
+    # EPLB changes the physical expert tensor layout by adding redundant
+    # replicas. The daemon must construct that identical layout before it can
+    # safely publish CUDA IPC handles or retained-HBM recovery descriptors.
+    if server_args.enable_eplb:
+        cmd += ["--enable-eplb"]
+        cmd += [
+            "--ep-num-redundant-experts",
+            str(server_args.ep_num_redundant_experts),
+        ]
+        if server_args.elastic_ep_backend is not None:
+            cmd += ["--elastic-ep-backend", server_args.elastic_ep_backend]
+        if server_args.mooncake_ib_device:
+            cmd += ["--mooncake-ib-device", server_args.mooncake_ib_device]
     if server_args.quantization:
         cmd += ["--quantization", server_args.quantization]
     if (
@@ -393,6 +417,8 @@ class WeightCacheDaemon:
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
+
+        self._initialize_eplb_expert_location_metadata(model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -416,10 +442,14 @@ class WeightCacheDaemon:
             attn_cp_size=self.attn_cp_size,
             moe_dense_tp_size=self.moe_dense_tp_size,
             moe_a2a_backend=self.moe_a2a_backend,
+            attention_backend=server_args.attention_backend or "",
+            prefill_attention_backend=server_args.prefill_attention_backend or "",
+            decode_attention_backend=server_args.decode_attention_backend or "",
             quant_method=quant_method,
             quant_config_hash=hash_quant_config(quant_config),
             dtype=str(model_config.dtype),
             revision=self.revision or "",
+            random_seed=server_args.random_seed,
             **compute_env_stamp(),
         )
 
@@ -463,6 +493,27 @@ class WeightCacheDaemon:
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
             f"Exported {len(self.state_entries)} tensors as IPC handles. "
             f"Ready to serve."
+        )
+
+    def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
+        # EPLB changes each rank's physical expert slots before the model is
+        # constructed. The serving ModelRunner installs this metadata before
+        # loading weights; the daemon must build the identical slot layout or
+        # CUDA IPC can map valid-looking tensors to different logical experts.
+        if not self.server_args.enable_eplb:
+            return
+
+        from sglang.srt.eplb.expert_location import (
+            compute_initial_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                server_args=self.server_args,
+                model_config=model_config,
+                moe_ep_rank=get_parallel().moe_ep_rank,
+            )
         )
 
     def _init_hbm_expert_source(self) -> None:
@@ -531,6 +582,16 @@ class WeightCacheDaemon:
         param_names = set(
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
+        named_tensors = {
+            name: tensor
+            for name, tensor in self.model.named_parameters(remove_duplicate=False)
+        }
+        named_tensors.update(
+            {
+                name: tensor
+                for name, tensor in self.model.named_buffers(remove_duplicate=False)
+            }
+        )
         state_dict_names = set(self.model.state_dict().keys())
 
         # Export all items from state_dict (parameters + persistent buffers)
@@ -543,6 +604,7 @@ class WeightCacheDaemon:
                 "shape": list(tensor.shape),
                 "dtype": str(tensor.dtype).replace("torch.", ""),
                 "is_param": name in param_names,
+                "metadata": self._tensor_metadata(named_tensors.get(name, tensor)),
             }
 
         # Also export non-persistent buffers (not in state_dict but needed
@@ -558,6 +620,7 @@ class WeightCacheDaemon:
                     "shape": list(buf.shape),
                     "dtype": str(buf.dtype).replace("torch.", ""),
                     "is_param": False,
+                    "metadata": self._tensor_metadata(buf),
                 }
                 non_persistent_count += 1
 
@@ -572,6 +635,18 @@ class WeightCacheDaemon:
             f"({non_persistent_count} non-persistent buffers), "
             f"serialized handle size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
+
+    @staticmethod
+    def _tensor_metadata(tensor: torch.Tensor) -> dict[str, bool]:
+        """Return tensor-side state that CUDA IPC storage cannot carry.
+
+        Block-FP8 MoE post-processing marks UE8M0 scale tensors with this
+        attribute. The client maps the bytes into a fresh Parameter, so it must
+        receive the marker explicitly rather than re-running quantization.
+        """
+        if getattr(tensor, "format_ue8m0", False):
+            return {"format_ue8m0": True}
+        return {}
 
     def serve(self):
         """Block and serve IPC handles over Unix socket."""

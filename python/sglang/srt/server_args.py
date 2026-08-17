@@ -3538,6 +3538,11 @@ class ServerArgs:
         "Mooncake IB device configuration for daemon HBM expert sources.",
         NS("model"),
     ] = None
+    enable_elastic_hbm_expert_source: A[
+        bool,
+        "Restore missing Elastic EP experts from retained weight-cache daemon HBM.",
+        NS("model"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Custom hooks, probe, and plugins
@@ -7552,10 +7557,27 @@ class ServerArgs:
                 "(--weight-cache-mode off) for this configuration."
             )
 
-        if self.weight_cache_mode != "off" and self.enable_eplb:
+        if (
+            self.weight_cache_mode != "off"
+            and self.enable_eplb
+            and not self.enable_elastic_hbm_expert_source
+        ):
             raise ValueError(
-                "--weight-cache-mode is not supported together with --enable-eplb."
+                "--weight-cache-mode is not supported together with --enable-eplb "
+                "unless --enable-elastic-hbm-expert-source is enabled."
             )
+
+        if self.enable_elastic_hbm_expert_source:
+            if self.weight_cache_mode != "client":
+                raise ValueError(
+                    "--enable-elastic-hbm-expert-source requires "
+                    "--weight-cache-mode client backed by persistent daemons."
+                )
+            if not self.enable_eplb or self.elastic_ep_backend is None:
+                raise ValueError(
+                    "--enable-elastic-hbm-expert-source requires --enable-eplb "
+                    "and --elastic-ep-backend."
+                )
 
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
@@ -9832,7 +9854,7 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
-            if server_args.is_ep_scale_joiner:
+            if server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA

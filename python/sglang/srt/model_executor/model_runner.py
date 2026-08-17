@@ -50,7 +50,6 @@ from sglang.srt.elastic_ep.elastic_ep import (
     register_scale_cohort,
     try_admit_scale_ranks,
 )
-from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -643,7 +642,7 @@ class ModelRunner:
         # routed-experts capture-write kernel.
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
-        self.maybe_init_expert_backup_client()
+        self.maybe_init_daemon_hbm_source_client()
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
@@ -709,8 +708,7 @@ class ModelRunner:
                 ps=self.ps,
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,
-                get_expert_backup_client=lambda: self.expert_backup_client,
-                get_weight_updater=lambda: self.weight_updater,
+                get_daemon_hbm_source_client=lambda: self.daemon_hbm_source_client,
             )
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
@@ -731,21 +729,37 @@ class ModelRunner:
             vocab_size=self.model_config.vocab_size,
         )
 
-    def maybe_init_expert_backup_client(self):
-        self.expert_backup_client = (
-            ExpertBackupClient(
-                server_args=self.server_args,
-                model_config=self.model_config,
-                moe_ep_size=self.ps.moe_ep_size,
+    def maybe_init_daemon_hbm_source_client(self):
+        self.daemon_hbm_source_client = None
+        # A recovery/scale joiner has not been admitted to the survivor world
+        # when this runs. The daemon-HBM registry is only needed by survivors
+        # for the fault-time EPLB restore, so do not issue its world collective
+        # from a pre-admission joiner.
+        if (
+            get_model().enable_elastic_hbm_expert_source
+            and not self.server_args.is_ep_joiner
+        ):
+            from sglang.srt.distributed.parallel_state import (
+                get_moe_ep_group,
+                get_world_group,
+            )
+            from sglang.srt.elastic_ep.daemon_hbm_expert_source import (
+                DaemonHBMExpertSourceClient,
+                collect_daemon_hbm_source_registry,
+            )
+
+            assert self.load_config.weight_cache_socket is not None
+            registry = collect_daemon_hbm_source_registry(
+                socket_path=self.load_config.weight_cache_socket,
+                world_group=get_world_group(),
+            )
+            self.daemon_hbm_source_client = DaemonHBMExpertSourceClient(
                 moe_ep_rank=self.ps.moe_ep_rank,
+                old_ep_world_ranks=list(get_moe_ep_group().ranks),
                 get_model=lambda: self.model,
+                registry=registry,
             )
-            if (
-                get_exec().moe.enable_elastic_expert_backup
-                and get_exec().moe.elastic_ep_backend is not None
-            )
-            else None
-        )
+
 
     def maybe_apply_post_load_model_transforms(self):
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)

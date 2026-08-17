@@ -63,10 +63,14 @@ def _make_cache_config(**overrides) -> CacheConfig:
         attn_cp_size=1,
         moe_dense_tp_size=None,
         moe_a2a_backend="none",
+        attention_backend="",
+        prefill_attention_backend="",
+        decode_attention_backend="",
         quant_method="",
         quant_config_hash="",
         dtype="torch.float16",
         revision="",
+        random_seed=42,
         device_capability="8.0",
         torch_version="2.5.1",
     )
@@ -134,10 +138,14 @@ class TestCacheConfig(CustomTestCase):
             ("enable_dp_attention", True),
             ("moe_dense_tp_size", 1),
             ("moe_a2a_backend", "mooncake"),
+            ("attention_backend", "flashinfer"),
+            ("prefill_attention_backend", "flashinfer"),
+            ("decode_attention_backend", "flashinfer"),
             ("dtype", "torch.bfloat16"),
             ("quant_method", "fp8"),
             ("model_path", "/models/other"),
             ("revision", "v2"),
+            ("random_seed", 7),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
         ):
@@ -244,12 +252,20 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
             moe_dense_tp_size=1,
             moe_a2a_backend="mooncake",
             deepep_mode="low_latency",
+            enable_eplb=True,
+            ep_num_redundant_experts=72,
+            elastic_ep_backend="mooncake",
+            mooncake_ib_device="mlx5_1,mlx5_3",
             load_format="safetensors",
             dtype="bfloat16",
             quantization="fp8",
             model_loader_extra_config='{"key": "value"}',
             trust_remote_code=True,
             revision="test-revision",
+            random_seed=42,
+            attention_backend="flashinfer",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="flashinfer",
         )
         command = build_weight_cache_daemon_command(
             server_args,
@@ -268,9 +284,17 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
         self.assertEqual(value_after("--ep-size"), "8")
         self.assertEqual(value_after("--moe-dp-size"), "2")
         self.assertEqual(value_after("--attn-cp-size"), "2")
+        self.assertEqual(value_after("--random-seed"), "42")
         self.assertEqual(value_after("--moe-dense-tp-size"), "1")
         self.assertEqual(value_after("--moe-a2a-backend"), "mooncake")
         self.assertEqual(value_after("--deepep-mode"), "low_latency")
+        self.assertEqual(value_after("--attention-backend"), "flashinfer")
+        self.assertEqual(value_after("--prefill-attention-backend"), "flashinfer")
+        self.assertEqual(value_after("--decode-attention-backend"), "flashinfer")
+        self.assertIn("--enable-eplb", command)
+        self.assertEqual(value_after("--ep-num-redundant-experts"), "72")
+        self.assertEqual(value_after("--elastic-ep-backend"), "mooncake")
+        self.assertEqual(value_after("--mooncake-ib-device"), "mlx5_1,mlx5_3")
         self.assertIn("--enable-dp-attention", command)
         self.assertIn("--enable-dp-lm-head", command)
         self.assertIn("--trust-remote-code", command)

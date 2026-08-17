@@ -47,6 +47,7 @@ class ExpertLocationUpdater:
         nnodes: int,
         rank: int,
         use_flat_topology: bool = False,
+        commit: bool = True,
     ):
         """
         Update experts' physical location after EPLB.
@@ -70,12 +71,64 @@ class ExpertLocationUpdater:
             nnodes=topology_num_nodes,
             rank=rank,
         )
-        old_expert_location_metadata.update(
-            new_expert_location_metadata,
+        _augment_missing_experts_from_failed_sources(
+            missing_logical_experts_by_layers=missing_logical_experts_by_layers,
+            old_expert_location_metadata=old_expert_location_metadata,
+            new_expert_location_metadata=new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
+            rank=rank,
         )
+        if commit:
+            self.commit(new_expert_location_metadata, update_layer_ids)
 
         return missing_logical_experts_by_layers
+
+    @staticmethod
+    def commit(
+        new_expert_location_metadata: ExpertLocationMetadata, update_layer_ids: List[int]
+    ):
+        old_expert_location_metadata = get_global_expert_location_metadata()
+        assert old_expert_location_metadata is not None
+        old_expert_location_metadata.update(
+            new_expert_location_metadata, update_layer_ids=update_layer_ids
+        )
+
+
+def _augment_missing_experts_from_failed_sources(
+    *,
+    missing_logical_experts_by_layers,
+    old_expert_location_metadata,
+    new_expert_location_metadata,
+    update_layer_ids,
+    rank: int,
+):
+    """Report experts whose complete pre-fault replica set was lost."""
+    elastic_ep_state = ElasticEPStateManager.instance()
+    if elastic_ep_state is None:
+        return
+    active_ranks = elastic_ep_state.active_ranks_cpu.tolist()
+    num_local = old_expert_location_metadata.num_local_physical_experts
+    local_start = rank * num_local
+    local_end = local_start + num_local
+    for layer_id in update_layer_ids:
+        old_row = old_expert_location_metadata.physical_to_logical_map_cpu[
+            layer_id
+        ].tolist()
+        new_row = new_expert_location_metadata.physical_to_logical_map_cpu[
+            layer_id
+        ].tolist()
+        missing = missing_logical_experts_by_layers.setdefault(layer_id, [])
+        for logical_expert_id in set(new_row[local_start:local_end]):
+            old_sources = [
+                physical_slot // num_local
+                for physical_slot, mapped_expert_id in enumerate(old_row)
+                if mapped_expert_id == logical_expert_id
+            ]
+            if old_sources and not any(active_ranks[source] for source in old_sources):
+                if logical_expert_id not in missing:
+                    missing.append(logical_expert_id)
+        if not missing:
+            missing_logical_experts_by_layers.pop(layer_id, None)
 
 
 def _update_expert_weights(**kwargs):
@@ -460,25 +513,11 @@ def update_expert_weights_single_layer(
     def _filter_p2p_ops(p2p_op_infos):
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
-            # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
-            is_active = elastic_ep_state.active_ranks_cpu
-            for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
-                has_isend = any(op.op == torch.distributed.isend for op in ops)
-                has_irecv = any(op.op == torch.distributed.irecv for op in ops)
-                assert not (has_isend and has_irecv), (
-                    "Each p2p_op_infos entry is expected to contain only send "
-                    "or only recv ops."
-                )
-
-                if has_isend:
-                    p2p_op_infos[i] = (
-                        logical_expert_id,
-                        [op for op in ops if is_active[op.peer]],
-                    )
-                elif has_irecv:
-                    if any(not is_active[op.peer] for op in ops):
-                        missing_logical_experts_info.append(logical_expert_id)
-                        p2p_op_infos[i] = (logical_expert_id, [])
+            _filter_p2p_ops_for_active_ranks(
+                p2p_op_infos,
+                is_active=elastic_ep_state.active_ranks_cpu,
+                missing_logical_experts_info=missing_logical_experts_info,
+            )
 
     def _execute_p2p_ops(p2p_op_infos):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
@@ -583,6 +622,28 @@ def _deduplicate_ordered(arr: List[int]):
         if len(output) == 0 or item != output[-1]:
             output.append(item)
     return output
+
+
+def _filter_p2p_ops_for_active_ranks(
+    p2p_op_infos, *, is_active, missing_logical_experts_info: List[int]
+):
+    """Keep a healthy P2P replica before escalating to daemon-HBM recovery."""
+    for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
+        has_isend = any(op.op == torch.distributed.isend for op in ops)
+        has_irecv = any(op.op == torch.distributed.irecv for op in ops)
+        assert not (has_isend and has_irecv), (
+            "Each p2p_op_infos entry is expected to contain only send or recv ops."
+        )
+
+        active_ops = [op for op in ops if is_active[op.peer]]
+        if has_isend:
+            p2p_op_infos[i] = (logical_expert_id, active_ops)
+        elif has_irecv:
+            if active_ops:
+                p2p_op_infos[i] = (logical_expert_id, active_ops)
+            else:
+                missing_logical_experts_info.append(logical_expert_id)
+                p2p_op_infos[i] = (logical_expert_id, [])
 
 
 def _log_p2p_op_metrics(
