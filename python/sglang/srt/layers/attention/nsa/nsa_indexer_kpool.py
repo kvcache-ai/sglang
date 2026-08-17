@@ -651,6 +651,14 @@ class IndexerKPool(MultiPlatformOp):
 
         return use_glm5_next_eager_logits_on_device(q_fp8.device)
 
+    @staticmethod
+    def _should_use_triton_logits(query: torch.Tensor) -> bool:
+        from sglang.srt.layers.attention.nsa.glm5_next_indexer_triton import (
+            use_glm5_next_triton_indexer,
+        )
+
+        return use_glm5_next_triton_indexer(query.device)
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -670,7 +678,7 @@ class IndexerKPool(MultiPlatformOp):
         # NOTE(dark): this support extend/decode/decode+graph
         block_tables = metadata.get_page_table_64()
 
-        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
+        kv_cache = self._get_index_k_read_buffer(pool, layer_id)
 
         blocksize = page_size
         seqlens_32 = metadata.get_seqlens_int32()
@@ -681,17 +689,15 @@ class IndexerKPool(MultiPlatformOp):
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
-        assert len(kv_cache_fp8.shape) == 2
+        assert len(kv_cache.shape) == 2
         block_kv = 64
         num_heads_kv = 1
         head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(q_fp8)
         use_eager_logits = self._should_use_eager_logits(q_fp8)
+        use_triton_logits = self._should_use_triton_logits(q_fp8)
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -700,14 +706,32 @@ class IndexerKPool(MultiPlatformOp):
                 seqlens_32,
                 blocksize,
                 build_schedule_metadata=not (
-                    use_tilelang_paged_mqa or use_eager_logits
+                    use_tilelang_paged_mqa or use_eager_logits or use_triton_logits
                 ),
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
-        if use_eager_logits:
+        if use_triton_logits:
+            from sglang.srt.layers.attention.nsa.glm5_next_indexer_triton import (
+                glm5_next_triton_paged_mqa_logits,
+            )
+
+            logits = glm5_next_triton_paged_mqa_logits(
+                q_fp8,
+                kv_cache,
+                weights,
+                pool_seqlens,
+                pool_block_tables,
+                pool_max_seq_len,
+                use_k_scale=not getattr(pool, "index_cache_is_bf16", False),
+            )
+        elif use_eager_logits:
             from sglang.srt.layers.attention.nsa.glm5_next_indexer_logits import (
                 glm5_next_eager_fp8_paged_mqa_logits,
+            )
+
+            kv_cache_fp8 = kv_cache.view(
+                kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
             )
 
             logits = glm5_next_eager_fp8_paged_mqa_logits(
@@ -723,6 +747,9 @@ class IndexerKPool(MultiPlatformOp):
                 tilelang_fp8_paged_mqa_logits,
             )
 
+            kv_cache_fp8 = kv_cache.view(
+                kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             logits = tilelang_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -734,6 +761,9 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
+            kv_cache_fp8 = kv_cache.view(
+                kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -787,20 +817,40 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         if total_k_rows > 0:
-            k_u8 = plan.ragged_k_u8
-            k_scale = plan.ragged_k_scale
-            assert k_u8 is not None and k_scale is not None
             pool = _token_pool_from_batch(forward_batch)
-            gather_index_k_scale_prefix_into(
-                pool=pool,
-                buf=self._get_index_k_read_buffer(pool, layer_id),
-                page_indices=plan.ragged_concat_page_table,
-                seq_len=total_k_rows,
-                k_out=k_u8,
-                scale_out=k_scale,
-            )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            if self._should_use_eager_logits(q_fp8):
+            if getattr(pool, "index_cache_is_bf16", False):
+                from sglang.srt.layers.attention.nsa.kpool_fp8_index import (
+                    gather_index_k_bf16_prefix_into,
+                )
+
+                k_bf16 = plan.ragged_k_bf16
+                assert k_bf16 is not None
+                gather_index_k_bf16_prefix_into(
+                    pool=pool,
+                    buf=self._get_index_k_read_buffer(pool, layer_id),
+                    page_indices=plan.ragged_concat_page_table,
+                    seq_len=total_k_rows,
+                    k_out=k_bf16,
+                )
+                index_k = k_bf16
+                k_scale = None
+            else:
+                k_u8 = plan.ragged_k_u8
+                k_scale = plan.ragged_k_scale
+                assert k_u8 is not None and k_scale is not None
+                gather_index_k_scale_prefix_into(
+                    pool=pool,
+                    buf=self._get_index_k_read_buffer(pool, layer_id),
+                    page_indices=plan.ragged_concat_page_table,
+                    seq_len=total_k_rows,
+                    k_out=k_u8,
+                    scale_out=k_scale,
+                )
+                index_k = k_u8.view(torch.float8_e4m3fn)
+
+            if self._should_use_eager_logits(q_fp8) or self._should_use_triton_logits(
+                q_fp8
+            ):
                 topk_method = getattr(metadata, "topk_transform_method", None)
                 attn_metadata = getattr(metadata, "attn_metadata", None)
                 page_table_all = None
@@ -817,9 +867,10 @@ class IndexerKPool(MultiPlatformOp):
                             attn_metadata, "topk_indices_offset", None
                         )
 
-                return self._topk_from_glm5_next_eager_logits_rows(
+                return self._topk_from_glm5_next_model_local_logits_rows(
                     q_fp8[:n_real].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
+                    index_k.contiguous(),
+                    None if k_scale is None else k_scale.contiguous(),
                     weights[:n_real].contiguous(),
                     pool_lens,
                     seq_lens_expanded,
@@ -831,9 +882,10 @@ class IndexerKPool(MultiPlatformOp):
                     page_table_row_index=page_table_row_index_all,
                 )
 
+            assert k_scale is not None, "DeepGEMM KPool requires scaled FP8 K"
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
+                (index_k.contiguous(), k_scale.contiguous()),
                 weights[:n_real].contiguous(),
                 ks_per_q,
                 ke_per_q,
@@ -865,10 +917,11 @@ class IndexerKPool(MultiPlatformOp):
             page_table_row_index=page_table_row_index_all,
         )
 
-    def _topk_from_glm5_next_eager_logits_rows(
+    def _topk_from_glm5_next_model_local_logits_rows(
         self,
-        q_fp8: torch.Tensor,
-        kv_fp8: tuple[torch.Tensor, torch.Tensor],
+        query: torch.Tensor,
+        index_k: torch.Tensor,
+        k_scale: Optional[torch.Tensor],
         weights: torch.Tensor,
         pool_lens: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -880,13 +933,16 @@ class IndexerKPool(MultiPlatformOp):
         topk_offsets: Optional[torch.Tensor],
         page_table_row_index: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Score/select fixed query-row chunks for exact-GLM SM120 prefill."""
+        """Score/select bounded rows with the architecture-local GLM scorer."""
 
         from sglang.srt.layers.attention.nsa.glm5_next_indexer_logits import (
             iter_glm5_next_eager_fp8_mqa_logits,
         )
+        from sglang.srt.layers.attention.nsa.glm5_next_indexer_triton import (
+            iter_glm5_next_triton_mqa_logits,
+        )
 
-        n_real = q_fp8.shape[0]
+        n_real = query.shape[0]
         if total_q < n_real:
             raise ValueError(
                 "GLM-5-Next total query rows cannot be smaller than real queries"
@@ -916,15 +972,27 @@ class IndexerKPool(MultiPlatformOp):
             (total_q, self.index_topk + self.index_kpool - 1),
             -1,
             dtype=torch.int32,
-            device=q_fp8.device,
+            device=query.device,
         )
-        logits_rows = iter_glm5_next_eager_fp8_mqa_logits(
-            q_fp8,
-            kv_fp8,
-            weights,
-            ks,
-            ke,
-        )
+        if self._should_use_triton_logits(query):
+            logits_rows = iter_glm5_next_triton_mqa_logits(
+                query,
+                index_k,
+                weights,
+                ks,
+                ke,
+                k_scale=k_scale,
+            )
+        else:
+            if k_scale is None:
+                raise RuntimeError("SM120 eager scorer requires an FP8 K scale")
+            logits_rows = iter_glm5_next_eager_fp8_mqa_logits(
+                query,
+                (index_k, k_scale),
+                weights,
+                ks,
+                ke,
+            )
         for q_start, q_end, logits_chunk in logits_rows:
             topk_offsets_chunk = (
                 None if topk_offsets is None else topk_offsets[q_start:q_end]
@@ -1058,7 +1126,14 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch=forward_batch,
             precompute_compress_gate=False,
         )
-        q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+        pool = _token_pool_from_batch(forward_batch)
+        if getattr(pool, "index_cache_is_bf16", False):
+            q_fp8 = query.contiguous()
+            q_scale = torch.ones(
+                (*query.shape[:-1], 1), dtype=torch.float32, device=query.device
+            )
+        else:
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
         self._compress_write(
             x=x,
             key=key,

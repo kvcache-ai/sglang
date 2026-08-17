@@ -429,6 +429,26 @@ class TestGlm5NextConfig(unittest.TestCase):
             self.config_module.Glm5NextCapabilities(False, False, False, False, False),
         )
 
+    def test_consumer_gpu_profiles_select_exact_cache_precision(self):
+        sm86 = self.config_module.get_glm5_next_gpu_profile((8, 6))
+        self.assertEqual(sm86.value, "sm86_bf16")
+        self.assertEqual(sm86.kv_cache_dtype, "bfloat16")
+        self.assertEqual(sm86.index_cache_dtype, "bfloat16")
+        self.assertTrue(sm86.is_consumer_gpu)
+
+        sm89 = self.config_module.get_glm5_next_gpu_profile((8, 9))
+        self.assertEqual(sm89.value, "sm89_fp8")
+        self.assertEqual(sm89.kv_cache_dtype, "fp8_e4m3")
+        self.assertEqual(sm89.index_cache_dtype, "fp8_e4m3")
+        self.assertTrue(sm89.is_consumer_gpu)
+
+        blackwell = self.config_module.get_glm5_next_gpu_profile((12, 0))
+        self.assertEqual(blackwell.value, "blackwell_fp8")
+        self.assertFalse(blackwell.is_consumer_gpu)
+
+        with self.assertRaisesRegex(ValueError, "SM86, SM89, or Blackwell"):
+            self.config_module.get_glm5_next_gpu_profile((9, 0))
+
     def test_nested_vision_config_is_data_only(self):
         root = self.config_module.Glm5NextConfig(
             vision_config={"depth": 24, "hidden_size": 1536}

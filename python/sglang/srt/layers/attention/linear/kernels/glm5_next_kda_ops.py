@@ -17,9 +17,25 @@ import triton.language as tl
 
 
 _MAX_TRITON_GRID_Z = 65535
-_SAFE_GATE_BLOCK_T = 32
-_SAFE_GATE_NUM_WARPS = 8
-_SAFE_GATE_NUM_STAGES = 3
+
+
+def glm5_next_kda_launch_config(
+    capability: tuple[int, int],
+) -> tuple[tuple[int, int, int], tuple[int, int]]:
+    """Return ``(gate, decode)`` static Triton configs for GLM GPUs."""
+
+    if capability == (8, 6):
+        # Four decode warps remove the single-warp kernel's local-memory
+        # spills on Ampere (verified with ptxas 12.8).
+        return (16, 4, 2), (4, 1)
+    if capability == (8, 9):
+        # The same geometry is spill-free on Ada; keep the larger gate tile
+        # selected for its higher-throughput BF16 prefill path.
+        return (32, 4, 3), (4, 1)
+    # Preserve the previously accepted kernel geometry for every other CUDA
+    # test/runtime.  The exact GLM server gate, not this low-level helper,
+    # controls which architectures can launch the model.
+    return (32, 8, 3), (1, 3)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -201,7 +217,11 @@ def glm5_next_safe_gate(
         )
     output = torch.empty_like(raw_gate, dtype=torch.float32)
 
-    grid = (_cdiv(num_tokens, _SAFE_GATE_BLOCK_T), num_heads)
+    gate_config, _ = glm5_next_kda_launch_config(
+        torch.cuda.get_device_capability(raw_gate.device)
+    )
+    block_t, num_warps, num_stages = gate_config
+    grid = (_cdiv(num_tokens, block_t), num_heads)
 
     _glm5_next_safe_gate_kernel[grid](
         raw_gate,
@@ -212,11 +232,11 @@ def glm5_next_safe_gate(
         num_tokens,
         num_heads,
         head_k_dim,
-        BT=_SAFE_GATE_BLOCK_T,
+        BT=block_t,
         BD=_next_power_of_2(head_k_dim),
         HAS_BIAS=dt_bias is not None,
-        num_warps=_SAFE_GATE_NUM_WARPS,
-        num_stages=_SAFE_GATE_NUM_STAGES,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output.view(*original_shape, num_heads, head_k_dim)
 
@@ -480,6 +500,10 @@ def glm5_next_safe_decode(
     raw_beta = raw_beta.contiguous()
     output = q.new_empty(nk, *v.shape)
     grid, split_grid = glm5_next_decode_grid(nk, nv, num_sequences, num_value_heads)
+    _, decode_config = glm5_next_kda_launch_config(
+        torch.cuda.get_device_capability(q.device)
+    )
+    num_warps, num_stages = decode_config
     _glm5_next_safe_decode_kernel[grid](
         A_log=A_log,
         raw_gate=raw_gate,
@@ -506,7 +530,7 @@ def glm5_next_safe_decode(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=query_start_loc is not None,
         SPLIT_N_HV_GRID=split_grid,
-        num_warps=1,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output.squeeze(0)

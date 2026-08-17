@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import ast
 import copy
+import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -346,11 +348,49 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
 class TestGlm5NextSessionABNSA(unittest.TestCase):
     @staticmethod
     def _configure():
-        return _compile_function(
+        def get_glm5_next_gpu_profile(capability):
+            if capability == (8, 6):
+                return SimpleNamespace(
+                    value="sm86_bf16",
+                    kv_cache_dtype="bfloat16",
+                    index_cache_dtype="bfloat16",
+                    is_consumer_gpu=True,
+                )
+            if capability == (8, 9):
+                return SimpleNamespace(
+                    value="sm89_fp8",
+                    kv_cache_dtype="fp8_e4m3",
+                    index_cache_dtype="fp8_e4m3",
+                    is_consumer_gpu=True,
+                )
+            if capability[0] >= 10:
+                return SimpleNamespace(
+                    value="blackwell_fp8",
+                    kv_cache_dtype="fp8_e4m3",
+                    index_cache_dtype="fp8_e4m3",
+                    is_consumer_gpu=False,
+                )
+            raise ValueError("GLM-5-Next supports NVIDIA SM86, SM89, or Blackwell")
+
+        configure = _compile_function(
             "_configure_glm5_next_session_ab_nsa",
             class_name="ServerArgs",
             globals_={"logger": _LoggerStub()},
         )
+        glm5_next_config = ModuleType("sglang.srt.configs.glm5_next")
+        glm5_next_config.get_glm5_next_gpu_profile = get_glm5_next_gpu_profile
+        package_modules = {
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.configs": ModuleType("sglang.srt.configs"),
+            "sglang.srt.configs.glm5_next": glm5_next_config,
+        }
+
+        def invoke(self, capability):
+            with mock.patch.dict(sys.modules, package_modules):
+                return configure(self, capability)
+
+        return invoke
 
     @staticmethod
     def _args(**overrides):
@@ -358,6 +398,8 @@ class TestGlm5NextSessionABNSA(unittest.TestCase):
             kv_cache_dtype="fp8_e4m3",
             nsa_prefill_backend=None,
             nsa_decode_backend=None,
+            kt_gpu_prefill_token_threshold=0,
+            enable_multimodal=False,
         )
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -366,23 +408,60 @@ class TestGlm5NextSessionABNSA(unittest.TestCase):
         configure = self._configure()
         args = self._args()
 
-        configure(args, 12)
+        configure(args, (12, 0))
 
         self.assertEqual(args.nsa_prefill_backend, "trtllm")
         self.assertEqual(args.nsa_decode_backend, "trtllm")
 
-    def test_bf16_and_pre_blackwell_are_rejected(self):
+    def test_architecture_specific_cache_dtype_policy(self):
+        sm86 = self._args(kv_cache_dtype="auto")
+        self._configure()(sm86, (8, 6))
+        self.assertEqual(sm86.kv_cache_dtype, "bfloat16")
+
+        sm89 = self._args(kv_cache_dtype="auto")
+        self._configure()(sm89, (8, 9))
+        self.assertEqual(sm89.kv_cache_dtype, "fp8_e4m3")
+
         for dtype in ("bf16", "bfloat16"):
             with self.subTest(dtype=dtype):
                 with self.assertRaisesRegex(ValueError, "fp8_e4m3"):
-                    self._configure()(self._args(kv_cache_dtype=dtype), 12)
+                    self._configure()(self._args(kv_cache_dtype=dtype), (8, 9))
 
-        with self.assertRaisesRegex(ValueError, "Blackwell"):
-            self._configure()(self._args(), 9)
+        with self.assertRaisesRegex(ValueError, "bfloat16"):
+            self._configure()(self._args(kv_cache_dtype="fp8_e4m3"), (8, 6))
+
+        with self.assertRaisesRegex(ValueError, "SM86, SM89, or Blackwell"):
+            self._configure()(self._args(), (9, 0))
+
+    def test_consumer_gpu_rejects_layerwise_prefill(self):
+        with self.assertRaisesRegex(ValueError, "not adapted for SM86/SM89"):
+            self._configure()(
+                self._args(
+                    kv_cache_dtype="bfloat16",
+                    kt_gpu_prefill_token_threshold=4096,
+                ),
+                (8, 6),
+            )
+
+    def test_consumer_gpu_rejects_multimodal_but_blackwell_is_unchanged(self):
+        with self.assertRaisesRegex(ValueError, "text inference only"):
+            self._configure()(
+                self._args(
+                    kv_cache_dtype="bfloat16",
+                    enable_multimodal=True,
+                ),
+                (8, 6),
+            )
+
+        blackwell = self._args(enable_multimodal=True)
+        self._configure()(blackwell, (12, 0))
+        self.assertTrue(blackwell.enable_multimodal)
 
     def test_non_trtllm_sparse_backend_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "both NSA prefill and decode"):
-            self._configure()(self._args(nsa_prefill_backend="flashmla_sparse"), 12)
+            self._configure()(
+                self._args(nsa_prefill_backend="flashmla_sparse"), (12, 0)
+            )
 
     def test_startup_does_not_require_new_flashinfer_abi(self):
         configure = _find_function(

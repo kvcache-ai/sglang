@@ -626,12 +626,14 @@ class TestGlm5NextKDAIsolation(unittest.TestCase):
         self.assertNotIn("beta.float().sigmoid()", source)
         self.assertIn("glm5_next_safe_gate", source)
 
-    def test_safe_gate_uses_one_deterministic_launch_configuration(self):
+    def test_safe_gate_uses_architecture_static_launch_configurations(self):
         source = OPS_PATH.read_text(encoding="utf-8")
+        ops = _load_ops()
         self.assertNotIn("@triton.autotune", source)
-        self.assertIn("_SAFE_GATE_BLOCK_T = 32", source)
-        self.assertIn("_SAFE_GATE_NUM_WARPS = 8", source)
-        self.assertIn("_SAFE_GATE_NUM_STAGES = 3", source)
+        self.assertIn("def glm5_next_kda_launch_config(", source)
+        self.assertIn("if capability == (8, 6):", source)
+        self.assertIn("if capability == (8, 9):", source)
+        self.assertIn("return (32, 8, 3), (1, 3)", source)
         self.assertIn(
             "@triton.jit\ndef _glm5_next_safe_gate_kernel(",
             source,
@@ -640,6 +642,14 @@ class TestGlm5NextKDAIsolation(unittest.TestCase):
             '@triton.jit(do_not_specialize=["T"])\n'
             "def _glm5_next_safe_gate_kernel(",
             source,
+        )
+        self.assertEqual(
+            ops.glm5_next_kda_launch_config((8, 6)),
+            ((16, 4, 2), (4, 1)),
+        )
+        self.assertEqual(
+            ops.glm5_next_kda_launch_config((8, 9)),
+            ((32, 4, 3), (4, 1)),
         )
 
     def test_kimi_kernel_launch_autotune_tf32_and_padding_are_untouched(self):

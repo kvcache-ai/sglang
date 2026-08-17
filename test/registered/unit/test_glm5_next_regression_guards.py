@@ -1020,8 +1020,8 @@ class TestKPoolBatchOwnedPool(unittest.TestCase):
     def test_kpool_ragged_row_chunks_slice_all_metadata_and_keep_padding(self):
         iterator_calls = []
 
-        def fake_logits_rows(q_fp8, kv_fp8, weights, ks, ke):
-            iterator_calls.append((q_fp8, kv_fp8, weights, ks, ke))
+        def fake_logits_rows(query, index_k, weights, ks, ke, *, k_scale=None):
+            iterator_calls.append((query, index_k, k_scale, weights, ks, ke))
             for start, end in ((0, 2), (2, 4), (4, 5)):
                 yield start, end, torch.full((end - start, 7), float(start))
 
@@ -1035,11 +1035,11 @@ class TestKPoolBatchOwnedPool(unittest.TestCase):
 
         method = _compile_function(
             self._SOURCE,
-            "_topk_from_glm5_next_eager_logits_rows",
+            "_topk_from_glm5_next_model_local_logits_rows",
             class_name="IndexerKPool",
             globals_={
                 "torch": torch,
-                "iter_glm5_next_eager_fp8_mqa_logits": fake_logits_rows,
+                "iter_glm5_next_triton_mqa_logits": fake_logits_rows,
             },
         )
         q = torch.zeros((5, 3, 128), dtype=torch.float32)
@@ -1057,12 +1057,14 @@ class TestKPoolBatchOwnedPool(unittest.TestCase):
             index_topk=8,
             index_kpool=4,
             _topk_from_kpool_logits=select,
+            _should_use_triton_logits=lambda _query: True,
         )
 
         result = method(
             runner,
             q,
-            (k, scale),
+            k,
+            scale,
             weights,
             pool_lens,
             seq_lens,

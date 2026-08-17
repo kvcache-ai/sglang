@@ -24,7 +24,22 @@ GLM5_NEXT_LATENT_SCALE_GROUP_SIZE = 128
 GLM5_NEXT_LATENT_SCALE_GROUPS = (
     GLM5_NEXT_SPARSE_HEAD_DIM // GLM5_NEXT_LATENT_SCALE_GROUP_SIZE
 )
-_TRITON_TOKEN_BLOCK = 16
+
+
+def glm5_next_sparse_mla_launch_config(
+    capability: tuple[int, int],
+) -> tuple[int, int, int]:
+    """Return static decode geometry tuned per supported GPU family."""
+
+    if capability == (8, 6):
+        # Ampere has a smaller register file per SM; halve the selected-token
+        # tile so the 512-wide online-softmax accumulator remains resident.
+        return 8, 4, 2
+    if capability == (8, 9):
+        return 16, 8, 2
+    # Retain the original geometry for existing CUDA unit tests and future
+    # backends.  The model/server dispatch remains the architecture gate.
+    return 16, 8, 2
 
 
 @triton.jit
@@ -135,6 +150,23 @@ def _glm5_next_sparse_mla_cuda(
 ) -> torch.Tensor:
     """Launch the graph-safe BF16-Q/raw-or-scaled-FP8-KV decode kernel."""
 
+    capability = torch.cuda.get_device_capability(query.device)
+    if capability == (8, 6):
+        if (
+            query.dtype != torch.bfloat16
+            or kv_cache.dtype != torch.bfloat16
+            or kv_scale is not None
+        ):
+            raise TypeError("SM86 GLM sparse MLA requires unscaled BF16 Q/KV")
+    elif capability == (8, 9):
+        if (
+            query.dtype != torch.bfloat16
+            or kv_cache.dtype != torch.float8_e4m3fn
+            or kv_scale is None
+            or kv_scale.dtype != torch.float32
+        ):
+            raise TypeError("SM89 GLM sparse MLA requires BF16 Q and scaled E4M3 KV")
+
     flat_kv = kv_cache.reshape(-1, GLM5_NEXT_SPARSE_HEAD_DIM)
     query_3d = query.contiguous()
     indices_2d = indices.contiguous()
@@ -147,6 +179,7 @@ def _glm5_next_sparse_mla_cuda(
         kv_scale_2d = flat_kv
     output = torch.empty_like(query_3d, dtype=torch.bfloat16)
     grid = (query_3d.shape[0], query_3d.shape[1])
+    block_t, num_warps, num_stages = glm5_next_sparse_mla_launch_config(capability)
     _glm5_next_sparse_mla_decode_kernel[grid](
         query_3d,
         flat_kv,
@@ -171,9 +204,9 @@ def _glm5_next_sparse_mla_cuda(
         HEAD_DIM=GLM5_NEXT_SPARSE_HEAD_DIM,
         SCALE_GROUP_SIZE=GLM5_NEXT_LATENT_SCALE_GROUP_SIZE,
         USE_KV_SCALE=use_kv_scale,
-        BLOCK_T=_TRITON_TOKEN_BLOCK,
-        num_warps=8,
-        num_stages=2,
+        BLOCK_T=block_t,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output
 

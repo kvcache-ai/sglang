@@ -7,14 +7,69 @@ runtime vision implementation without changing text-only config loading.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, List, Optional, Union
 
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 
-
 _GLM5_NEXT_ARCH = "Glm5NextForConditionalGeneration"
+
+
+class Glm5NextGPUProfile(str, Enum):
+    """Validated cache/kernel policy for one GLM-5-Next GPU family.
+
+    Consumer GPUs deliberately use explicit profiles instead of inheriting the
+    generic DeepSeek NSA capability checks.  In particular, SM86 cannot execute
+    the E4M3 tensor-core index-cache path and therefore keeps both the latent and
+    KPool caches in BF16.
+    """
+
+    SM86_BF16 = "sm86_bf16"
+    SM89_FP8 = "sm89_fp8"
+    BLACKWELL_FP8 = "blackwell_fp8"
+
+    @property
+    def kv_cache_dtype(self) -> str:
+        return (
+            "bfloat16"
+            if self is Glm5NextGPUProfile.SM86_BF16
+            else "fp8_e4m3"
+        )
+
+    @property
+    def index_cache_dtype(self) -> str:
+        return "bfloat16" if self is Glm5NextGPUProfile.SM86_BF16 else "fp8_e4m3"
+
+    @property
+    def is_consumer_gpu(self) -> bool:
+        return self in (
+            Glm5NextGPUProfile.SM86_BF16,
+            Glm5NextGPUProfile.SM89_FP8,
+        )
+
+
+def get_glm5_next_gpu_profile(
+    capability: tuple[int, int],
+) -> Glm5NextGPUProfile:
+    """Resolve the exact GLM runtime policy or fail closed.
+
+    Keep the pre-existing major>=10 acceptance boundary intact while adding
+    only the two requested consumer architectures.  SM90 and other Ampere/Ada
+    variants remain unsupported until separately validated.
+    """
+
+    if capability == (8, 6):
+        return Glm5NextGPUProfile.SM86_BF16
+    if capability == (8, 9):
+        return Glm5NextGPUProfile.SM89_FP8
+    if capability[0] >= 10:
+        return Glm5NextGPUProfile.BLACKWELL_FP8
+    raise ValueError(
+        "GLM-5-Next supports NVIDIA SM86, SM89, or Blackwell (SM>=100); "
+        f"got SM{capability[0]}{capability[1]}."
+    )
 
 _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
     "architectures",

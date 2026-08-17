@@ -1523,19 +1523,22 @@ class ServerArgs:
         # revalidate without loading or inspecting configs for other models.
         self._glm5_next_session_ab_active = True
 
-    def _configure_glm5_next_session_ab_nsa(self, major: int) -> None:
-        if major < 10:
+    def _configure_glm5_next_session_ab_nsa(
+        self, capability: tuple[int, int]
+    ) -> None:
+        from sglang.srt.configs.glm5_next import get_glm5_next_gpu_profile
+
+        profile = get_glm5_next_gpu_profile(capability)
+        if self.kv_cache_dtype == "auto":
+            self.kv_cache_dtype = profile.kv_cache_dtype
+        elif self.kv_cache_dtype == "bf16":
+            self.kv_cache_dtype = "bfloat16"
+
+        if self.kv_cache_dtype != profile.kv_cache_dtype:
             raise ValueError(
-                "GLM-5-Next Session AB requires an NVIDIA Blackwell GPU "
-                "(compute capability major >= 10) for the validated FP8 "
-                "KPool4 path; "
-                f"got compute capability major {major}."
-            )
-        if self.kv_cache_dtype != "fp8_e4m3":
-            raise ValueError(
-                "GLM-5-Next Session AB requires --kv-cache-dtype=fp8_e4m3; "
-                f"got {self.kv_cache_dtype!r}. BF16 and other KV-cache "
-                "precisions are outside the accepted boundary."
+                f"GLM-5-Next {profile.value} requires "
+                f"--kv-cache-dtype={profile.kv_cache_dtype}; got "
+                f"{self.kv_cache_dtype!r}."
             )
 
         if self.nsa_prefill_backend is None:
@@ -1547,17 +1550,40 @@ class ServerArgs:
             or self.nsa_decode_backend != "trtllm"
         ):
             raise ValueError(
-                "GLM-5-Next Session AB FP8 KPool4 requires trtllm for both "
+                "GLM-5-Next KPool4 requires the model-local trtllm dispatcher "
+                "for both "
                 "NSA prefill and decode; got "
                 f"prefill={self.nsa_prefill_backend!r}, "
                 f"decode={self.nsa_decode_backend!r}."
             )
 
         logger.warning(
-            "Set GLM-5-Next KPool4 NSA dispatcher paths to trtllm for FP8 KV "
-            "cache on Blackwell; Session C uses the model-local graph-safe "
-            "SM120 indexer and sparse-MLA kernels."
+            "Set GLM-5-Next GPU profile=%s, KV cache=%s, KPool cache=%s, "
+            "NSA dispatcher=trtllm; the dispatcher selects model-local "
+            "graph-safe kernels on SM86/SM89/SM120.",
+            profile.value,
+            profile.kv_cache_dtype,
+            profile.index_cache_dtype,
         )
+
+        prefill_threshold = getattr(self, "kt_gpu_prefill_token_threshold", None)
+        if (
+            profile.is_consumer_gpu
+            and prefill_threshold is not None
+            and prefill_threshold > 0
+        ):
+            raise ValueError(
+                "GLM-5-Next layerwise prefill is not adapted for SM86/SM89; "
+                "set --kt-gpu-prefill-token-threshold=0."
+            )
+
+        if profile.is_consumer_gpu and bool(
+            getattr(self, "enable_multimodal", False)
+        ):
+            raise ValueError(
+                "GLM-5-Next SM86/SM89 acceptance covers text inference only; "
+                "--enable-multimodal must remain disabled."
+            )
 
     def _set_default_nsa_kv_cache_dtype(self, major: int) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
@@ -1780,11 +1806,12 @@ class ServerArgs:
 
                     import torch
 
-                    major, _ = torch.cuda.get_device_capability()
-                    self._set_default_nsa_kv_cache_dtype(major)
+                    capability = torch.cuda.get_device_capability()
+                    major, _ = capability
                     if is_glm5_next:
-                        self._configure_glm5_next_session_ab_nsa(major)
+                        self._configure_glm5_next_session_ab_nsa(capability)
                     else:
+                        self._set_default_nsa_kv_cache_dtype(major)
                         self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
                 if self.enable_nsa_prefill_context_parallel:

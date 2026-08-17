@@ -1746,6 +1746,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_cache_dtype: Optional[torch.dtype] = None,
     ):
 
         override_dim = (
@@ -1769,6 +1770,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        self.index_cache_dtype = index_cache_dtype or torch.float8_e4m3fn
+        if self.index_cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+            raise ValueError(
+                "NSA index cache supports only FP8 E4M3 or BF16, got "
+                f"{self.index_cache_dtype}"
+            )
+        self.index_cache_is_bf16 = self.index_cache_dtype == torch.bfloat16
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
 
@@ -1793,10 +1801,17 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         (size + page_size + 1) // self.page_size,
                         self.page_size
                         * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
+                            index_head_dim
+                            if self.index_cache_is_bf16
+                            else index_head_dim
+                            + index_head_dim // self.quant_block_size * 4
                         ),
                     ),
-                    dtype=self.index_k_with_scale_buffer_dtype,
+                    dtype=(
+                        torch.bfloat16
+                        if self.index_cache_is_bf16
+                        else self.index_k_with_scale_buffer_dtype
+                    ),
                     device=device,
                 )
                 for _ in range(layer_num)
@@ -1815,6 +1830,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if self.index_cache_is_bf16:
+            num_pages = (seq_len + self.page_size - 1) // self.page_size
+            pages = buf.index_select(0, page_indices[:num_pages].to(torch.int64))
+            return pages.view(-1, self.index_head_dim)[:seq_len]
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -1826,6 +1845,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
     ):
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if self.index_cache_is_bf16:
+            return torch.ones((seq_len,), dtype=torch.float32, device=buf.device)
         return index_buf_accessor.GetS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -1848,6 +1869,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
                  k_scale: (seq_len, 4), uint8
         """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if self.index_cache_is_bf16:
+            return (
+                self.get_index_k_continuous(layer_id, seq_len, page_indices),
+                torch.ones((seq_len,), dtype=torch.float32, device=buf.device),
+            )
         return index_buf_accessor.GetKAndS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
@@ -1860,6 +1886,18 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if self.index_cache_is_bf16:
+            if index_k.shape != (loc.numel(), self.index_head_dim):
+                raise ValueError(
+                    "BF16 NSA index K must have shape "
+                    f"{(loc.numel(), self.index_head_dim)}, got {tuple(index_k.shape)}"
+                )
+            pages = torch.div(loc, self.page_size, rounding_mode="floor").to(torch.long)
+            offsets = torch.remainder(loc, self.page_size).to(torch.long)
+            buf.view(-1, self.page_size, self.index_head_dim)[pages, offsets] = (
+                index_k.to(torch.bfloat16)
+            )
+            return
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
