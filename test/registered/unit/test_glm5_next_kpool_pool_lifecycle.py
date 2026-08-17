@@ -48,9 +48,17 @@ class _FakeNSATokenToKVPool:
         )
         self.kv_cache_dim = kwargs["kv_cache_dim"]
         self.index_head_dim = kwargs["index_head_dim"]
+        self.index_cache_dtype = kwargs.get(
+            "index_cache_dtype", torch.float8_e4m3fn
+        )
+        self.index_cache_is_bf16 = self.index_cache_dtype == torch.bfloat16
         self.mem_usage = 0
         self.index_k_with_scale_buffer = [
-            torch.zeros((1, 132), dtype=torch.uint8) for _ in range(self.layer_num)
+            torch.zeros(
+                (1, 128 if self.index_cache_is_bf16 else 132),
+                dtype=torch.bfloat16 if self.index_cache_is_bf16 else torch.uint8,
+            )
+            for _ in range(self.layer_num)
         ]
 
     def get_kv_size_bytes(self):
@@ -168,10 +176,10 @@ def _load_sources():
 ) = _load_sources()
 
 
-def _make_hybrid_pool(req_pool_size=6):
+def _make_hybrid_pool(req_pool_size=6, dtype=torch.float8_e4m3fn):
     return POOL.Glm5NextHybridKVPool(
         size=128,
-        dtype=torch.float8_e4m3fn,
+        dtype=dtype,
         page_size=64,
         head_num=1,
         head_dim=256,
@@ -243,6 +251,21 @@ class TestGlm5NextKPoolMemoryPool(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             pool.get_latent_scale_buffer(0)
+
+    def test_sm86_bf16_cache_omits_all_fp8_scale_sidecars(self):
+        pool = _make_hybrid_pool(dtype=torch.bfloat16)
+        self.assertTrue(pool.index_cache_is_bf16)
+        self.assertEqual(pool.index_cache_dtype, torch.bfloat16)
+        self.assertEqual(
+            pool.get_index_k_with_scale_buffer(3).dtype, torch.bfloat16
+        )
+        self.assertIsNone(pool.get_latent_scale_buffer(3))
+        with self.assertRaisesRegex(RuntimeError, "only for GLM FP8 KV cache"):
+            pool.set_latent_scale_buffer(
+                3,
+                torch.tensor([1], dtype=torch.long),
+                torch.ones((1, 4), dtype=torch.float32),
+            )
 
     def test_speculative_cache_move_fails_closed(self):
         pool = _make_hybrid_pool()

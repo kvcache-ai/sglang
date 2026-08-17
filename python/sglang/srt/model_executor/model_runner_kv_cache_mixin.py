@@ -145,13 +145,17 @@ class ModelRunnerKVCacheMixin:
                     if getattr(self.model_config, "is_glm5_next", False)
                     else get_nsa_index_head_dim(self.model_config.hf_config)
                 )
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
+                if is_glm5_next_kpool and self.kv_cache_dtype == torch.bfloat16:
+                    indexer_size_per_token = index_head_dim
+                    element_size = torch.bfloat16.itemsize
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
             if self.model_config.is_hybrid_swa:

@@ -6,14 +6,15 @@ which the ordinary correctness oracle and performance benchmark deliberately
 do not prove:
 
 * exact layerwise-prefill chunk boundaries (128/4096/4097/8193);
-* threshold-0 ordinary prefill versus threshold-1 layerwise parity;
+* threshold-0 ordinary prefill versus threshold-1024 layerwise parity;
 * the final 500000-input + 1024-output integrated request;
 * real decode CUDA Graph counter movement; and
 * exact batch-size 1/2/4 graph replay for the Qwen regression.
 
 The layerwise and long modes require access to the server log.  They snapshot
-the log immediately before each request and accept only complete 42-layer
-rounds with the expected cumulative counters and ``fallback_count=0``.
+the log immediately before each request and accept only complete generic
+``SharedFullContext`` 42-layer compute rounds.  The GLM-specific storage
+contract is one lazily allocated full-layer GPU slot and two host expert slots.
 """
 
 from __future__ import annotations
@@ -44,11 +45,12 @@ DEFAULT_VOCAB_SIZE = 154880
 LAYERWISE_LENGTHS = (128, 4096, 4097, 8193)
 LAYERWISE_CHUNK_SIZE = 4096
 LAYERWISE_MOE_LAYERS = 42
-LAYERWISE_PREFETCH_HITS_PER_ROUND = LAYERWISE_MOE_LAYERS - 1
-LAYERWISE_FINAL_SLOT = (LAYERWISE_MOE_LAYERS - 1) % 2
+LAYERWISE_FIRST_LAYER = 3
+LAYERWISE_LAST_LAYER = 44
+LAYERWISE_TOKEN_THRESHOLD = 1024
 DEFAULT_BOUNDARY_OUTPUT = 16
 LAYERWISE_FIXTURE_SEED = 20260811
-REQUIRED_TP_SIZE = 8
+REQUIRED_TP_SIZE = 4
 PREFILL_PARITY_COLLECTION_TOP_K = 256
 PREFILL_PARITY_COMPARISON_TOP_K = 64
 PREFILL_PARITY_LOGPROB_ATOL = 5e-2
@@ -60,22 +62,23 @@ BUCKET_OUTPUT_TOKENS = 8
 BUCKET_TOP_K = 64
 
 LAYERWISE_PATTERN = re.compile(
-    r"KT GLM-5-Next FP8 layerwise prefill: "
-    r"layer=(?P<layer>\d+) epoch=(?P<epoch>\d+) "
-    r"slot=(?P<slot>\d+) (?P<load_kind>prefetch-hit|prime) "
-    r"apply_count=(?P<apply_count>\d+) "
-    r"prime_count=(?P<prime_count>\d+) "
-    r"prefetch_hit_count=(?P<prefetch_hit_count>\d+) "
-    r"completed_rounds=(?P<completed_rounds>\d+) "
-    r"fallback_count=(?P<fallback_count>\d+)"
+    r"KT layerwise prefill: layer (?P<layer>\d+) "
+    r"compute = (?P<compute_ms>[-+0-9.eE]+) ms"
+    r"(?:, expert update = (?P<expert_update_ms>[-+0-9.eE]+) ms)?"
 )
 
 LAYERWISE_STARTUP_PATTERN = re.compile(
-    r"KT GLM-5-Next FP8 layerwise prefill eagerly allocated two raw "
-    r"E4M3\+FP32 full-layer slots on (?P<device>\S+) before KV profiling "
-    r"\(total=(?P<total_gib>[0-9]+(?:\.[0-9]+)?) GiB, "
-    r"contract=(?P<contract>[0-9a-f]{64}), "
-    r"fallback_count=(?P<fallback_count>\d+)\)"
+    r"KT GLM-5-Next FP8 layerwise prefill lazily allocated generic "
+    r"SharedFullContext: gpu_full_layer_slots=(?P<gpu_slots>\d+) "
+    r"host_expert_slots=(?P<host_slots>\d+) "
+    r"gpu_slot_bytes=(?P<gpu_slot_bytes>\d+) "
+    r"host_buffer_bytes=(?P<host_buffer_bytes>\d+) "
+    r"device=(?P<device>\S+)"
+)
+
+LEGACY_LAYERWISE_PATTERNS = (
+    re.compile(r"eagerly allocated two raw E4M3\+FP32 full-layer slots"),
+    re.compile(r"KT GLM-5-Next FP8 layerwise prefill: .*prefetch-hit"),
 )
 
 SERVER_ARGS_PATTERN = re.compile(r"server_args=ServerArgs\((?P<body>[^\n]+)\)")
@@ -286,33 +289,53 @@ def validate_graph_counter_progress(
 
 
 def parse_layerwise_summaries(text: str) -> list[dict[str, Any]]:
-    """Return one completion summary per full 42-layer prefill round."""
-    summaries: list[dict[str, Any]] = []
-    for match in LAYERWISE_PATTERN.finditer(text):
-        item: dict[str, Any] = {
-            key: int(value) if key != "load_kind" else value
-            for key, value in match.groupdict().items()
+    """Group generic layerwise compute events into ordered 42-layer rounds.
+
+    Partial and malformed groups are deliberately retained so the validator
+    can fail closed instead of silently discarding evidence from a stalled or
+    out-of-order loader.
+    """
+    events = [
+        {
+            "layer": int(match.group("layer")),
+            "compute_ms": float(match.group("compute_ms")),
+            "expert_update_ms": (
+                float(match.group("expert_update_ms"))
+                if match.group("expert_update_ms") is not None
+                else None
+            ),
         }
-        # Production logs every MoE layer so operators can diagnose a stalled
-        # prefetch.  Only layer 44 completes a round and advances
-        # completed_rounds; accepting all 42 events as summaries makes every
-        # healthy request fail the exact-round gate.
-        if item["layer"] == 44:
-            summaries.append(item)
+        for match in LAYERWISE_PATTERN.finditer(text)
+    ]
+    summaries: list[dict[str, Any]] = []
+    for start in range(0, len(events), LAYERWISE_MOE_LAYERS):
+        group = events[start : start + LAYERWISE_MOE_LAYERS]
+        summaries.append(
+            {
+                "round_index": len(summaries),
+                "layers": [event["layer"] for event in group],
+                "compute_ms": [event["compute_ms"] for event in group],
+                "expert_update_ms": [
+                    event["expert_update_ms"] for event in group
+                ],
+                "complete": len(group) == LAYERWISE_MOE_LAYERS,
+            }
+        )
     return summaries
 
 
-def _zero_layerwise_summary() -> dict[str, int]:
-    return {
-        "layer": 44,
-        "epoch": -1,
-        "slot": -1,
-        "apply_count": 0,
-        "prime_count": 0,
-        "prefetch_hit_count": 0,
-        "completed_rounds": 0,
-        "fallback_count": 0,
-    }
+def expected_layerwise_rounds(
+    input_tokens: int,
+    chunk_size: int,
+    *,
+    threshold: int = LAYERWISE_TOKEN_THRESHOLD,
+) -> int:
+    """Count chunks large enough to enter the generic full-layer route."""
+    if threshold <= 0:
+        return 0
+    full_chunks, tail = divmod(input_tokens, chunk_size)
+    qualifying_full_chunks = full_chunks if chunk_size >= threshold else 0
+    return qualifying_full_chunks + int(tail >= threshold)
 
 
 def validate_layerwise_progress(
@@ -322,93 +345,102 @@ def validate_layerwise_progress(
     expected_rounds: int,
 ) -> list[str]:
     failures: list[str] = []
-    prior = dict(previous or _zero_layerwise_summary())
     if len(current) != expected_rounds:
         failures.append(
             f"expected {expected_rounds} completed layerwise rounds, "
             f"observed {len(current)}"
         )
+    expected_layers = list(range(LAYERWISE_FIRST_LAYER, LAYERWISE_LAST_LAYER + 1))
     for index, summary in enumerate(current):
-        expected = {
-            "layer": 44,
-            "epoch": int(prior["epoch"]) + 1,
-            "slot": LAYERWISE_FINAL_SLOT,
-            "load_kind": "prefetch-hit",
-            "apply_count": int(prior["apply_count"]) + LAYERWISE_MOE_LAYERS,
-            "prime_count": int(prior["prime_count"]) + 1,
-            "prefetch_hit_count": int(prior["prefetch_hit_count"])
-            + LAYERWISE_PREFETCH_HITS_PER_ROUND,
-            "completed_rounds": int(prior["completed_rounds"]) + 1,
-            "fallback_count": 0,
-        }
-        for key, expected_value in expected.items():
-            if summary.get(key) != expected_value:
-                failures.append(
-                    f"round {index} {key}: expected {expected_value}, "
-                    f"observed {summary.get(key)}"
-                )
-        if summary.get("apply_count") != summary.get("prime_count", 0) + summary.get(
-            "prefetch_hit_count", 0
-        ):
+        if summary.get("round_index") != index:
             failures.append(
-                f"round {index}: apply_count does not equal prime+prefetch_hit"
+                f"round {index}: round_index is {summary.get('round_index')!r}"
             )
-        prior = summary
+        if summary.get("complete") is not True:
+            failures.append(f"round {index}: generic compute sequence is incomplete")
+        if summary.get("layers") != expected_layers:
+            failures.append(
+                f"round {index}: expected ordered layers "
+                f"{LAYERWISE_FIRST_LAYER}..{LAYERWISE_LAST_LAYER}, "
+                f"observed {summary.get('layers')!r}"
+            )
+        timings = summary.get("compute_ms")
+        if (
+            not isinstance(timings, list)
+            or len(timings) != LAYERWISE_MOE_LAYERS
+            or any(not math.isfinite(value) or value < 0 for value in timings)
+        ):
+            failures.append(f"round {index}: compute timings are invalid")
     return failures
 
 
-def validate_layerwise_startup(text: str) -> dict[str, Any]:
-    """Prove that the required two GPU slots were allocated before KV pools."""
+def validate_layerwise_startup(
+    text: str, *, require_allocation: bool = True
+) -> dict[str, Any]:
+    """Validate the lazy generic SharedFullContext allocation contract."""
     failures: list[str] = []
     matches = list(LAYERWISE_STARTUP_PATTERN.finditer(text))
-    if len(matches) != 1:
+    if len(matches) > 1 or (require_allocation and len(matches) != 1):
         failures.append(
-            "expected exactly one GLM-5-Next FP8 two-slot allocation marker, "
+            "expected exactly one GLM-5-Next lazy SharedFullContext allocation "
+            "marker, "
             f"observed {len(matches)}"
         )
     allocation: dict[str, Any] | None = None
     if matches:
         match = matches[0]
-        total_gib = float(match.group("total_gib"))
-        fallback_count = int(match.group("fallback_count"))
+        gpu_slots = int(match.group("gpu_slots"))
+        host_slots = int(match.group("host_slots"))
+        gpu_slot_bytes = int(match.group("gpu_slot_bytes"))
+        host_buffer_bytes = int(match.group("host_buffer_bytes"))
         allocation = {
             "offset": match.start(),
             "device": match.group("device"),
-            "total_gib": total_gib,
-            "contract_sha256": match.group("contract"),
-            "fallback_count": fallback_count,
+            "gpu_full_layer_slots": gpu_slots,
+            "host_expert_slots": host_slots,
+            "gpu_slot_bytes": gpu_slot_bytes,
+            "host_buffer_bytes": host_buffer_bytes,
         }
-        if total_gib <= 0:
-            failures.append("layerwise two-slot allocation size is not positive")
-        if fallback_count != 0:
+        if gpu_slots != 1:
             failures.append(
-                f"startup layerwise fallback_count is {fallback_count}, expected 0"
+                f"gpu_full_layer_slots is {gpu_slots}, expected exactly 1"
             )
+        if host_slots != 2:
+            failures.append(f"host_expert_slots is {host_slots}, expected exactly 2")
+        if gpu_slot_bytes <= 0 or host_buffer_bytes <= 0:
+            failures.append("lazy layerwise allocation byte counts must be positive")
 
         memory_pool_offsets = [
             match.start() for match in re.finditer(r"Memory pool end\.", text)
         ]
         if not memory_pool_offsets:
             failures.append("server log has no completed KV memory-pool marker")
-        elif match.start() >= min(memory_pool_offsets):
+        elif match.start() <= max(memory_pool_offsets):
             failures.append(
-                "layerwise two-slot allocation marker does not precede KV memory pool"
+                "layerwise allocation is not lazy: marker must follow KV memory pool"
             )
 
         ready_offset = text.find("The server is fired up and ready to roll!")
         if ready_offset < 0:
             failures.append("server-ready marker is missing")
-        elif match.start() >= ready_offset:
+        elif match.start() <= ready_offset:
             failures.append(
-                "layerwise two-slot allocation marker does not precede server ready"
+                "layerwise allocation is not lazy: marker must follow server ready"
             )
         first_round = LAYERWISE_PATTERN.search(text)
         if first_round is not None and match.start() >= first_round.start():
-            failures.append("layerwise execution appears before startup allocation")
+            failures.append("generic layerwise execution appears before lazy allocation")
+
+    if text.count("The server is fired up and ready to roll!") != 1:
+        failures.append("server log must contain exactly one server-ready marker")
+    for legacy_pattern in LEGACY_LAYERWISE_PATTERNS:
+        if legacy_pattern.search(text) is not None:
+            failures.append("server log contains a legacy eager/two-slot protocol marker")
 
     return {
         "allocation": allocation,
         "allocation_marker_count": len(matches),
+        "allocation_required": require_allocation,
         "failures": failures,
         "pass": not failures,
     }
@@ -420,7 +452,7 @@ def _server_arg_value(body: str, name: str) -> str | None:
 
 
 def validate_prefill_parity_server_log(text: str, *, threshold: int) -> dict[str, Any]:
-    """Bind a parity collection to the exact TP8 threshold-0/1 server."""
+    """Bind a parity collection to the exact TP4 threshold-0/1024 server."""
     failures: list[str] = []
     server_args_matches = list(SERVER_ARGS_PATTERN.finditer(text))
     fields: dict[str, str | None] = {}
@@ -455,14 +487,18 @@ def validate_prefill_parity_server_log(text: str, *, threshold: int) -> dict[str
     if text.count("The server is fired up and ready to roll!") != 1:
         failures.append("server log must contain exactly one server-ready marker")
 
-    startup = validate_layerwise_startup(text) if threshold == 1 else None
+    startup = (
+        validate_layerwise_startup(text, require_allocation=False)
+        if threshold == LAYERWISE_TOKEN_THRESHOLD
+        else None
+    )
     if startup is not None:
         failures.extend(startup["failures"])
     else:
         if LAYERWISE_STARTUP_PATTERN.search(text) is not None:
-            failures.append("threshold-0 server allocated the layerwise manager")
+            failures.append("threshold-0 server allocated SharedFullContext")
         if LAYERWISE_PATTERN.search(text) is not None:
-            failures.append("threshold-0 server executed the layerwise manager")
+            failures.append("threshold-0 server executed generic layerwise prefill")
 
     return {
         "threshold": threshold,
@@ -492,8 +528,9 @@ def _log_before(path: Path) -> tuple[int, dict[str, Any] | None]:
     if not path.is_file():
         raise FileNotFoundError(path)
     size = path.stat().st_size
-    summaries = parse_layerwise_summaries(_read_tail(path))
-    return size, summaries[-1] if summaries else None
+    # Generic SharedFullContext logs have no global epoch/counter.  Every
+    # request is validated from its exact append-only log window instead.
+    return size, None
 
 
 def _log_after(path: Path, offset: int) -> tuple[int, str]:
@@ -571,7 +608,7 @@ def _capture_request_evidence(
     counters_after = cuda_graph_counters_by_rank(metrics_after_text)
 
     summaries = parse_layerwise_summaries(log_segment)
-    expected_rounds = math.ceil(len(input_ids) / chunk_size)
+    expected_rounds = expected_layerwise_rounds(len(input_ids), chunk_size)
     failures.extend(
         validate_layerwise_progress(
             previous_summary,
@@ -646,13 +683,15 @@ def run_layerwise(args: argparse.Namespace) -> int:
         failures.append(
             "layerwise matrix must use lengths 128/4096/4097/8193, "
             "chunk size 4096, exactly 16 output tokens, seed 20260811, "
-            "TP=8, and vocab size 154880"
+            "TP=4, and vocab size 154880"
         )
 
     server_log = Path(args.server_log)
     try:
         startup_text = server_log.read_text(encoding="utf-8", errors="replace")
-        startup_evidence = validate_layerwise_startup(startup_text)
+        startup_evidence = validate_prefill_parity_server_log(
+            startup_text, threshold=LAYERWISE_TOKEN_THRESHOLD
+        )
     except Exception as error:
         startup_evidence = {
             "failures": [f"{type(error).__name__}: {error}"],
@@ -696,6 +735,20 @@ def run_layerwise(args: argparse.Namespace) -> int:
         if not evidence["pass"] and args.stop_on_failure:
             break
 
+    try:
+        final_log = server_log.read_text(encoding="utf-8", errors="replace")
+        allocation_evidence = validate_layerwise_startup(
+            final_log, require_allocation=True
+        )
+    except Exception as error:
+        allocation_evidence = {
+            "failures": [f"{type(error).__name__}: {error}"],
+            "pass": False,
+        }
+    failures.extend(
+        f"allocation: {failure}" for failure in allocation_evidence["failures"]
+    )
+
     payload = {
         "schema_version": SCHEMA_VERSION,
         "kind": "glm5_next_session_c_layerwise_boundaries",
@@ -707,17 +760,22 @@ def run_layerwise(args: argparse.Namespace) -> int:
             "chunk_size": args.chunk_size,
             "output_tokens": args.output_length,
             "expected_rounds": {
-                str(length): math.ceil(length / args.chunk_size) for length in lengths
+                str(length): expected_layerwise_rounds(length, args.chunk_size)
+                for length in lengths
             },
             "require_decode_cuda_graph": True,
-            "require_layerwise_fallback_zero": True,
-            "require_startup_two_slot_allocation_before_kv_pool": True,
+            "layerwise_token_threshold": LAYERWISE_TOKEN_THRESHOLD,
+            "require_generic_complete_layer_rounds": True,
+            "require_lazy_shared_full_context": True,
+            "gpu_full_layer_slots": 1,
+            "host_expert_slots": 2,
             "fixture_seed": args.fixture_seed,
             "vocab_size": args.vocab_size,
             "tp_size": args.tp_size,
             "compliant": contract_compliant,
         },
         "startup_evidence": startup_evidence,
+        "allocation_evidence": allocation_evidence,
         "cases": cases,
         "failures": failures,
         "pass": not failures,
@@ -747,7 +805,7 @@ def run_long(args: argparse.Namespace) -> int:
     if not contract_compliant:
         failures.append(
             "final long request requires exactly 500000 input, 1024 output, "
-            "layerwise chunk size 4096, seed 20260812, TP=8, and vocab 154880"
+            "layerwise chunk size 4096, seed 20260812, TP=4, and vocab 154880"
         )
     try:
         if not contract_compliant:
@@ -771,6 +829,19 @@ def run_long(args: argparse.Namespace) -> int:
             "pass": False,
         }
     failures.extend(evidence["failures"])
+    try:
+        allocation_evidence = validate_layerwise_startup(
+            Path(args.server_log).read_text(encoding="utf-8", errors="replace"),
+            require_allocation=True,
+        )
+    except Exception as error:
+        allocation_evidence = {
+            "failures": [f"{type(error).__name__}: {error}"],
+            "pass": False,
+        }
+    failures.extend(
+        f"allocation: {failure}" for failure in allocation_evidence["failures"]
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "kind": "glm5_next_session_c_final_long_context",
@@ -782,9 +853,15 @@ def run_long(args: argparse.Namespace) -> int:
             "input_tokens": MIN_LONG_INPUT,
             "output_tokens": MIN_LONG_OUTPUT,
             "chunk_size": args.chunk_size,
-            "expected_layerwise_rounds": math.ceil(args.input_length / args.chunk_size),
+            "expected_layerwise_rounds": expected_layerwise_rounds(
+                args.input_length, args.chunk_size
+            ),
             "require_decode_cuda_graph": True,
-            "require_layerwise_fallback_zero": True,
+            "layerwise_token_threshold": LAYERWISE_TOKEN_THRESHOLD,
+            "require_generic_complete_layer_rounds": True,
+            "require_lazy_shared_full_context": True,
+            "gpu_full_layer_slots": 1,
+            "host_expert_slots": 2,
             "throughput_gate": None,
             "fixture_seed": args.fixture_seed,
             "vocab_size": args.vocab_size,
@@ -793,6 +870,7 @@ def run_long(args: argparse.Namespace) -> int:
         },
         "fixture": fixture,
         "evidence": evidence,
+        "allocation_evidence": allocation_evidence,
         "failures": failures,
         "pass": not failures,
     }
@@ -983,8 +1061,8 @@ def _collect_prefill_parity_case(
     after_offset, log_segment = _log_after(server_log, before_offset)
     summaries = parse_layerwise_summaries(log_segment)
     failures: list[str] = []
-    expected_rounds = math.ceil(length / args.chunk_size)
-    if args.threshold == 1:
+    expected_rounds = expected_layerwise_rounds(length, args.chunk_size)
+    if args.threshold == LAYERWISE_TOKEN_THRESHOLD:
         failures.extend(
             validate_layerwise_progress(
                 previous_summary,
@@ -1012,7 +1090,11 @@ def _collect_prefill_parity_case(
         "prompt_tokens": meta.get("prompt_tokens"),
         "completion_tokens": meta.get("completion_tokens"),
         "top_logprobs": top_logprobs,
-        "expected_layerwise_rounds": expected_rounds if args.threshold == 1 else 0,
+        "expected_layerwise_rounds": (
+            expected_rounds
+            if args.threshold == LAYERWISE_TOKEN_THRESHOLD
+            else 0
+        ),
         "previous_layerwise_summary": previous_summary,
         "layerwise_summaries": summaries,
         "server_log_window": {
@@ -1030,7 +1112,7 @@ def _collect_prefill_parity_case(
 def run_prefill_parity(args: argparse.Namespace) -> int:
     lengths = tuple(args.lengths)
     contract_compliant = (
-        args.threshold in (0, 1)
+        args.threshold in (0, LAYERWISE_TOKEN_THRESHOLD)
         and lengths == LAYERWISE_LENGTHS
         and args.output_length == DEFAULT_BOUNDARY_OUTPUT
         and args.chunk_size == LAYERWISE_CHUNK_SIZE
@@ -1042,9 +1124,9 @@ def run_prefill_parity(args: argparse.Namespace) -> int:
     failures: list[str] = []
     if not contract_compliant:
         failures.append(
-            "prefill parity requires threshold 0/1, lengths "
+            "prefill parity requires threshold 0/1024, lengths "
             "128/4096/4097/8193, output 16, chunk 4096, seed 20260811, "
-            "TP=8, vocab 154880, and collected top-k 256"
+            "TP=4, vocab 154880, and collected top-k 256"
         )
 
     server_log = Path(args.server_log)
@@ -1081,6 +1163,39 @@ def run_prefill_parity(args: argparse.Namespace) -> int:
         failures.extend(f"length {length}: {failure}" for failure in case["failures"])
         if not case["pass"] and args.stop_on_failure:
             break
+
+    try:
+        final_log = server_log.read_text(encoding="utf-8", errors="replace")
+        final_server_evidence = validate_prefill_parity_server_log(
+            final_log, threshold=args.threshold
+        )
+        if args.threshold == LAYERWISE_TOKEN_THRESHOLD:
+            allocation_evidence = validate_layerwise_startup(
+                final_log, require_allocation=True
+            )
+            final_server_evidence["layerwise_startup"] = allocation_evidence
+            final_server_evidence["failures"] = list(
+                dict.fromkeys(
+                    final_server_evidence["failures"]
+                    + allocation_evidence["failures"]
+                )
+            )
+            final_server_evidence["pass"] = not final_server_evidence["failures"]
+        server_evidence = final_server_evidence | {
+            "path": str(server_log.resolve()),
+            "initial_size": server_evidence.get("initial_size"),
+            "initial_sha256": server_evidence.get("initial_sha256"),
+        }
+    except Exception as error:
+        server_evidence = {
+            **server_evidence,
+            "failures": server_evidence.get("failures", [])
+            + [f"{type(error).__name__}: {error}"],
+            "pass": False,
+        }
+    failures.extend(
+        f"final server: {failure}" for failure in server_evidence["failures"]
+    )
 
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -1142,10 +1257,24 @@ def _validate_prefill_collection(
         ):
             failures.append(f"{role}: server_args evidence is invalid")
         startup = server_evidence.get("layerwise_startup")
-        if expected_threshold == 1 and (
+        if expected_threshold == LAYERWISE_TOKEN_THRESHOLD and (
             not isinstance(startup, dict) or startup.get("pass") is not True
         ):
             failures.append(f"{role}: layerwise startup evidence is invalid")
+        elif expected_threshold == LAYERWISE_TOKEN_THRESHOLD:
+            allocation = startup.get("allocation")
+            if (
+                not isinstance(allocation, dict)
+                or allocation.get("gpu_full_layer_slots") != 1
+                or allocation.get("host_expert_slots") != 2
+                or not isinstance(allocation.get("gpu_slot_bytes"), int)
+                or allocation["gpu_slot_bytes"] <= 0
+                or not isinstance(allocation.get("host_buffer_bytes"), int)
+                or allocation["host_buffer_bytes"] <= 0
+            ):
+                failures.append(
+                    f"{role}: lazy SharedFullContext slot evidence is invalid"
+                )
         if expected_threshold == 0 and startup is not None:
             failures.append(f"{role}: threshold-0 startup evidence is not null")
         if not isinstance(server_evidence.get("path"), str):
@@ -1242,8 +1371,10 @@ def _validate_prefill_collection(
             failures.append(f"{role} length {length}: completion token count differs")
 
         summaries = case.get("layerwise_summaries")
-        expected_rounds = math.ceil(length / LAYERWISE_CHUNK_SIZE)
-        if expected_threshold == 1:
+        expected_rounds = expected_layerwise_rounds(
+            length, LAYERWISE_CHUNK_SIZE
+        )
+        if expected_threshold == LAYERWISE_TOKEN_THRESHOLD:
             if not isinstance(summaries, list):
                 failures.append(
                     f"{role} length {length}: layerwise summaries are missing"
@@ -1361,7 +1492,9 @@ def compare_prefill_parity_payloads(
         baseline, role="threshold-0", expected_threshold=0
     )
     candidate_failures, candidate_cases = _validate_prefill_collection(
-        candidate, role="threshold-1", expected_threshold=1
+        candidate,
+        role="threshold-1024",
+        expected_threshold=LAYERWISE_TOKEN_THRESHOLD,
     )
     failures.extend(candidate_failures)
     diagnostics: list[dict[str, Any]] = []
@@ -1434,7 +1567,7 @@ def compare_prefill_parity_payloads(
             if missing:
                 failures.append(
                     f"length {length} step {step_index}: {len(missing)} "
-                    "threshold-0 top-64 IDs are absent from threshold-1 top-256"
+                    "threshold-0 top-64 IDs are absent from threshold-1024 top-256"
                 )
             if numerical_failures:
                 failures.append(
@@ -1447,7 +1580,7 @@ def compare_prefill_parity_payloads(
         "created_unix": time.time(),
         "contract": {
             "baseline_threshold": 0,
-            "candidate_threshold": 1,
+            "candidate_threshold": LAYERWISE_TOKEN_THRESHOLD,
             "lengths": list(LAYERWISE_LENGTHS),
             "output_tokens": DEFAULT_BOUNDARY_OUTPUT,
             "fixture_seed": LAYERWISE_FIXTURE_SEED,
@@ -1467,13 +1600,13 @@ def compare_prefill_parity_payloads(
 
 def run_compare_prefill_parity(args: argparse.Namespace) -> int:
     baseline_path = Path(args.threshold_0)
-    candidate_path = Path(args.threshold_1)
+    candidate_path = Path(args.threshold_1024)
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
     payload = compare_prefill_parity_payloads(baseline, candidate)
     payload["inputs"] = {
         "threshold_0": str(baseline_path.resolve()),
-        "threshold_1": str(candidate_path.resolve()),
+        "threshold_1024": str(candidate_path.resolve()),
     }
     _atomic_write_json(Path(args.output), payload)
     print(json.dumps({"output": args.output, "pass": payload["pass"]}, indent=2))
@@ -1709,7 +1842,7 @@ def _add_common_request_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fixture-seed", type=int, default=FIXTURE_SEED)
     parser.add_argument("--request-timeout", type=float, default=86_400.0)
     parser.add_argument("--no-flush-cache", action="store_true")
-    parser.add_argument("--tp-size", type=int, default=8)
+    parser.add_argument("--tp-size", type=int, default=REQUIRED_TP_SIZE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1738,7 +1871,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_request_args(prefill_parity)
     prefill_parity.add_argument("--server-log", required=True)
-    prefill_parity.add_argument("--threshold", type=int, choices=(0, 1), required=True)
+    prefill_parity.add_argument(
+        "--threshold",
+        type=int,
+        choices=(0, LAYERWISE_TOKEN_THRESHOLD),
+        required=True,
+    )
     prefill_parity.add_argument(
         "--lengths", type=int, nargs="+", default=list(LAYERWISE_LENGTHS)
     )
@@ -1757,10 +1895,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     compare_prefill = subparsers.add_parser(
         "compare-prefill-parity",
-        help="compare frozen threshold-0 and threshold-1 prefill collections",
+        help="compare frozen threshold-0 and threshold-1024 prefill collections",
     )
     compare_prefill.add_argument("--threshold-0", required=True)
-    compare_prefill.add_argument("--threshold-1", required=True)
+    compare_prefill.add_argument("--threshold-1024", required=True)
     compare_prefill.add_argument("--output", required=True)
     compare_prefill.set_defaults(func=run_compare_prefill_parity)
 

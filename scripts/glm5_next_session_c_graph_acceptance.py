@@ -1132,7 +1132,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eager-json")
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
-    parser.add_argument("--tp-size", type=int, default=8)
+    parser.add_argument("--tp-size", type=int, default=4)
     parser.add_argument("--request-timeout", type=float, default=7200)
     parser.add_argument("--no-flush-cache", action="store_true")
     return parser

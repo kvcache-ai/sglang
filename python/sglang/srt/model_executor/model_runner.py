@@ -590,25 +590,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
-        # Exact GLM-5-Next treats a positive threshold as a required
-        # layerwise-prefill enable switch.  Materialize its two raw block-FP8
-        # slots before KV profiling so the profiler observes the real reserved
-        # VRAM and a startup OOM fails closed rather than surfacing on the first
-        # long request.
-        self.glm5_next_fp8_layerwise_prefill_allocated_bytes = 0
-        if (
-            getattr(server_args, "_glm5_next_session_ab_active", False)
-            and (server_args.kt_method or "").upper() == "FP8"
-            and (server_args.kt_gpu_prefill_token_threshold or 0) > 0
-        ):
-            from sglang.srt.layers.moe.kt_ep_wrapper import (
-                initialize_glm5_next_fp8_layerwise_prefill,
-            )
-
-            self.glm5_next_fp8_layerwise_prefill_allocated_bytes = (
-                initialize_glm5_next_fp8_layerwise_prefill()
-            )
-
         # Do not allocate the MXFP4 layerwise slots at startup.  Still account
         # for their future capacity before KV-cache profiling, otherwise the
         # pool can consume the VRAM needed by the first long prefill request.

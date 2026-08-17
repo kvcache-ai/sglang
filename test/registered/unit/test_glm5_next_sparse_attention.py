@@ -326,7 +326,13 @@ class TestGlm5NextSparseAttention(unittest.TestCase):
         )
         source = ast.unparse(forward)
         self.assertIn("if self.is_glm5_next", source)
-        self.assertIn("self.is_glm5_next and self.device_capability == (12, 0)", source)
+        self.assertIn(
+            "self.is_glm5_next and self.device_capability in _GLM5_NEXT_NATIVE_CUDA_CAPS",
+            source,
+        )
+        self.assertIn(
+            "self.device_capability in _GLM5_NEXT_SCALED_FP8_CUDA_CAPS", source
+        )
         self.assertIn("glm5_next_sparse_mla_reference", source)
         self.assertIn("use_cuda_decode_kernel=not is_prefill", source)
         self.assertIn("forward_batch.forward_mode.is_extend_without_speculative()", source)
@@ -365,6 +371,10 @@ class TestGlm5NextSparseAttention(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_raw_fp8_cuda_kernel_matches_cpu_oracle_and_replays_graph(self):
+        if torch.cuda.get_device_capability() < (8, 9):
+            self.skipTest("this legacy route requires native FP8")
+        if torch.cuda.get_device_capability() == (8, 9):
+            self.skipTest("consumer profiles use BF16 or scaled FP8 cache")
         torch.manual_seed(20260812)
         query_cpu = (torch.randn(1, 2, 512) * 0.1).to(torch.float8_e4m3fn)
         kv_cpu = (torch.randn(16, 512) * 0.1).to(torch.float8_e4m3fn)
@@ -412,6 +422,8 @@ class TestGlm5NextSparseAttention(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_scaled_fp8_cuda_kernel_matches_oracle_and_replays_graph(self):
+        if torch.cuda.get_device_capability() < (8, 9):
+            self.skipTest("pre-SM89 GPUs use an unscaled BF16 latent cache")
         torch.manual_seed(20260815)
         query_bf16 = (torch.randn(1, 2, 512) * 0.02).to(torch.bfloat16)
         kv_bf16 = (torch.randn(16, 512) * 0.02).to(torch.bfloat16)

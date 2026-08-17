@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 _RAGGED_SCRATCH_K_U8: Optional[torch.Tensor] = None
 _RAGGED_SCRATCH_K_SCALE: Optional[torch.Tensor] = None
+_RAGGED_SCRATCH_K_BF16: Optional[torch.Tensor] = None
 
 
 def _req_to_token_table_from_batch(forward_batch: ForwardBatch) -> torch.Tensor:
@@ -65,6 +66,24 @@ def _get_ragged_scratch(
     return _RAGGED_SCRATCH_K_U8[:total_k_rows], _RAGGED_SCRATCH_K_SCALE[:total_k_rows]
 
 
+def _get_ragged_bf16_scratch(
+    total_k_rows: int, device: torch.device
+) -> torch.Tensor:
+    global _RAGGED_SCRATCH_K_BF16
+    cur = _RAGGED_SCRATCH_K_BF16
+    grow = (
+        cur is None
+        or cur.device.type != device.type
+        or (device.index is not None and cur.device.index != device.index)
+        or cur.shape[0] < total_k_rows
+    )
+    if grow:
+        _RAGGED_SCRATCH_K_BF16 = torch.empty(
+            (total_k_rows, INDEX_HEAD_DIM), dtype=torch.bfloat16, device=device
+        )
+    return _RAGGED_SCRATCH_K_BF16[:total_k_rows]
+
+
 @dataclass(frozen=True)
 class PoolWriteRows:
     req: torch.Tensor
@@ -103,6 +122,7 @@ class KPoolExtendPlan:
     ragged_total_k_rows: int
     ragged_k_u8: Optional[torch.Tensor]
     ragged_k_scale: Optional[torch.Tensor]
+    ragged_k_bf16: Optional[torch.Tensor]
     ragged_paged_page_table: Optional[torch.Tensor]
     ragged_paged_page_table_row_index: Optional[torch.Tensor]
 
@@ -270,6 +290,7 @@ def _kpool_plan_to_gpu(
     pool_size: int,
     slots_per_page: int,
     topk_transform_method: TopkTransformMethod,
+    index_cache_dtype: torch.dtype,
 ) -> KPoolExtendPlan:
     from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
 
@@ -405,11 +426,17 @@ def _kpool_plan_to_gpu(
         )
         ragged_paged_page_table = req_to_token
 
-    if ragged_total_k_rows > 0:
+    if ragged_total_k_rows > 0 and index_cache_dtype == torch.bfloat16:
+        ragged_k_u8 = None
+        ragged_k_scale = None
+        ragged_k_bf16 = _get_ragged_bf16_scratch(ragged_total_k_rows, device)
+    elif ragged_total_k_rows > 0:
         ragged_k_u8, ragged_k_scale = _get_ragged_scratch(ragged_total_k_rows, device)
+        ragged_k_bf16 = None
     else:
         ragged_k_u8 = None
         ragged_k_scale = None
+        ragged_k_bf16 = None
 
     return KPoolExtendPlan(
         writes=PoolWriteRows(
@@ -434,6 +461,7 @@ def _kpool_plan_to_gpu(
         ragged_total_k_rows=ragged_total_k_rows,
         ragged_k_u8=ragged_k_u8,
         ragged_k_scale=ragged_k_scale,
+        ragged_k_bf16=ragged_k_bf16,
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
     )
@@ -454,6 +482,7 @@ def init_kpool_extend_metadata(
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
     local_req_pool_indices: Optional[torch.Tensor] = None,
+    index_cache_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> NSAMetadata:
     mode = forward_batch.forward_mode
     is_extend_like = mode.is_extend_without_speculative()
@@ -489,6 +518,7 @@ def init_kpool_extend_metadata(
         pool_size,
         slots_per_page,
         topk_transform_method,
+        index_cache_dtype,
     )
     return dataclasses.replace(metadata, kpool_extend_plan=plan)
 

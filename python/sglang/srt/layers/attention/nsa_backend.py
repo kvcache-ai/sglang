@@ -76,6 +76,8 @@ else:
 
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
+_GLM5_NEXT_NATIVE_CUDA_CAPS = ((8, 6), (8, 9), (12, 0))
+_GLM5_NEXT_SCALED_FP8_CUDA_CAPS = ((8, 9), (12, 0))
 
 # Control whether to use fused metadata copy kernel (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
@@ -385,7 +387,13 @@ class NativeSparseAttnBackend(
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
-        if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm":
+        uses_glm5_native_backend = (
+            self.is_glm5_next
+            and self.device_capability in _GLM5_NEXT_NATIVE_CUDA_CAPS
+        )
+        if not uses_glm5_native_backend and (
+            self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm"
+        ):
             global global_workspace_buffer
             if global_workspace_buffer is None:
                 global_workspace_buffer = torch.empty(
@@ -443,7 +451,8 @@ class NativeSparseAttnBackend(
             # SM120 consumes the graph-safe model-local scorer and has no
             # DeepGEMM schedule.  Other Blackwell variants keep the existing
             # schedule contract.
-            build_schedule_metadata=self.device_capability != (12, 0),
+            build_schedule_metadata=self.device_capability
+            not in _GLM5_NEXT_NATIVE_CUDA_CAPS,
         )
 
     def _update_glm5_next_kpool_graph_metadata(
@@ -469,7 +478,8 @@ class NativeSparseAttnBackend(
             pool_size=self.nsa_index_kpool,
             real_page_size=self.real_page_size,
             slots_per_page=64,
-            build_schedule_metadata=self.device_capability != (12, 0),
+            build_schedule_metadata=self.device_capability
+            not in _GLM5_NEXT_NATIVE_CUDA_CAPS,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -713,7 +723,10 @@ class NativeSparseAttnBackend(
         # Compute it once per forward batch and reuse it across layers.
         if (
             is_cuda()
-            and not (self.is_glm5_next and self.device_capability == (12, 0))
+            and not (
+                self.is_glm5_next
+                and self.device_capability in _GLM5_NEXT_NATIVE_CUDA_CAPS
+            )
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
@@ -808,6 +821,11 @@ class NativeSparseAttnBackend(
                     topk_transform_method=topk_transform_method,
                     full_real_page_table=metadata.real_page_table,
                     full_seqlens_expanded=seqlens_expanded,
+                    index_cache_dtype=getattr(
+                        forward_batch.token_to_kv_pool,
+                        "index_cache_dtype",
+                        torch.float8_e4m3fn,
+                    ),
                 )
             elif forward_batch.forward_mode.is_decode_or_idle():
                 metadata = init_pooled_paged_mqa_metadata(
@@ -818,7 +836,8 @@ class NativeSparseAttnBackend(
                     real_page_size=self.real_page_size,
                     slots_per_page=slots_per_page,
                     build_schedule_metadata=not (
-                        self.is_glm5_next and self.device_capability == (12, 0)
+                        self.is_glm5_next
+                        and self.device_capability in _GLM5_NEXT_NATIVE_CUDA_CAPS
                     ),
                 )
         self.forward_metadata = metadata
@@ -1056,7 +1075,10 @@ class NativeSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         if (
             is_cuda()
-            and not (self.is_glm5_next and self.device_capability == (12, 0))
+            and not (
+                self.is_glm5_next
+                and self.device_capability in _GLM5_NEXT_NATIVE_CUDA_CAPS
+            )
             and (
                 forward_mode.is_decode_or_idle()
                 or forward_mode.is_target_verify()
@@ -1236,7 +1258,10 @@ class NativeSparseAttnBackend(
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
         if (
             is_cuda()
-            and not (self.is_glm5_next and self.device_capability == (12, 0))
+            and not (
+                self.is_glm5_next
+                and self.device_capability in _GLM5_NEXT_NATIVE_CUDA_CAPS
+            )
             and (
                 forward_mode.is_decode_or_idle()
                 or forward_mode.is_target_verify()
@@ -2073,8 +2098,6 @@ class NativeSparseAttnBackend(
         is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
-        import flashinfer.decode
-
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
@@ -2083,7 +2106,7 @@ class NativeSparseAttnBackend(
         glm5_current_chunk_locs = None
         use_glm5_scaled_fp8 = (
             self.is_glm5_next
-            and self.device_capability == (12, 0)
+            and self.device_capability in _GLM5_NEXT_SCALED_FP8_CUDA_CAPS
             and self.kv_cache_dtype == torch.float8_e4m3fn
         )
         use_glm5_current_chunk_bf16 = (
@@ -2215,7 +2238,10 @@ class NativeSparseAttnBackend(
             )
             bmm1_scale = q_scale * k_scale * layer.scaling
 
-        if self.is_glm5_next and self.device_capability == (12, 0):
+        if (
+            self.is_glm5_next
+            and self.device_capability in _GLM5_NEXT_NATIVE_CUDA_CAPS
+        ):
             latent_scale = (
                 forward_batch.token_to_kv_pool.get_latent_scale_buffer(layer.layer_id)
                 if use_glm5_scaled_fp8
@@ -2236,6 +2262,12 @@ class NativeSparseAttnBackend(
                 current_chunk_kv=glm5_current_chunk_kv,
                 current_chunk_locs=glm5_current_chunk_locs,
             )
+
+        # The GLM-native path above deliberately has no FlashInfer ABI
+        # dependency: consumer GPUs can execute it even when the installed
+        # TRTLLM-GEN kernels do not contain their architecture.  Import only
+        # after that dispatch, for the shared DeepSeek implementation below.
+        import flashinfer.decode
 
         # Padding to a multiple of four belongs to FlashInfer's TRTLLM ABI.
         # The exact GLM kernel above consumes its native 2048+3 width and must

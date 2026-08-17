@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import ast
 import copy
+import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SERVER_ARGS_PATH = REPO_ROOT / "python/sglang/srt/server_args.py"
+MODEL_RUNNER_PATH = REPO_ROOT / "python/sglang/srt/model_executor/model_runner.py"
 NSA_BACKEND_PATH = REPO_ROOT / "python/sglang/srt/layers/attention/nsa_backend.py"
 
 
@@ -98,7 +101,7 @@ def _boundary_args(**overrides):
         dllm_algorithm=None,
         dllm_algorithm_config=None,
         quantization="fp8",
-        tp_size=1,
+        tp_size=4,
         pp_size=1,
         dp_size=1,
         moe_dp_size=1,
@@ -247,16 +250,14 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self.validate(_boundary_args(**overrides))
 
-    def test_only_tp1_structural_and_tp8_production_widths_are_accepted(self):
-        for tp_size in (1, 8):
-            with self.subTest(tp_size=tp_size):
-                args = _boundary_args(tp_size=tp_size)
-                self.validate(args)
-                self.assertEqual(args.tp_size, tp_size)
+    def test_only_tp4_width_is_accepted(self):
+        args = _boundary_args(tp_size=4)
+        self.validate(args)
+        self.assertEqual(args.tp_size, 4)
 
-        for tp_size in (2, 4, 16):
+        for tp_size in (1, 2, 8, 16):
             with self.subTest(tp_size=tp_size):
-                with self.assertRaisesRegex(ValueError, "TP=8 production"):
+                with self.assertRaisesRegex(ValueError, "only TP=4"):
                     self.validate(_boundary_args(tp_size=tp_size))
 
     def test_only_tensor_parallel_topology_is_accepted(self):
@@ -317,29 +318,19 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                         )
                     )
 
-    def test_layerwise_prefill_requires_tp8_and_static_experts(self):
+    def test_layerwise_prefill_requires_tp4_and_static_experts(self):
         accepted = _boundary_args(
-            tp_size=8,
+            tp_size=4,
             kt_weight_path="stub/experts",
             kt_method="fp8",
             kt_gpu_prefill_token_threshold=4096,
         )
         self.validate(accepted)
 
-        with self.assertRaisesRegex(ValueError, "requires TP=8"):
-            self.validate(
-                _boundary_args(
-                    tp_size=1,
-                    kt_weight_path="stub/experts",
-                    kt_method="fp8",
-                    kt_gpu_prefill_token_threshold=4096,
-                )
-            )
-
         with self.assertRaisesRegex(ValueError, "dynamic-expert-update"):
             self.validate(
                 _boundary_args(
-                    tp_size=8,
+                    tp_size=4,
                     kt_weight_path="stub/experts",
                     kt_method="fp8",
                     kt_gpu_prefill_token_threshold=4096,
@@ -347,23 +338,59 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 )
             )
 
-        structural = _boundary_args(
-            tp_size=1,
-            kt_weight_path="stub/experts",
-            kt_method="fp8",
-            kt_gpu_prefill_token_threshold=0,
-        )
-        self.validate(structural)
+    def test_glm_layerwise_context_is_not_eagerly_initialized_by_model_runner(self):
+        source = MODEL_RUNNER_PATH.read_text(encoding="utf-8")
+
+        self.assertNotIn("initialize_glm5_next_fp8_layerwise_prefill", source)
+        self.assertNotIn("glm5_next_fp8_layerwise_prefill_allocated_bytes", source)
 
 
 class TestGlm5NextSessionABNSA(unittest.TestCase):
     @staticmethod
     def _configure():
-        return _compile_function(
+        def get_glm5_next_gpu_profile(capability):
+            if capability == (8, 6):
+                return SimpleNamespace(
+                    value="sm86_bf16",
+                    kv_cache_dtype="bfloat16",
+                    index_cache_dtype="bfloat16",
+                    is_consumer_gpu=True,
+                )
+            if capability == (8, 9):
+                return SimpleNamespace(
+                    value="sm89_fp8",
+                    kv_cache_dtype="fp8_e4m3",
+                    index_cache_dtype="fp8_e4m3",
+                    is_consumer_gpu=True,
+                )
+            if capability[0] >= 10:
+                return SimpleNamespace(
+                    value="blackwell_fp8",
+                    kv_cache_dtype="fp8_e4m3",
+                    index_cache_dtype="fp8_e4m3",
+                    is_consumer_gpu=False,
+                )
+            raise ValueError("GLM-5-Next supports NVIDIA SM86, SM89, or Blackwell")
+
+        configure = _compile_function(
             "_configure_glm5_next_session_ab_nsa",
             class_name="ServerArgs",
             globals_={"logger": _LoggerStub()},
         )
+        glm5_next_config = ModuleType("sglang.srt.configs.glm5_next")
+        glm5_next_config.get_glm5_next_gpu_profile = get_glm5_next_gpu_profile
+        package_modules = {
+            "sglang": ModuleType("sglang"),
+            "sglang.srt": ModuleType("sglang.srt"),
+            "sglang.srt.configs": ModuleType("sglang.srt.configs"),
+            "sglang.srt.configs.glm5_next": glm5_next_config,
+        }
+
+        def invoke(self, capability):
+            with mock.patch.dict(sys.modules, package_modules):
+                return configure(self, capability)
+
+        return invoke
 
     @staticmethod
     def _args(**overrides):
@@ -371,6 +398,8 @@ class TestGlm5NextSessionABNSA(unittest.TestCase):
             kv_cache_dtype="fp8_e4m3",
             nsa_prefill_backend=None,
             nsa_decode_backend=None,
+            kt_gpu_prefill_token_threshold=0,
+            enable_multimodal=False,
         )
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -379,23 +408,60 @@ class TestGlm5NextSessionABNSA(unittest.TestCase):
         configure = self._configure()
         args = self._args()
 
-        configure(args, 12)
+        configure(args, (12, 0))
 
         self.assertEqual(args.nsa_prefill_backend, "trtllm")
         self.assertEqual(args.nsa_decode_backend, "trtllm")
 
-    def test_bf16_and_pre_blackwell_are_rejected(self):
+    def test_architecture_specific_cache_dtype_policy(self):
+        sm86 = self._args(kv_cache_dtype="auto")
+        self._configure()(sm86, (8, 6))
+        self.assertEqual(sm86.kv_cache_dtype, "bfloat16")
+
+        sm89 = self._args(kv_cache_dtype="auto")
+        self._configure()(sm89, (8, 9))
+        self.assertEqual(sm89.kv_cache_dtype, "fp8_e4m3")
+
         for dtype in ("bf16", "bfloat16"):
             with self.subTest(dtype=dtype):
                 with self.assertRaisesRegex(ValueError, "fp8_e4m3"):
-                    self._configure()(self._args(kv_cache_dtype=dtype), 12)
+                    self._configure()(self._args(kv_cache_dtype=dtype), (8, 9))
 
-        with self.assertRaisesRegex(ValueError, "Blackwell"):
-            self._configure()(self._args(), 9)
+        with self.assertRaisesRegex(ValueError, "bfloat16"):
+            self._configure()(self._args(kv_cache_dtype="fp8_e4m3"), (8, 6))
+
+        with self.assertRaisesRegex(ValueError, "SM86, SM89, or Blackwell"):
+            self._configure()(self._args(), (9, 0))
+
+    def test_consumer_gpu_rejects_layerwise_prefill(self):
+        with self.assertRaisesRegex(ValueError, "not adapted for SM86/SM89"):
+            self._configure()(
+                self._args(
+                    kv_cache_dtype="bfloat16",
+                    kt_gpu_prefill_token_threshold=4096,
+                ),
+                (8, 6),
+            )
+
+    def test_consumer_gpu_rejects_multimodal_but_blackwell_is_unchanged(self):
+        with self.assertRaisesRegex(ValueError, "text inference only"):
+            self._configure()(
+                self._args(
+                    kv_cache_dtype="bfloat16",
+                    enable_multimodal=True,
+                ),
+                (8, 6),
+            )
+
+        blackwell = self._args(enable_multimodal=True)
+        self._configure()(blackwell, (12, 0))
+        self.assertTrue(blackwell.enable_multimodal)
 
     def test_non_trtllm_sparse_backend_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "both NSA prefill and decode"):
-            self._configure()(self._args(nsa_prefill_backend="flashmla_sparse"), 12)
+            self._configure()(
+                self._args(nsa_prefill_backend="flashmla_sparse"), (12, 0)
+            )
 
     def test_startup_does_not_require_new_flashinfer_abi(self):
         configure = _find_function(
@@ -540,7 +606,7 @@ class TestGlm5NextBoundaryIsolation(unittest.TestCase):
             args = _boundary_args(moe_runner_backend="triton" if exact_glm else backend)
             args.quantization = "fp8"
             args.ep_size = 1
-            args.tp_size = 1
+            args.tp_size = 4 if exact_glm else 1
             args._validate_glm5_next_session_ab_boundary = lambda: validate(args)
             if exact_glm:
                 validate(args)

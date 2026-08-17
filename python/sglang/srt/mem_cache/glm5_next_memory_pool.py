@@ -124,6 +124,9 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
+            index_cache_dtype=(
+                torch.bfloat16 if dtype == torch.bfloat16 else torch.float8_e4m3fn
+            ),
         )
 
         # The shared NSA pool selects its scaled FP8 layout when
@@ -134,6 +137,11 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
         if dtype == torch.float8_e4m3fn:
             assert not self.nsa_kv_cache_store_fp8
             assert self.kv_cache_dim == kv_lora_rank
+        elif dtype != torch.bfloat16:
+            raise ValueError(
+                "GLM-5-Next consumer cache supports only BF16 or FP8 E4M3, "
+                f"got {dtype}"
+            )
 
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
@@ -413,6 +421,14 @@ class Glm5NextHybridKVPool(HybridLinearKVPool):
     @property
     def quant_block_size(self) -> int:
         return self.full_kv_pool.quant_block_size
+
+    @property
+    def index_cache_dtype(self) -> torch.dtype:
+        return self.full_kv_pool.index_cache_dtype
+
+    @property
+    def index_cache_is_bf16(self) -> bool:
+        return self.full_kv_pool.index_cache_is_bf16
 
     @property
     def index_kpool(self) -> int:

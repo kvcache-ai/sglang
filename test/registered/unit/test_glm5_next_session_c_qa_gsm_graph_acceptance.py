@@ -187,17 +187,17 @@ def test_metrics_allow_decode_none_counter_disappearance_but_not_increase():
     assert comparison["per_rank"]["1"]["decode_none_delta"] == -4
 
 
-def test_metrics_require_positive_cuda_graph_delta_on_all_eight_ranks():
-    before = acceptance.analyze_metrics(_metrics(graph=[10] * 8))
-    after = acceptance.analyze_metrics(_metrics(graph=[11] * 7 + [10]))
+def test_metrics_require_positive_cuda_graph_delta_on_all_four_ranks():
+    before = acceptance.analyze_metrics(_metrics(graph=[10] * 4))
+    after = acceptance.analyze_metrics(_metrics(graph=[11] * 3 + [10]))
 
     comparison = acceptance.compare_metrics(
-        before, after, tp_size=8, minimum_graph_delta_per_rank=1
+        before, after, tp_size=4, minimum_graph_delta_per_rank=1
     )
 
     assert comparison["pass"] is False
-    assert comparison["per_rank"]["7"]["pass"] is False
-    assert any("TP rank 7" in failure for failure in comparison["failures"])
+    assert comparison["per_rank"]["3"]["pass"] is False
+    assert any("TP rank 3" in failure for failure in comparison["failures"])
 
 
 def test_qa_requires_choice_content_usage_and_stop_finish():
@@ -340,6 +340,7 @@ def test_gsm_command_freezes_session_c_parameters(tmp_path: Path):
 
     command = acceptance.build_gsm_command(args)
 
+    assert args.tp_size == 4
     assert command[0] == args.python
     assert command[1] == "-c"
     assert command[2] == acceptance.GSM_BENCHMARK_WORKER

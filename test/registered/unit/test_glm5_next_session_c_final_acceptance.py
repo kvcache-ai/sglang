@@ -15,102 +15,55 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(ACCEPTANCE)
 
 
-def _summary(
-    *,
-    epoch,
-    apply_count,
-    prime_count,
-    prefetch_hit_count,
-    completed_rounds,
-    fallback_count=0,
-    slot=1,
-    load_kind="prefetch-hit",
-):
+def _round(*, round_index=0, layers=None, compute_ms=None):
+    layers = list(range(3, 45)) if layers is None else layers
+    compute_ms = [1.0] * len(layers) if compute_ms is None else compute_ms
     return {
-        "layer": 44,
-        "epoch": epoch,
-        "slot": slot,
-        "load_kind": load_kind,
-        "apply_count": apply_count,
-        "prime_count": prime_count,
-        "prefetch_hit_count": prefetch_hit_count,
-        "completed_rounds": completed_rounds,
-        "fallback_count": fallback_count,
+        "round_index": round_index,
+        "layers": layers,
+        "compute_ms": compute_ms,
+        "expert_update_ms": [None] * len(layers),
+        "complete": len(layers) == 42,
     }
 
 
 def test_layerwise_log_parser_and_progress_gate_accept_exact_rounds():
     text = "\n".join(
-        [
-            "noise",
-            "KT GLM-5-Next FP8 layerwise prefill: layer=44 epoch=3 slot=1 "
-            "prefetch-hit apply_count=168 prime_count=4 "
-            "prefetch_hit_count=164 completed_rounds=4 fallback_count=0",
-            "KT GLM-5-Next FP8 layerwise prefill: layer=44 epoch=4 slot=1 "
-            "prefetch-hit apply_count=210 prime_count=5 "
-            "prefetch_hit_count=205 completed_rounds=5 fallback_count=0",
+        ["noise"]
+        + [
+            "KT layerwise prefill: "
+            f"layer {layer} compute = {round_index + layer / 100:.2f} ms"
+            for round_index in range(2)
+            for layer in range(3, 45)
         ]
     )
     current = ACCEPTANCE.parse_layerwise_summaries(text)
-    previous = _summary(
-        epoch=2,
-        apply_count=126,
-        prime_count=3,
-        prefetch_hit_count=123,
-        completed_rounds=3,
-    )
 
     assert len(current) == 2
     assert not ACCEPTANCE.validate_layerwise_progress(
-        previous, current, expected_rounds=2
+        None, current, expected_rounds=2
     )
 
 
-def test_layerwise_log_parser_ignores_per_layer_diagnostics():
-    lines = []
-    for epoch in range(2):
-        for layer in range(3, 45):
-            offset = layer - 3
-            lines.append(
-                "KT GLM-5-Next FP8 layerwise prefill: "
-                f"layer={layer} epoch={epoch} slot={offset % 2} "
-                f"{'prime' if layer == 3 else 'prefetch-hit'} "
-                f"apply_count={epoch * 42 + offset + 1} "
-                f"prime_count={epoch + 1} "
-                f"prefetch_hit_count={epoch * 41 + offset} "
-                f"completed_rounds={epoch + (layer == 44)} fallback_count=0"
-            )
-
-    summaries = ACCEPTANCE.parse_layerwise_summaries("\n".join(lines))
-
-    assert summaries == [
-        _summary(
-            epoch=0,
-            apply_count=42,
-            prime_count=1,
-            prefetch_hit_count=41,
-            completed_rounds=1,
-        ),
-        _summary(
-            epoch=1,
-            apply_count=84,
-            prime_count=2,
-            prefetch_hit_count=82,
-            completed_rounds=2,
-        ),
-    ]
-    assert not ACCEPTANCE.validate_layerwise_progress(
-        None, summaries, expected_rounds=2
-    )
-
-
-def test_layerwise_partial_round_does_not_become_a_summary():
+def test_layerwise_log_parser_accepts_optional_expert_update_timing():
     text = "\n".join(
-        "KT GLM-5-Next FP8 layerwise prefill: "
-        f"layer={layer} epoch=0 slot={(layer - 3) % 2} "
-        f"{'prime' if layer == 3 else 'prefetch-hit'} "
-        f"apply_count={layer - 2} prime_count=1 "
-        f"prefetch_hit_count={layer - 3} completed_rounds=0 fallback_count=0"
+        "KT layerwise prefill: "
+        f"layer {layer} compute = 1.25 ms, expert update = 0.50 ms"
+        for layer in range(3, 45)
+    )
+
+    summaries = ACCEPTANCE.parse_layerwise_summaries(text)
+
+    assert len(summaries) == 1
+    assert summaries[0]["expert_update_ms"] == [0.5] * 42
+    assert not ACCEPTANCE.validate_layerwise_progress(
+        None, summaries, expected_rounds=1
+    )
+
+
+def test_layerwise_partial_round_is_retained_and_rejected():
+    text = "\n".join(
+        f"KT layerwise prefill: layer {layer} compute = 1.00 ms"
         for layer in range(3, 44)
     )
 
@@ -119,62 +72,28 @@ def test_layerwise_partial_round_does_not_become_a_summary():
         None, summaries, expected_rounds=1
     )
 
-    assert summaries == []
-    assert any("expected 1" in failure for failure in failures)
+    assert len(summaries) == 1
+    assert summaries[0]["complete"] is False
+    assert any("incomplete" in failure for failure in failures)
 
 
-def test_layerwise_progress_fails_closed_on_missing_round_or_fallback():
-    previous = _summary(
-        epoch=0,
-        apply_count=42,
-        prime_count=1,
-        prefetch_hit_count=41,
-        completed_rounds=1,
-    )
-    bad = _summary(
-        epoch=1,
-        apply_count=84,
-        prime_count=2,
-        prefetch_hit_count=82,
-        completed_rounds=2,
-        fallback_count=1,
-    )
-
+def test_layerwise_progress_fails_closed_on_missing_or_out_of_order_round():
+    bad = _round(layers=[3, 5, 4, *range(6, 45)])
     failures = ACCEPTANCE.validate_layerwise_progress(
-        previous, [bad], expected_rounds=2
+        None, [bad], expected_rounds=2
     )
 
     assert any("expected 2" in failure for failure in failures)
-    assert any("fallback_count" in failure for failure in failures)
+    assert any("ordered layers" in failure for failure in failures)
 
 
-def test_layerwise_progress_rejects_wrong_final_slot_or_load_kind():
-    wrong_slot = _summary(
-        epoch=0,
-        apply_count=42,
-        prime_count=1,
-        prefetch_hit_count=41,
-        completed_rounds=1,
-        slot=0,
-    )
-    wrong_kind = _summary(
-        epoch=0,
-        apply_count=42,
-        prime_count=1,
-        prefetch_hit_count=41,
-        completed_rounds=1,
-        load_kind="prime",
-    )
-
-    slot_failures = ACCEPTANCE.validate_layerwise_progress(
-        None, [wrong_slot], expected_rounds=1
-    )
-    kind_failures = ACCEPTANCE.validate_layerwise_progress(
-        None, [wrong_kind], expected_rounds=1
-    )
-
-    assert any("slot" in failure for failure in slot_failures)
-    assert any("load_kind" in failure for failure in kind_failures)
+def test_expected_layerwise_rounds_keeps_subthreshold_tail_hybrid():
+    assert ACCEPTANCE.expected_layerwise_rounds(128, 4096) == 0
+    assert ACCEPTANCE.expected_layerwise_rounds(4096, 4096) == 1
+    assert ACCEPTANCE.expected_layerwise_rounds(4097, 4096) == 1
+    assert ACCEPTANCE.expected_layerwise_rounds(8193, 4096) == 2
+    assert ACCEPTANCE.expected_layerwise_rounds(500_000, 4096) == 122
+    assert ACCEPTANCE.expected_layerwise_rounds(4096, 512) == 0
 
 
 def test_prometheus_graph_counter_sums_matching_modes_only():
@@ -379,7 +298,7 @@ def test_bucket_contract_defaults_are_exact():
     assert args.input_length == 128
     assert args.output_length == 8
     assert args.top_k == 64
-    assert args.tp_size == 8
+    assert args.tp_size == 4
 
 
 def test_final_long_contract_is_exact_not_a_minimum(monkeypatch, tmp_path):
@@ -422,53 +341,79 @@ def test_fatal_log_scan_ignores_info_but_rejects_runtime_failures():
     assert len(failures) == 3
 
 
-def _startup_log(*, threshold=1, allocation_first=True):
+def _startup_log(*, threshold=1024, lazy=True, include_allocation=True):
     server_args = (
-        "server_args=ServerArgs(tp_size=8, chunked_prefill_size=4096, "
+        "server_args=ServerArgs(tp_size=4, chunked_prefill_size=4096, "
         "kt_method='FP8', kt_gpu_prefill_token_threshold="
         f"{threshold})"
     )
     allocation = (
-        "KT GLM-5-Next FP8 layerwise prefill eagerly allocated two raw "
-        "E4M3+FP32 full-layer slots on cuda:0 before KV profiling "
-        f"(total=1.69 GiB, contract={'a' * 64}, fallback_count=0)"
+        "KT GLM-5-Next FP8 layerwise prefill lazily allocated generic "
+        "SharedFullContext: gpu_full_layer_slots=1 host_expert_slots=2 "
+        "gpu_slot_bytes=1812381696 host_buffer_bytes=12582912 device=cuda:0"
     )
     memory_pool = "Memory pool end. avail mem=12.34 GB"
-    ordered = (
-        [allocation, memory_pool] if allocation_first else [memory_pool, allocation]
-    )
-    return "\n".join(
-        [server_args, *ordered, "The server is fired up and ready to roll!"]
-    )
+    ready = "The server is fired up and ready to roll!"
+    ordered = [memory_pool, ready]
+    if include_allocation:
+        ordered = [*ordered, allocation] if lazy else [allocation, *ordered]
+    return "\n".join([server_args, *ordered])
 
 
-def test_layerwise_startup_requires_one_allocation_before_kv_pool_and_ready():
+def test_layerwise_startup_requires_one_lazy_single_gpu_two_host_allocation():
     result = ACCEPTANCE.validate_layerwise_startup(_startup_log())
 
     assert result["pass"]
-    assert result["allocation"]["total_gib"] == 1.69
-    assert result["allocation"]["fallback_count"] == 0
+    assert result["allocation"]["gpu_full_layer_slots"] == 1
+    assert result["allocation"]["host_expert_slots"] == 2
+    assert result["allocation"]["gpu_slot_bytes"] == 1812381696
 
-    wrong_order = ACCEPTANCE.validate_layerwise_startup(
-        _startup_log(allocation_first=False)
-    )
+    eager = ACCEPTANCE.validate_layerwise_startup(_startup_log(lazy=False))
     duplicate = ACCEPTANCE.validate_layerwise_startup(
-        _startup_log() + "\n" + _startup_log().splitlines()[1]
+        _startup_log() + "\n" + _startup_log().splitlines()[-1]
     )
-    assert not wrong_order["pass"]
-    assert any("does not precede" in failure for failure in wrong_order["failures"])
+    missing = ACCEPTANCE.validate_layerwise_startup(
+        _startup_log(include_allocation=False)
+    )
+    pending = ACCEPTANCE.validate_layerwise_startup(
+        _startup_log(include_allocation=False), require_allocation=False
+    )
+    assert not eager["pass"]
+    assert any("not lazy" in failure for failure in eager["failures"])
     assert not duplicate["pass"]
     assert any("exactly one" in failure for failure in duplicate["failures"])
+    assert not missing["pass"]
+    assert pending["pass"]
 
 
-def test_prefill_server_log_binds_explicit_threshold_and_tp8():
-    threshold_1 = ACCEPTANCE.validate_prefill_parity_server_log(
-        _startup_log(threshold=1), threshold=1
+def test_layerwise_startup_rejects_wrong_slots_and_legacy_protocol():
+    wrong_slots = _startup_log().replace(
+        "gpu_full_layer_slots=1 host_expert_slots=2",
+        "gpu_full_layer_slots=2 host_expert_slots=1",
+    )
+    legacy = _startup_log() + "\n" + (
+        "KT GLM-5-Next FP8 layerwise prefill eagerly allocated two raw "
+        "E4M3+FP32 full-layer slots"
+    )
+
+    slots_result = ACCEPTANCE.validate_layerwise_startup(wrong_slots)
+    legacy_result = ACCEPTANCE.validate_layerwise_startup(legacy)
+
+    assert not slots_result["pass"]
+    assert any("gpu_full_layer_slots" in item for item in slots_result["failures"])
+    assert any("host_expert_slots" in item for item in slots_result["failures"])
+    assert not legacy_result["pass"]
+    assert any("legacy" in item for item in legacy_result["failures"])
+
+
+def test_prefill_server_log_binds_explicit_threshold_and_tp4():
+    threshold_1024 = ACCEPTANCE.validate_prefill_parity_server_log(
+        _startup_log(threshold=1024), threshold=1024
     )
     threshold_0_log = "\n".join(
         [
             (
-                "server_args=ServerArgs(tp_size=8, chunked_prefill_size=4096, "
+                "server_args=ServerArgs(tp_size=4, chunked_prefill_size=4096, "
                 "kt_method='FP8', kt_gpu_prefill_token_threshold=0)"
             ),
             "The server is fired up and ready to roll!",
@@ -478,10 +423,10 @@ def test_prefill_server_log_binds_explicit_threshold_and_tp8():
         threshold_0_log, threshold=0
     )
 
-    assert threshold_1["pass"]
+    assert threshold_1024["pass"]
     assert threshold_0["pass"]
     wrong_threshold = ACCEPTANCE.validate_prefill_parity_server_log(
-        threshold_0_log, threshold=1
+        threshold_0_log, threshold=1024
     )
     assert not wrong_threshold["pass"]
     assert any(
@@ -494,14 +439,12 @@ def test_threshold_zero_rejects_nonfinal_layerwise_event():
     threshold_0_log = "\n".join(
         [
             (
-                "server_args=ServerArgs(tp_size=8, chunked_prefill_size=4096, "
+                "server_args=ServerArgs(tp_size=4, chunked_prefill_size=4096, "
                 "kt_method='FP8', kt_gpu_prefill_token_threshold=0)"
             ),
             "The server is fired up and ready to roll!",
             (
-                "KT GLM-5-Next FP8 layerwise prefill: layer=3 epoch=0 slot=0 "
-                "prime apply_count=1 prime_count=1 prefetch_hit_count=0 "
-                "completed_rounds=0 fallback_count=0"
+                "KT layerwise prefill: layer 3 compute = 1.25 ms"
             ),
         ]
     )
@@ -536,8 +479,6 @@ def test_completed_request_requires_length_finish_and_in_range_tokens():
 
 def _prefill_parity_payload(threshold):
     cases = []
-    previous = None
-    completed_rounds = 0
     for length in ACCEPTANCE.LAYERWISE_LENGTHS:
         fixture = ACCEPTANCE.build_fixture(
             length,
@@ -559,18 +500,9 @@ def _prefill_parity_payload(threshold):
                 ]
             )
         summaries = []
-        case_previous = copy.deepcopy(previous)
-        if threshold == 1:
-            for _ in range((length + 4095) // 4096):
-                completed_rounds += 1
-                previous = _summary(
-                    epoch=completed_rounds - 1,
-                    apply_count=completed_rounds * 42,
-                    prime_count=completed_rounds,
-                    prefetch_hit_count=completed_rounds * 41,
-                    completed_rounds=completed_rounds,
-                )
-                summaries.append(copy.deepcopy(previous))
+        expected_rounds = ACCEPTANCE.expected_layerwise_rounds(length, 4096)
+        if threshold == ACCEPTANCE.LAYERWISE_TOKEN_THRESHOLD:
+            summaries = [_round(round_index=index) for index in range(expected_rounds)]
         cases.append(
             {
                 "input_tokens": length,
@@ -582,9 +514,11 @@ def _prefill_parity_payload(threshold):
                 "completion_tokens": 16,
                 "top_logprobs": top_logprobs,
                 "expected_layerwise_rounds": (
-                    (length + 4095) // 4096 if threshold == 1 else 0
+                    expected_rounds
+                    if threshold == ACCEPTANCE.LAYERWISE_TOKEN_THRESHOLD
+                    else 0
                 ),
-                "previous_layerwise_summary": case_previous,
+                "previous_layerwise_summary": None,
                 "layerwise_summaries": summaries,
                 "server_log_window": {
                     "path": "/tmp/server.log",
@@ -598,7 +532,7 @@ def _prefill_parity_payload(threshold):
             }
         )
     server_args = {
-        "tp_size": "8",
+        "tp_size": "4",
         "chunked_prefill_size": "4096",
         "kt_method": "'FP8'",
         "kt_gpu_prefill_token_threshold": str(threshold),
@@ -613,7 +547,7 @@ def _prefill_parity_payload(threshold):
             "output_tokens": 16,
             "chunk_size": 4096,
             "fixture_seed": 20260811,
-            "tp_size": 8,
+            "tp_size": 4,
             "vocab_size": 154880,
             "collection_top_k": 256,
             "comparison_top_k": 64,
@@ -626,7 +560,11 @@ def _prefill_parity_payload(threshold):
         "server_evidence": {
             "threshold": threshold,
             "server_args": server_args,
-            "layerwise_startup": {"pass": True} if threshold == 1 else None,
+            "layerwise_startup": (
+                ACCEPTANCE.validate_layerwise_startup(_startup_log())
+                if threshold == ACCEPTANCE.LAYERWISE_TOKEN_THRESHOLD
+                else None
+            ),
             "path": "/tmp/server.log",
             "initial_size": 1024,
             "initial_sha256": "a" * 64,
@@ -639,7 +577,7 @@ def _prefill_parity_payload(threshold):
 
 def test_prefill_parity_comparison_accepts_exact_tokens_and_bounded_toplogprobs():
     baseline = _prefill_parity_payload(0)
-    candidate = _prefill_parity_payload(1)
+    candidate = _prefill_parity_payload(1024)
     for case in candidate["cases"]:
         for step in case["top_logprobs"]:
             for item in step:
@@ -653,7 +591,7 @@ def test_prefill_parity_comparison_accepts_exact_tokens_and_bounded_toplogprobs(
 
 def test_prefill_parity_comparison_rejects_token_or_toplogprob_drift():
     baseline = _prefill_parity_payload(0)
-    token_candidate = _prefill_parity_payload(1)
+    token_candidate = _prefill_parity_payload(1024)
     token_case = token_candidate["cases"][0]
     token_case["output_ids"][0] = 150000
     token_case["top_logprobs"][0][0]["token_id"] = 150000
@@ -664,7 +602,7 @@ def test_prefill_parity_comparison_rejects_token_or_toplogprob_drift():
     assert not token_result["pass"]
     assert any("greedy output token" in failure for failure in token_result["failures"])
 
-    logprob_candidate = _prefill_parity_payload(1)
+    logprob_candidate = _prefill_parity_payload(1024)
     logprob_candidate["cases"][0]["top_logprobs"][0][0]["logprob"] = -0.5
     logprob_result = ACCEPTANCE.compare_prefill_parity_payloads(
         baseline, logprob_candidate
@@ -677,7 +615,7 @@ def test_prefill_parity_comparison_rejects_token_or_toplogprob_drift():
 
 def test_prefill_parity_comparison_fails_closed_on_missing_top_evidence():
     baseline = _prefill_parity_payload(0)
-    candidate = _prefill_parity_payload(1)
+    candidate = _prefill_parity_payload(1024)
     candidate["cases"][0]["top_logprobs"][0].pop()
 
     result = ACCEPTANCE.compare_prefill_parity_payloads(baseline, candidate)
@@ -693,19 +631,19 @@ def test_prefill_parity_parser_defaults_freeze_matrix_seed_and_tp():
         [
             "prefill-parity",
             "--label",
-            "threshold-1",
+            "threshold-1024",
             "--output",
             "/tmp/prefill.json",
             "--server-log",
             "/tmp/server.log",
             "--threshold",
-            "1",
+            "1024",
         ]
     )
 
     assert args.lengths == [128, 4096, 4097, 8193]
     assert args.output_length == 16
     assert args.fixture_seed == 20260811
-    assert args.tp_size == 8
+    assert args.tp_size == 4
     assert args.vocab_size == 154880
     assert args.top_k == 256
