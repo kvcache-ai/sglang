@@ -283,6 +283,13 @@ class IpcModelLoader(BaseModelLoader):
             elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
+        return getattr(obj, leaf_name)
+
+    @staticmethod
+    def _restore_tensor_metadata(tensor: torch.Tensor, metadata: dict) -> None:
+        """Restore daemon post-load metadata lost by CUDA IPC deserialization."""
+        if metadata.get("format_ue8m0", False):
+            tensor.format_ue8m0 = True
 
     def _load_zero_copy_mode(
         self,
@@ -358,7 +365,12 @@ class IpcModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            replacement_tensor = self._set_module_tensor(
+                model, name, imported_tensor, is_param=is_param
+            )
+            self._restore_tensor_metadata(
+                replacement_tensor, entry.get("metadata", {})
+            )
             imported_refs.append(imported_tensor)
             imported_count += 1
 
@@ -473,7 +485,7 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_exec, get_parallel
+            from sglang.srt.runtime_context import get_device, get_exec, get_parallel
 
             ps = get_parallel()
             tp_size = ps.tp_size
@@ -512,10 +524,16 @@ class IpcModelLoader(BaseModelLoader):
                 attn_cp_size=ps.attn_cp_size,
                 moe_dense_tp_size=ps.moe_dense_tp_size,
                 moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+                attention_backend=get_exec().kernel.attention_backend or "",
+                prefill_attention_backend=get_exec().kernel.prefill_attention_backend
+                or "",
+                decode_attention_backend=get_exec().kernel.decode_attention_backend
+                or "",
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
+                random_seed=get_device().random_seed,
                 **compute_env_stamp(),
             )
 

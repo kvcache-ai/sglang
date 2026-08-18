@@ -50,10 +50,14 @@ class CacheConfig(msgspec.Struct):
     attn_cp_size: int
     moe_dense_tp_size: Optional[int]
     moe_a2a_backend: str
+    attention_backend: str
+    prefill_attention_backend: str
+    decode_attention_backend: str
     quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
     quant_config_hash: str  # SHA-256 hash of quantization config
     dtype: str  # e.g. "torch.float16"
     revision: str  # model revision the weights were loaded from ("" if unset)
+    random_seed: int  # EPLB layout construction must match the client
     # Environment stamp: a daemon and a client that ran different post-processing
     # branches (different GPU compute capability or torch/kernel version) can
     # produce incompatible weights that would map cleanly yet serve garbage.
