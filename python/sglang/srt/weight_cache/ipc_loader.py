@@ -214,9 +214,10 @@ class IpcModelLoader(BaseModelLoader):
 
     @staticmethod
     def _finalize_model_after_ipc_mapping(model, tensor_replacements) -> None:
-        """Rebuild derived model state after replacing meta tensors via IPC."""
-        # The daemon has already quantized the shared tensors. This hook only
-        # rebuilds model-owned derived state, such as DeepSeek MLA w_kc/w_vc.
+        """Build derived state after replacing meta tensors through CUDA IPC."""
+        # `model.load_weights()` normally invokes this hook. IPC maps the
+        # daemon's already-loaded tensors directly, so it must invoke the same
+        # model contract to build derived state such as DeepSeek MLA w_kc/w_vc.
         _post_load_weights(model)
         IpcModelLoader._rebuild_stale_views(model)
 

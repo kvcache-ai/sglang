@@ -57,7 +57,6 @@ class ElasticEPState:
     original_ep_size: int = 0
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
-    initial_cohort_active_observations: int = 0
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -77,7 +76,6 @@ class ElasticEPState:
             self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
-            self.initial_cohort_active_observations = 0
 
 
 class ElasticEPStateManager:
@@ -513,28 +511,7 @@ def maybe_recover_ep_ranks(
 
 def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
-    if elastic_ep_state is None:
-        return False
-
-    # Mooncake EP brings up peer transports lazily on the first forwards. The
-    # initial cohort's mask can transiently change while those transports are
-    # established. Require two consecutive all-active forward boundaries: the
-    # first can precede lazy transport setup, while the second proves an EP
-    # forward completed without changing membership. A later loss from that
-    # healthy baseline is a rank fault and must drive EPLB.
-    active_cohort = elastic_ep_state.active_ranks[
-        : elastic_ep_state.effective_ep_size
-    ]
-    if elastic_ep_state.initial_cohort_active_observations < 2:
-        if bool(active_cohort.all()):
-            elastic_ep_state.initial_cohort_active_observations += 1
-        else:
-            elastic_ep_state.initial_cohort_active_observations = 0
-        elastic_ep_state.snapshot_active_to_last()
-        elastic_ep_state.sync_active_to_cpu()
-        return False
-
-    if elastic_ep_state.is_active_equal_last():
+    if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
         return False
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()

@@ -144,9 +144,11 @@ class WeightUpdater:
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        allow_weight_cache: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
-        self._assert_weight_cache_inactive("update_weights_from_disk")
+        if not allow_weight_cache:
+            self._assert_weight_cache_inactive("update_weights_from_disk")
         error = _unsupported_derived_weight_cache_error()
         if error is not None:
             return False, error
