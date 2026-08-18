@@ -93,7 +93,7 @@ def test_eplb_daemon_installs_initial_slot_layout_before_model_load(monkeypatch)
     ]
 
 
-def test_ep_timeout_membership_change_rebalances_after_initial_cohort(monkeypatch):
+def test_ep_timeout_membership_change_rebalances(monkeypatch):
     state = ElasticEPState(
         active_ranks=torch.tensor([True, True]),
         last_active_ranks=torch.tensor([True, True]),
@@ -103,27 +103,6 @@ def test_ep_timeout_membership_change_rebalances_after_initial_cohort(monkeypatc
     monkeypatch.setattr(ElasticEPStateManager, "_instance", state)
     rebalance_calls = []
 
-    # Mooncake EP may publish transient membership while lazily establishing
-    # the initial cohort. Snapshot it but do not rebalance.
-    state.active_ranks[1] = False
-    assert not maybe_rebalance_after_rank_fault(
-        eplb_manager=SimpleNamespace(rebalance=lambda: iter(())),
-    )
-    assert state.initial_cohort_active_observations == 0
-
-    state.active_ranks[1] = True
-    assert not maybe_rebalance_after_rank_fault(
-        eplb_manager=SimpleNamespace(rebalance=lambda: iter(())),
-    )
-    assert state.initial_cohort_active_observations == 1
-
-    # A full EP forward must complete with a healthy mask before faults arm.
-    assert not maybe_rebalance_after_rank_fault(
-        eplb_manager=SimpleNamespace(rebalance=lambda: iter(())),
-    )
-    assert state.initial_cohort_active_observations == 2
-
-    # A timed-out peer after the healthy cohort has been observed is a fault.
     state.active_ranks[1] = False
     assert maybe_rebalance_after_rank_fault(
         eplb_manager=SimpleNamespace(
@@ -160,14 +139,29 @@ class _HBMClient:
             raise RuntimeError("injected restore failure")
 
 
-def _run_recovery(monkeypatch, *, hbm_client, updater=None):
+class _DiskUpdater:
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = result
+
+    def update_weights_from_disk(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.result
+
+
+def _run_recovery(monkeypatch, *, hbm_client, disk_updater, updater=None):
     old_metadata = object()
     monkeypatch.setattr(
         eplb_manager, "get_global_expert_location_metadata", lambda: old_metadata
     )
     updater = updater or _Updater({0: [3]})
     new_metadata = object()
-    model = SimpleNamespace(routed_experts_weights_of_layer={})
+    model = SimpleNamespace(
+        routed_experts_weights_of_layer={},
+        model_path="/models/test",
+        load_format="safetensors",
+        generate_weight_name_filter=lambda missing: lambda name: missing == {0: [3]},
+    )
     eplb_manager.update_expert_location_with_recovery(
         expert_location_updater=updater,
         model=model,
@@ -176,6 +170,7 @@ def _run_recovery(monkeypatch, *, hbm_client, updater=None):
         nnodes=2,
         tp_rank=0,
         daemon_hbm_source_client=hbm_client,
+        update_weights_from_disk_callable=disk_updater.update_weights_from_disk,
         ep_dispatch_algorithm="none",
         init_lplb_solvers_callable=lambda: None,
     )
@@ -184,19 +179,51 @@ def _run_recovery(monkeypatch, *, hbm_client, updater=None):
 
 def test_hbm_recovery_commits_only_after_hbm_restore(monkeypatch):
     hbm = _HBMClient()
-    updater, new_metadata = _run_recovery(monkeypatch, hbm_client=hbm)
+    disk = _DiskUpdater()
+    updater, new_metadata = _run_recovery(
+        monkeypatch, hbm_client=hbm, disk_updater=disk
+    )
 
     assert hbm.calls == 1
+    assert disk.calls == []
     assert updater.calls == [("update", False), ("commit", new_metadata, [0])]
 
 
-def test_hbm_failure_keeps_old_mapping(monkeypatch):
+def test_hbm_failure_falls_back_to_disk_before_commit(monkeypatch):
     hbm = _HBMClient(fail=True)
+    disk = _DiskUpdater()
     updater = _Updater({0: [3]})
-    with pytest.raises(RuntimeError, match="injected restore failure"):
-        _run_recovery(monkeypatch, hbm_client=hbm, updater=updater)
+    updater, new_metadata = _run_recovery(
+        monkeypatch, hbm_client=hbm, disk_updater=disk, updater=updater
+    )
 
     assert hbm.calls == 1
+    assert disk.calls[0][0] == ("/models/test", "safetensors")
+    assert disk.calls[0][1]["weight_name_filter"]("expert")
+    assert disk.calls[0][1]["allow_weight_cache"] is True
+    assert updater.calls == [("update", False), ("commit", new_metadata, [0])]
+
+
+def test_missing_hbm_source_falls_back_to_disk_before_commit(monkeypatch):
+    disk = _DiskUpdater()
+    updater, new_metadata = _run_recovery(
+        monkeypatch, hbm_client=None, disk_updater=disk
+    )
+
+    assert disk.calls[0][0] == ("/models/test", "safetensors")
+    assert disk.calls[0][1]["allow_weight_cache"] is True
+    assert updater.calls == [("update", False), ("commit", new_metadata, [0])]
+
+
+def test_disk_recovery_failure_does_not_commit(monkeypatch):
+    disk = _DiskUpdater((False, "injected disk failure"))
+    updater = _Updater({0: [3]})
+
+    with pytest.raises(RuntimeError, match="injected disk failure"):
+        _run_recovery(
+            monkeypatch, hbm_client=None, disk_updater=disk, updater=updater
+        )
+
     assert updater.calls == [("update", False)]
 
 

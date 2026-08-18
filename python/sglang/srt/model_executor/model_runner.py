@@ -709,6 +709,7 @@ class ModelRunner:
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,
                 get_daemon_hbm_source_client=lambda: self.daemon_hbm_source_client,
+                get_weight_updater=lambda: self.weight_updater,
             )
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None

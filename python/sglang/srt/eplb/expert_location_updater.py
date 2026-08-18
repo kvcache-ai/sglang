@@ -469,6 +469,7 @@ def update_expert_weights_single_layer(
     def _filter_p2p_ops(p2p_op_infos):
         elastic_ep_state = ElasticEPStateManager.instance()
         if elastic_ep_state is not None and missing_logical_experts_info is not None:
+            # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
             is_active = elastic_ep_state.active_ranks_cpu
             for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
                 has_isend = any(op.op == torch.distributed.isend for op in ops)
@@ -478,13 +479,13 @@ def update_expert_weights_single_layer(
                     "or only recv ops."
                 )
 
-                active_ops = [op for op in ops if is_active[op.peer]]
                 if has_isend:
-                    p2p_op_infos[i] = (logical_expert_id, active_ops)
+                    p2p_op_infos[i] = (
+                        logical_expert_id,
+                        [op for op in ops if is_active[op.peer]],
+                    )
                 elif has_irecv:
-                    if active_ops:
-                        p2p_op_infos[i] = (logical_expert_id, active_ops)
-                    else:
+                    if any(not is_active[op.peer] for op in ops):
                         missing_logical_experts_info.append(logical_expert_id)
                         p2p_op_infos[i] = (logical_expert_id, [])
 

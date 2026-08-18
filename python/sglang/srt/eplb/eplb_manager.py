@@ -37,6 +37,7 @@ class EPLBManager:
         get_model: Callable[[], nn.Module],
         get_expert_location_updater: Callable[[], ExpertLocationUpdater],
         get_daemon_hbm_source_client: Callable[[], Any],
+        get_weight_updater: Callable[[], Any],
     ):
         super().__init__()
         # These collaborators are set on ModelRunner AFTER EPLBManager is
@@ -48,6 +49,7 @@ class EPLBManager:
         self._get_model = get_model
         self._get_expert_location_updater = get_expert_location_updater
         self._get_daemon_hbm_source_client = get_daemon_hbm_source_client
+        self._get_weight_updater = get_weight_updater
         self._rebalance_layers_per_chunk = (
             self._server_args.eplb_rebalance_layers_per_chunk
         )
@@ -166,6 +168,7 @@ class EPLBManager:
                 ),
                 use_flat_topology=is_post_scale_rebalance,
                 daemon_hbm_source_client=self._get_daemon_hbm_source_client(),
+                update_weights_from_disk_callable=self._get_weight_updater().update_weights_from_disk,
                 ep_dispatch_algorithm=self._server_args.ep_dispatch_algorithm,
                 init_lplb_solvers_callable=lambda: init_lplb_solvers(
                     model_config=self._model_config
@@ -308,6 +311,7 @@ def update_expert_location_with_recovery(
     ep_dispatch_algorithm: str,
     init_lplb_solvers_callable,
     daemon_hbm_source_client=None,
+    update_weights_from_disk_callable=None,
 ):
     p2p_missing_logical_experts = expert_location_updater.update(
         model.routed_experts_weights_of_layer,
@@ -320,20 +324,42 @@ def update_expert_location_with_recovery(
     )
 
     if len(p2p_missing_logical_experts) > 0:
-        if daemon_hbm_source_client is None:
-            raise RuntimeError(
-                "[DaemonHBMExpertRecovery] missing daemon-HBM source for "
-                "faulted expert recovery"
+        weight_name_filter = None
+        if callable(getattr(model, "generate_weight_name_filter", None)):
+            weight_name_filter = model.generate_weight_name_filter(
+                p2p_missing_logical_experts
             )
-        # Do not publish the new mapping until every missing expert has been
-        # restored from retained daemon HBM. DRAM and disk fallback use a
-        # separate ownership protocol and are intentionally not part of this
-        # fault-recovery path.
-        daemon_hbm_source_client.restore_missing_experts(
-            missing_logical_experts_by_layers=p2p_missing_logical_experts,
-            old_expert_location_metadata=get_global_expert_location_metadata(),
-            new_expert_location_metadata=new_expert_location_metadata,
-        )
+
+        restored_from_hbm = False
+        if daemon_hbm_source_client is not None:
+            try:
+                daemon_hbm_source_client.restore_missing_experts(
+                    missing_logical_experts_by_layers=p2p_missing_logical_experts,
+                    old_expert_location_metadata=get_global_expert_location_metadata(),
+                    new_expert_location_metadata=new_expert_location_metadata,
+                )
+                restored_from_hbm = True
+            except Exception:
+                logger.exception(
+                    "[DaemonHBMExpertRecovery] failed; falling back to disk weights"
+                )
+
+        if not restored_from_hbm:
+            if update_weights_from_disk_callable is None:
+                raise RuntimeError(
+                    "[Elastic EP] missing disk weight updater for expert recovery"
+                )
+            disk_result = update_weights_from_disk_callable(
+                model.model_path,
+                model.load_format,
+                weight_name_filter=weight_name_filter,
+                allow_weight_cache=True,
+            )
+            if isinstance(disk_result, tuple) and not disk_result[0]:
+                raise RuntimeError(
+                    "[Elastic EP] disk weight recovery failed: "
+                    f"{disk_result[1]}"
+                )
 
     # Publish the new location only after P2P and daemon-HBM copies finish.
     expert_location_updater.commit(new_expert_location_metadata, update_layer_ids)

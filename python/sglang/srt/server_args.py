@@ -7557,16 +7557,6 @@ class ServerArgs:
                 "(--weight-cache-mode off) for this configuration."
             )
 
-        if (
-            self.weight_cache_mode != "off"
-            and self.enable_eplb
-            and not self.enable_elastic_hbm_expert_source
-        ):
-            raise ValueError(
-                "--weight-cache-mode is not supported together with --enable-eplb "
-                "unless --enable-elastic-hbm-expert-source is enabled."
-            )
-
         if self.enable_elastic_hbm_expert_source:
             if self.weight_cache_mode != "client":
                 raise ValueError(
