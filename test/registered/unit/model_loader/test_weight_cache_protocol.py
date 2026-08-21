@@ -7,7 +7,7 @@ These cover the pure-Python logic that the GPU end-to-end test
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
   - CacheConfig fingerprint matching / (de)serialization
   - quant-config hashing and method-name extraction
-  - daemon command construction and socket/ready path derivation
+  - daemon spawn configuration and socket/ready path derivation
   - the IPC quantization allowlist (the gate that keeps silently-wrong
     quant methods off the zero-copy path)
   - stale-vs-live daemon file cleanup
@@ -17,11 +17,14 @@ process, so they run in the fast CPU suite and would catch a regression
 in any of these branches before it reaches the expensive GPU path.
 """
 
+import dataclasses
 import os
+import pickle
 import socket
 import struct
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
@@ -234,70 +237,84 @@ class TestGlobalRankAndPaths(CustomTestCase):
 
 
 class TestDaemonLaunchConfiguration(CustomTestCase):
-    def test_builder_projects_complex_server_layout(self):
-        from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
+    def test_weight_cache_client_allows_eplb(self):
+        from sglang.srt.server_args import prepare_server_args
 
-        # The builder consumes Engine's already-resolved ServerArgs. A minimal
-        # namespace keeps this projection test CPU-only and model-independent.
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--tp-size",
+                "4",
+                "--dp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--weight-cache-mode",
+                "client",
+                "--enable-eplb",
+                "--ep-num-redundant-experts",
+                "8",
+                "--elastic-ep-backend",
+                "mooncake",
+            ]
+        )
+
+        self.assertEqual(args.weight_cache_mode, "client")
+        self.assertTrue(args.enable_eplb)
+        self.assertEqual(args.ep_num_redundant_experts, 8)
+
+    def test_complete_server_args_pickle_round_trip(self):
+        from sglang.srt.server_args import ServerArgs
+
+        # Construct every dataclass field directly so this remains a cheap
+        # serialization test rather than loading a model configuration.
+        server_args = object.__new__(ServerArgs)
+        for field in dataclasses.fields(ServerArgs):
+            if field.default is not dataclasses.MISSING:
+                value = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                value = field.default_factory()
+            else:
+                value = None
+            setattr(server_args, field.name, value)
+        server_args.model_path = "/models/demo"
+        server_args.enable_eplb = True
+        server_args.attention_backend = "flashinfer"
+
+        restored = pickle.loads(pickle.dumps(server_args))
+
+        self.assertIsInstance(restored, ServerArgs)
+        self.assertEqual(restored.__dict__, server_args.__dict__)
+
+    def test_spawn_forwards_complete_server_args_without_projection(self):
+        from sglang.srt.weight_cache import daemon
+
         server_args = SimpleNamespace(
             model_path="/models/demo",
-            tp_size=8,
-            pp_size=1,
-            dp_size=8,
-            ep_size=8,
-            moe_dp_size=2,
-            enable_dp_attention=True,
-            enable_dp_lm_head=True,
-            attn_cp_size=2,
-            moe_dense_tp_size=1,
-            moe_a2a_backend="mooncake",
-            deepep_mode="low_latency",
-            enable_eplb=True,
-            ep_num_redundant_experts=72,
-            elastic_ep_backend="mooncake",
-            mooncake_ib_device="mlx5_1,mlx5_3",
-            load_format="safetensors",
-            dtype="bfloat16",
-            quantization="fp8",
-            model_loader_extra_config='{"key": "value"}',
-            trust_remote_code=True,
-            revision="test-revision",
-            random_seed=42,
-            attention_backend="flashinfer",
-            prefill_attention_backend="flashinfer",
-            decode_attention_backend="flashinfer",
+            future_layout_option={"nested": [1, 2, 3]},
         )
-        command = build_weight_cache_daemon_command(
-            server_args,
-            gpu_id=3,
-            tp_rank=3,
-            pp_rank=0,
-            dist_init_method="tcp://127.0.0.1:29500",
+        fake_proc = mock.Mock(pid=1234)
+        fake_context = mock.Mock()
+        fake_context.Process.return_value = fake_proc
+
+        with mock.patch.object(
+            daemon.multiprocessing, "get_context", return_value=fake_context
+        ):
+            result = daemon.spawn_weight_cache_daemon(
+                server_args,
+                gpu_id=3,
+                tp_rank=3,
+                pp_rank=0,
+                dist_init_method="tcp://127.0.0.1:29500",
+            )
+
+        self.assertIs(result, fake_proc)
+        fake_context.Process.assert_called_once_with(
+            target=daemon.run_weight_cache_daemon,
+            args=(server_args, 3, 3, 0, "tcp://127.0.0.1:29500"),
         )
-
-        def value_after(flag):
-            return command[command.index(flag) + 1]
-
-        self.assertEqual(value_after("--gpu-id"), "3")
-        self.assertEqual(value_after("--tp-rank"), "3")
-        self.assertEqual(value_after("--dp-size"), "8")
-        self.assertEqual(value_after("--ep-size"), "8")
-        self.assertEqual(value_after("--moe-dp-size"), "2")
-        self.assertEqual(value_after("--attn-cp-size"), "2")
-        self.assertEqual(value_after("--random-seed"), "42")
-        self.assertEqual(value_after("--moe-dense-tp-size"), "1")
-        self.assertEqual(value_after("--moe-a2a-backend"), "mooncake")
-        self.assertEqual(value_after("--deepep-mode"), "low_latency")
-        self.assertEqual(value_after("--attention-backend"), "flashinfer")
-        self.assertEqual(value_after("--prefill-attention-backend"), "flashinfer")
-        self.assertEqual(value_after("--decode-attention-backend"), "flashinfer")
-        self.assertIn("--enable-eplb", command)
-        self.assertEqual(value_after("--ep-num-redundant-experts"), "72")
-        self.assertEqual(value_after("--elastic-ep-backend"), "mooncake")
-        self.assertEqual(value_after("--mooncake-ib-device"), "mlx5_1,mlx5_3")
-        self.assertIn("--enable-dp-attention", command)
-        self.assertIn("--enable-dp-lm-head", command)
-        self.assertIn("--trust-remote-code", command)
+        fake_proc.start.assert_called_once_with()
 
 
 class TestIpcQuantAllowlist(CustomTestCase):
