@@ -824,7 +824,7 @@ class Glm5NextModel(KimiLinearModel):
 
 
 class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
-    """GLM-5-Next text runtime with an isolated single-image vision path."""
+    """GLM-5-Next runtime with isolated multi-image and single-video paths."""
 
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -999,9 +999,78 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         return image_embeds
 
-    def get_video_feature(self, *args, **kwargs):
-        del args, kwargs
-        raise ValueError("GLM-5-Next Session D does not support video input.")
+    def get_video_feature(self, items) -> torch.Tensor:
+        """Run timestamped video frames through bounded vision microbatches."""
+
+        self._require_multimodal_enabled()
+        if not items:
+            raise ValueError("GLM-5-Next video feature extraction needs video items.")
+        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+            device=self.visual.device, dtype=self.visual.dtype
+        )
+        video_grids = torch.cat([item.video_grid_thw for item in items], dim=0).to(
+            device="cpu", dtype=torch.int32
+        )
+        if pixel_values.ndim != 2 or video_grids.ndim != 2:
+            raise ValueError(
+                "GLM-5-Next video vision expects 2-D pixel patches and video_grid_thw."
+            )
+
+        frame_grids = []
+        for grid in video_grids.tolist():
+            grid_t, grid_h, grid_w = (int(value) for value in grid)
+            if min(grid_t, grid_h, grid_w) <= 0:
+                raise ValueError(f"Invalid GLM-5-Next video grid: {grid!r}.")
+            frame_grids.extend([(1, grid_h, grid_w)] * grid_t)
+        expected_patch_rows = sum(t * h * w for t, h, w in frame_grids)
+        if pixel_values.shape[0] != expected_patch_rows:
+            raise RuntimeError(
+                "GLM-5-Next video patch/grid mismatch before vision: "
+                f"expected={expected_patch_rows}, got={pixel_values.shape[0]}."
+            )
+
+        # Bound the temporary vision activation footprint.  A spatial frame
+        # larger than the budget is kept intact and runs alone because the
+        # vision tower cannot split one grid without changing positional ids.
+        max_patch_rows = 32_768
+        embeddings = []
+        patch_cursor = 0
+        batch_start = 0
+        batch_rows = 0
+        for frame_index, (_, grid_h, grid_w) in enumerate(frame_grids):
+            frame_rows = grid_h * grid_w
+            if batch_rows and batch_rows + frame_rows > max_patch_rows:
+                batch_grid = torch.tensor(
+                    frame_grids[batch_start:frame_index], dtype=torch.int32
+                )
+                embeddings.append(
+                    self.visual(
+                        pixel_values[patch_cursor - batch_rows : patch_cursor],
+                        grid_thw=batch_grid,
+                    )
+                )
+                batch_start = frame_index
+                batch_rows = 0
+            batch_rows += frame_rows
+            patch_cursor += frame_rows
+        if batch_rows:
+            batch_grid = torch.tensor(frame_grids[batch_start:], dtype=torch.int32)
+            embeddings.append(
+                self.visual(
+                    pixel_values[patch_cursor - batch_rows : patch_cursor],
+                    grid_thw=batch_grid,
+                )
+            )
+
+        video_embeds = torch.cat(embeddings, dim=0)
+        merge_area = self.vision_config.spatial_merge_size**2
+        expected_embed_rows = sum(t * h * w // merge_area for t, h, w in frame_grids)
+        if video_embeds.ndim != 2 or video_embeds.shape[0] != expected_embed_rows:
+            raise RuntimeError(
+                "GLM-5-Next visual embedding rows do not match video placeholders: "
+                f"expected={expected_embed_rows}, got={tuple(video_embeds.shape)}."
+            )
+        return video_embeds
 
     @torch.no_grad()
     def forward(
@@ -1018,43 +1087,55 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         has_image_inputs = bool(
             callable(contains_image_inputs) and contains_image_inputs()
         )
+        contains_video_inputs = getattr(
+            forward_batch, "contains_video_inputs", None
+        )
+        has_video_inputs = bool(
+            callable(contains_video_inputs) and contains_video_inputs()
+        )
+        has_multimodal_inputs = has_image_inputs or has_video_inputs
         forward_mode_name = getattr(
             getattr(forward_batch, "forward_mode", None), "name", None
         )
-        is_image_extend = has_image_inputs and forward_mode_name == "EXTEND"
+        is_multimodal_extend = has_multimodal_inputs and forward_mode_name == "EXTEND"
         # Real scheduler batches expose this Session-D marker as a dataclass
         # field.  Keep the historical lightweight/unit-test forward contract
         # usable for text-only calls, while refusing to silently lose the
         # marker for an actual image batch.
         try:
-            forward_batch.glm5_next_has_image_inputs = is_image_extend
+            forward_batch.glm5_next_has_image_inputs = (
+                has_image_inputs and forward_mode_name == "EXTEND"
+            )
+            forward_batch.glm5_next_force_hybrid_prefill = bool(
+                is_multimodal_extend
+                or getattr(forward_batch, "glm5_next_force_hybrid_prefill", False)
+            )
         except (AttributeError, TypeError):
-            if is_image_extend:
+            if is_multimodal_extend:
                 raise RuntimeError(
-                    "GLM-5-Next image dispatch requires a mutable ForwardBatch "
+                    "GLM-5-Next multimodal dispatch requires a mutable ForwardBatch "
                     "with the multimodal scheduling marker."
                 )
 
-        contains_video_inputs = getattr(
-            forward_batch, "contains_video_inputs", None
-        )
-        if callable(contains_video_inputs) and contains_video_inputs():
-            raise ValueError("GLM-5-Next Session D does not support video input.")
         contains_audio_inputs = getattr(
             forward_batch, "contains_audio_inputs", None
         )
         if callable(contains_audio_inputs) and contains_audio_inputs():
-            raise ValueError("GLM-5-Next Session D does not support audio input.")
+            raise ValueError("GLM-5-Next does not support audio input.")
 
-        if has_image_inputs and not self.multimodal_enabled:
+        if has_multimodal_inputs and not self.multimodal_enabled:
             self._require_multimodal_enabled()
-        if has_image_inputs and forward_mode_name not in ("EXTEND", "DECODE", "IDLE"):
+        if has_multimodal_inputs and forward_mode_name not in (
+            "EXTEND",
+            "DECODE",
+            "IDLE",
+        ):
             raise RuntimeError(
-                "GLM-5-Next Session D accepts image data only in plain EXTEND; "
+                "GLM-5-Next accepts multimodal data only in plain EXTEND; "
                 f"got ForwardMode.{forward_mode_name}."
             )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            if self.multimodal_enabled and is_image_extend:
+            if self.multimodal_enabled and is_multimodal_extend:
                 from sglang.srt.managers.mm_utils import general_mm_embed_routine
 
                 hidden_states = general_mm_embed_routine(

@@ -226,9 +226,15 @@ class Glm5NextMoE(DeepseekV2MoE):
         previous_image_marker = getattr(
             quant_method, "_glm5_next_has_image_inputs", missing
         )
+        previous_hybrid_marker = getattr(
+            quant_method, "_glm5_next_force_hybrid_prefill", missing
+        )
         quant_method._glm5_next_forward_mode = forward_batch.forward_mode
         quant_method._glm5_next_has_image_inputs = bool(
             getattr(forward_batch, "glm5_next_has_image_inputs", False)
+        )
+        quant_method._glm5_next_force_hybrid_prefill = bool(
+            getattr(forward_batch, "glm5_next_force_hybrid_prefill", False)
         )
         try:
             return super().forward(hidden_states, *args, **kwargs)
@@ -241,6 +247,10 @@ class Glm5NextMoE(DeepseekV2MoE):
                 delattr(quant_method, "_glm5_next_has_image_inputs")
             else:
                 quant_method._glm5_next_has_image_inputs = previous_image_marker
+            if previous_hybrid_marker is missing:
+                delattr(quant_method, "_glm5_next_force_hybrid_prefill")
+            else:
+                quant_method._glm5_next_force_hybrid_prefill = previous_hybrid_marker
 
 
 __all__ = [

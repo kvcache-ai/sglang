@@ -5326,13 +5326,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if forward_mode_name not in ("EXTEND", "DECODE", "IDLE"):
                 raise RuntimeError(
                     "GLM-5-Next FP8 layerwise prefill supports only plain "
-                    "EXTEND (text layerwise or image hybrid) and bypasses "
+                    "EXTEND (text layerwise or multimodal hybrid) and bypasses "
                     "only DECODE/IDLE; got "
                     f"ForwardMode.{forward_mode_name}"
                 )
             if forward_mode_name == "EXTEND":
-                if bool(getattr(self, "_glm5_next_has_image_inputs", False)):
-                    # Keep the complete image EXTEND batch on the accepted
+                if bool(
+                    getattr(self, "_glm5_next_force_hybrid_prefill", False)
+                    or getattr(self, "_glm5_next_has_image_inputs", False)
+                ):
+                    # Keep the complete multimodal EXTEND batch on the accepted
                     # CPU/hybrid route; multimodal batches must not enter the
                     # text-only generic full-layer loader.
                     self._glm5_next_mm_hybrid_extend_count = (
@@ -5340,7 +5343,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                     if self.tp_rank == 0 and self.kt_config.layer_idx in (3, 44):
                         logger.info(
-                            "GLM-5-Next image EXTEND bypasses FP8 layerwise "
+                            "GLM-5-Next multimodal EXTEND bypasses FP8 layerwise "
                             "prefill: layer=%d count=%d",
                             self.kt_config.layer_idx,
                             self._glm5_next_mm_hybrid_extend_count,

@@ -175,6 +175,7 @@ StructuralTagResponseFormat: TypeAlias = Union[
 ToolCallConstraint: TypeAlias = Union[
     Tuple[Literal["structural_tag"], StructuralTagResponseFormat],
     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+    Tuple[Literal["ebnf"], str],
 ]
 
 

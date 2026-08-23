@@ -356,6 +356,9 @@ class MultimodalProcessorOutput:
     # video
     video_token_id: Optional[int] = None
 
+    # GLM-5-Next multimodal prefill must stay on the ordinary hybrid path.
+    glm5_next_force_hybrid_prefill: bool = False
+
     # audio
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
@@ -392,6 +395,9 @@ class MultimodalInputs:
 
     # video
     video_token_id: Optional[int] = None
+
+    # Request-level routing policy retained across chunked prefill batches.
+    glm5_next_force_hybrid_prefill: bool = False
 
     # audio
     audio_token_id: Optional[int] = None
@@ -461,6 +467,7 @@ class MultimodalInputs:
             "audio_start_id",
             "audio_end_id",
             "audio_token_id",
+            "glm5_next_force_hybrid_prefill",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -518,6 +525,9 @@ class MultimodalInputs:
                 # set token_ids
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
+        self.glm5_next_force_hybrid_prefill = bool(
+            self.glm5_next_force_hybrid_prefill or other.glm5_next_force_hybrid_prefill
+        )
         # other args would be kept intact
 
 

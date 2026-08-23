@@ -1,213 +1,52 @@
-"""Self-contained image processor for GLM-5-Next.
+"""Strict image/video request adapter for GLM-5-Next.
 
-The pinned transformers-kt wheel has the reusable GLM-4.6V tokenizer and
-patchifier, but it does not register the checkpoint's Glmga image processor.
-Keep the small GLM-5 resize difference here instead of requiring a patched
-Transformers checkout at runtime.
+The checkpoint processor lives in transformers-kt.  SGLang owns only the
+request boundary, scheduler metadata, and the invariants needed by its vision
+embedding path; patchification and temporal sampling have one source of truth.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import base64
+import binascii
+import os
+import tempfile
+from contextlib import contextmanager
+from urllib.parse import unquote, urlparse
 
+import requests
 import torch
-from transformers.image_transforms import group_images_by_shape, reorder_images
-from transformers.image_utils import SizeDict
-from transformers.models.glm46v.image_processing_glm46v import (
-    Glm46VImageProcessor,
-    smart_resize,
+from transformers.models.glm5_next.image_processing_glm5_next import (
+    Glm5NextImageProcessor,
 )
-from transformers.models.glm46v.processing_glm46v import Glm46VProcessor
+from transformers.models.glm5_next.processing_glm5_next import Glm5NextProcessor
+from transformers.models.glm5_next.video_processing_glm5_next import (
+    Glm5NextVideoProcessor,
+)
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
+    MultimodalSpecialTokens,
+)
 from sglang.srt.multimodal.processors.glm4v import Glm4vImageProcessor
 
 
 GLM5_NEXT_MIN_PIXELS = 12_544
-GLM5_NEXT_DEFAULT_MAX_PIXELS = 1_254_400
-GLM5_NEXT_CHECKPOINT_MAX_PIXELS = 9_633_792
-GLM5_NEXT_PATCH_EXPAND_FACTOR = 2
-_GLM5_NEXT_IMAGE_CONFIG_KEYS = frozenset(
-    {
-        "do_rescale",
-        "image_mean",
-        "image_processor_type",
-        "image_std",
-        "merge_size",
-        "patch_size",
-        "patch_expand_factor",
-        "size",
-        "temporal_patch_size",
-    }
-)
-_GLM5_NEXT_IMAGE_CONFIG_VALUES = {
-    "do_rescale": True,
-    "image_mean": [0.48145466, 0.4578275, 0.40821073],
-    "image_processor_type": "GlmgaImageProcessor",
-    "image_std": [0.26862954, 0.26130258, 0.27577711],
-    "merge_size": 2,
-    "patch_size": 14,
-    "patch_expand_factor": GLM5_NEXT_PATCH_EXPAND_FACTOR,
-    "temporal_patch_size": 2,
-}
-
-
-class Glm5NextImageProcessor(Glm46VImageProcessor):
-    """GLM-4.6V patchification with GLM-5's expanded resize factor."""
-
-    size = {
-        "shortest_edge": GLM5_NEXT_MIN_PIXELS,
-        "longest_edge": GLM5_NEXT_DEFAULT_MAX_PIXELS,
-    }
-    patch_expand_factor = GLM5_NEXT_PATCH_EXPAND_FACTOR
-
-    def __init__(self, patch_expand_factor: int = 2, **kwargs) -> None:
-        if patch_expand_factor != GLM5_NEXT_PATCH_EXPAND_FACTOR:
-            raise ValueError(
-                "GLM-5-Next requires patch_expand_factor=2; "
-                f"got {patch_expand_factor!r}."
-            )
-        self.patch_expand_factor = patch_expand_factor
-        super().__init__(**kwargs)
-
-    @classmethod
-    def from_checkpoint_config(cls, image_config: dict[str, Any]):
-        config = dict(image_config)
-        actual_keys = set(config)
-        missing_keys = sorted(_GLM5_NEXT_IMAGE_CONFIG_KEYS - actual_keys)
-        unknown_keys = sorted(actual_keys - _GLM5_NEXT_IMAGE_CONFIG_KEYS)
-        if missing_keys or unknown_keys:
-            raise ValueError(
-                "GLM-5-Next pinned image processor metadata keys changed: "
-                f"missing={missing_keys}, unknown={unknown_keys}."
-            )
-        for key, expected in _GLM5_NEXT_IMAGE_CONFIG_VALUES.items():
-            actual = config[key]
-            if actual != expected:
-                raise ValueError(
-                    f"GLM-5-Next pinned processor requires {key}={expected!r}; "
-                    f"got {actual!r}."
-                )
-
-        checkpoint_size = config["size"]
-        if not isinstance(checkpoint_size, dict) or checkpoint_size != {
-            "shortest_edge": GLM5_NEXT_MIN_PIXELS,
-            "longest_edge": GLM5_NEXT_CHECKPOINT_MAX_PIXELS,
-        }:
-            raise ValueError(
-                "GLM-5-Next checkpoint processor size metadata changed: "
-                f"got {checkpoint_size!r}."
-            )
-        config.pop("image_processor_type")
-        config["size"] = {
-            "shortest_edge": GLM5_NEXT_MIN_PIXELS,
-            "longest_edge": GLM5_NEXT_DEFAULT_MAX_PIXELS,
-        }
-        return cls(**config)
-
-    def _preprocess(
-        self,
-        images,
-        do_resize,
-        size,
-        resample,
-        do_rescale,
-        rescale_factor,
-        do_normalize,
-        image_mean,
-        image_std,
-        patch_size,
-        temporal_patch_size,
-        merge_size,
-        disable_grouping,
-        return_tensors,
-        **kwargs,
-    ):
-        if do_resize:
-            grouped_images, grouped_images_index = group_images_by_shape(
-                images, disable_grouping=disable_grouping
-            )
-            resized_images_grouped = {}
-            for shape, stacked_images in grouped_images.items():
-                height, width = stacked_images.shape[-2:]
-                resized_height, resized_width = smart_resize(
-                    num_frames=temporal_patch_size,
-                    height=height,
-                    width=width,
-                    temporal_factor=temporal_patch_size,
-                    factor=patch_size * merge_size * self.patch_expand_factor,
-                    min_pixels=size.shortest_edge,
-                    max_pixels=size.longest_edge,
-                )
-                resized_images_grouped[shape] = self.resize(
-                    stacked_images,
-                    size=SizeDict(height=resized_height, width=resized_width),
-                    resample=resample,
-                )
-            images = reorder_images(resized_images_grouped, grouped_images_index)
-
-        return super()._preprocess(
-            images=images,
-            do_resize=False,
-            size=size,
-            resample=resample,
-            do_rescale=do_rescale,
-            rescale_factor=rescale_factor,
-            do_normalize=do_normalize,
-            image_mean=image_mean,
-            image_std=image_std,
-            patch_size=patch_size,
-            temporal_patch_size=temporal_patch_size,
-            merge_size=merge_size,
-            disable_grouping=disable_grouping,
-            return_tensors=return_tensors,
-            **kwargs,
-        )
-
-    def get_number_of_image_patches(
-        self, height: int, width: int, images_kwargs=None
-    ) -> int:
-        images_kwargs = images_kwargs or {}
-        patch_size = images_kwargs.get("patch_size", self.patch_size)
-        merge_size = images_kwargs.get("merge_size", self.merge_size)
-        size = images_kwargs.get("size", self.size)
-        min_pixels = (
-            size["shortest_edge"] if isinstance(size, dict) else size.shortest_edge
-        )
-        max_pixels = (
-            size["longest_edge"] if isinstance(size, dict) else size.longest_edge
-        )
-        resized_height, resized_width = smart_resize(
-            num_frames=self.temporal_patch_size,
-            height=height,
-            width=width,
-            temporal_factor=self.temporal_patch_size,
-            factor=patch_size * merge_size * self.patch_expand_factor,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-        )
-        return (resized_height // patch_size) * (resized_width // patch_size)
-
-
-class Glm5NextProcessor(Glm46VProcessor):
-    """Image-only facade over the pinned GLM-4.6V token expansion logic."""
-
-    def __call__(self, images=None, text=None, videos=None, **kwargs):
-        if videos is not None:
-            raise ValueError("GLM-5-Next Session D does not support video input.")
-        return super().__call__(images=images, text=text, videos=None, **kwargs)
+GLM5_NEXT_DEFAULT_MAX_PIXELS = 8000 * 14**2 * 2**2
+GLM5_NEXT_CHECKPOINT_MAX_PIXELS = GLM5_NEXT_DEFAULT_MAX_PIXELS
+GLM5_NEXT_PATCH_EXPAND_FACTOR = 1
 
 
 class Glm5NextSGLangProcessor(Glm4vImageProcessor):
-    """Strict image-only request adapter registered only for GLM-5-Next."""
+    """Strict text+images or text+one-video adapter for GLM-5-Next."""
 
     models = [Glm5NextForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.IMAGE_FACTOR = 56
+        self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = GLM5_NEXT_MIN_PIXELS
         self.MAX_PIXELS = self._resolve_max_pixels(server_args.mm_process_config)
 
@@ -217,6 +56,11 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
                 "GLM-5-Next requires the built-in Glm5NextImageProcessor; "
                 f"got {type(image_processor).__name__}."
             )
+        if image_processor.patch_expand_factor != GLM5_NEXT_PATCH_EXPAND_FACTOR:
+            raise ValueError(
+                "GLM-5-Next requires image patch_expand_factor=1; "
+                f"got {image_processor.patch_expand_factor!r}."
+            )
         if isinstance(image_processor.size, dict):
             image_processor.size["shortest_edge"] = self.MIN_PIXELS
             image_processor.size["longest_edge"] = self.MAX_PIXELS
@@ -224,11 +68,30 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
             image_processor.size.shortest_edge = self.MIN_PIXELS
             image_processor.size.longest_edge = self.MAX_PIXELS
 
-        # Rebuild after the GLM4V initializer so only the image modality is
-        # advertised by this exact-model processor.
+        video_processor = getattr(_processor, "video_processor", None)
+        if not isinstance(video_processor, Glm5NextVideoProcessor):
+            raise TypeError(
+                "GLM-5-Next requires Glm5NextVideoProcessor; "
+                f"got {type(video_processor).__name__}."
+            )
+        if video_processor.patch_expand_factor != GLM5_NEXT_PATCH_EXPAND_FACTOR:
+            raise ValueError(
+                "GLM-5-Next requires video patch_expand_factor=1; "
+                f"got {video_processor.patch_expand_factor!r}."
+            )
+        if video_processor.fps != 2:
+            raise ValueError(
+                f"GLM-5-Next requires the checkpoint video fps=2; got {video_processor.fps!r}."
+            )
+
+        # GLM expands video frames to the image placeholder id.  Keep the
+        # source token distinct but advertise the post-tokenization id used by
+        # the scheduler and embedding scatter.
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
             image_token_id=self.IM_TOKEN_ID,
+            video_token=self.VIDEO_TOKEN,
+            video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
 
     @staticmethod
@@ -239,7 +102,7 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
         unknown_root = set(config) - {"image"}
         if unknown_root:
             raise ValueError(
-                "GLM-5-Next Session D accepts only the image processor config; "
+                "GLM-5-Next accepts only the image processor override; "
                 f"unsupported keys: {sorted(unknown_root)}."
             )
         image_config = config.get("image", {})
@@ -262,16 +125,106 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
             )
         return max_pixels
 
-    def _count_image_placeholders(self, input_text) -> int:
+    def _count_placeholders(self, input_text) -> tuple[int, int]:
         if isinstance(input_text, str):
-            if self.VIDEO_TOKEN in input_text:
-                raise ValueError("GLM-5-Next Session D does not support video input.")
-            return input_text.count(self.IMAGE_TOKEN)
+            return (
+                input_text.count(self.IMAGE_TOKEN),
+                input_text.count(self.VIDEO_TOKEN),
+            )
         if isinstance(input_text, (list, tuple)):
-            if self.VIDEO_TOKEN_ID in input_text:
-                raise ValueError("GLM-5-Next Session D does not support video input.")
-            return input_text.count(self.IM_TOKEN_ID)
+            return (
+                input_text.count(self.IM_TOKEN_ID),
+                input_text.count(self.VIDEO_TOKEN_ID),
+            )
         raise TypeError("GLM-5-Next multimodal prompt must be text or token ids.")
+
+    @staticmethod
+    @contextmanager
+    def _materialize_video(video):
+        """Yield one seekable local file for transformers/PyAV and clean it up."""
+
+        max_bytes = int(
+            os.environ.get("SGLANG_GLM5_NEXT_MAX_VIDEO_BYTES", 2 * 1024**3)
+        )
+        if max_bytes <= 0:
+            raise ValueError("SGLANG_GLM5_NEXT_MAX_VIDEO_BYTES must be positive.")
+        temporary_path = None
+        try:
+            if isinstance(video, str):
+                parsed = urlparse(video)
+                if parsed.scheme == "file":
+                    local_path = unquote(parsed.path)
+                    if not os.path.isfile(local_path):
+                        raise ValueError(f"GLM-5-Next video file not found: {local_path}")
+                    yield local_path
+                    return
+                if parsed.scheme in ("", None) and os.path.isfile(video):
+                    yield video
+                    return
+
+            payload = None
+            if isinstance(video, bytes):
+                payload = video
+            elif isinstance(video, str) and video.startswith(("http://", "https://")):
+                timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+                response = requests.get(video, stream=True, timeout=timeout)
+                try:
+                    response.raise_for_status()
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > max_bytes:
+                        raise ValueError(
+                            "GLM-5-Next video exceeds the configured byte limit: "
+                            f"content_length={content_length}, limit={max_bytes}."
+                        )
+                    with tempfile.NamedTemporaryFile(
+                        delete=False, suffix=".mp4"
+                    ) as temporary:
+                        temporary_path = temporary.name
+                        downloaded = 0
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            downloaded += len(chunk)
+                            if downloaded > max_bytes:
+                                raise ValueError(
+                                    "GLM-5-Next video exceeds the configured byte "
+                                    f"limit of {max_bytes} bytes."
+                                )
+                            temporary.write(chunk)
+                finally:
+                    response.close()
+                if downloaded == 0:
+                    raise ValueError("GLM-5-Next downloaded an empty video.")
+                yield temporary_path
+                return
+            elif isinstance(video, str):
+                encoded = video.split(",", 1)[1] if video.startswith("data:") else video
+                try:
+                    payload = base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError) as error:
+                    raise ValueError(
+                        "GLM-5-Next video must be a local path, HTTP(S) URL, "
+                        "bytes, data URL, or valid base64."
+                    ) from error
+            else:
+                raise ValueError(
+                    f"Unsupported GLM-5-Next video input type: {type(video).__name__}."
+                )
+
+            if not payload:
+                raise ValueError("GLM-5-Next video payload is empty.")
+            if len(payload) > max_bytes:
+                raise ValueError(
+                    "GLM-5-Next video exceeds the configured byte limit: "
+                    f"size={len(payload)}, limit={max_bytes}."
+                )
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temporary:
+                temporary_path = temporary.name
+                temporary.write(payload)
+            yield temporary_path
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     def _get_multi_image_mrope(
         self,
@@ -426,9 +379,20 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
     ):
         del args, kwargs
         if audio_data:
-            raise ValueError("GLM-5-Next Session D does not support audio input.")
-        if getattr(request_obj, "video_data", None):
-            raise ValueError("GLM-5-Next Session D does not support video input.")
+            raise ValueError("GLM-5-Next does not support audio input.")
+        video_data = getattr(request_obj, "video_data", None) or []
+        image_data = image_data or []
+        if image_data and video_data:
+            raise ValueError(
+                "GLM-5-Next does not allow image and video content in one request."
+            )
+        if image_data:
+            return self._process_image_data(image_data, input_text)
+        if video_data:
+            return self._process_video_data(video_data, input_text)
+        raise ValueError("GLM-5-Next multimodal request contains no media data.")
+
+    def _process_image_data(self, image_data, input_text):
         if not isinstance(image_data, list) or not image_data:
             count = len(image_data) if isinstance(image_data, list) else 0
             raise ValueError(
@@ -436,16 +400,24 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
                 f"got {count}."
             )
         image_count = len(image_data)
+        if image_count > 8:
+            raise ValueError(
+                f"GLM-5-Next accepts at most 8 images per request; got {image_count}."
+            )
         if any(isinstance(image, dict) for image in image_data):
             raise ValueError(
                 "GLM-5-Next does not accept processor_output or "
                 "precomputed_embedding image inputs."
             )
-        placeholder_count = self._count_image_placeholders(input_text)
-        if placeholder_count != image_count:
+        image_placeholders, video_placeholders = self._count_placeholders(input_text)
+        if video_placeholders:
+            raise ValueError(
+                "GLM-5-Next image request unexpectedly contains a video placeholder."
+            )
+        if image_placeholders != image_count:
             raise ValueError(
                 "GLM-5-Next image count/placeholder count mismatch: "
-                f"images={image_count}, placeholders={placeholder_count}."
+                f"images={image_count}, placeholders={image_placeholders}."
             )
 
         # load_mm_data is synchronous: it submits image I/O to the processor's
@@ -599,9 +571,215 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
             "im_token_id": self.IM_TOKEN_ID,
             "im_start_id": self.IMAGE_START_TOKEN_ID,
             "im_end_id": self.IMAGE_END_TOKEN_ID,
-            "video_token_id": self.VIDEO_TOKEN_ID,
+            "video_token_id": self.IM_TOKEN_ID,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
+            "glm5_next_force_hybrid_prefill": True,
+        }
+
+    def _process_video_data(self, video_data, input_text):
+        if not isinstance(video_data, list) or len(video_data) != 1:
+            count = len(video_data) if isinstance(video_data, list) else 0
+            raise ValueError(
+                f"GLM-5-Next accepts exactly one video per video request; got {count}."
+            )
+        if isinstance(video_data[0], dict):
+            raise ValueError(
+                "GLM-5-Next does not accept processor_output or "
+                "precomputed_embedding video inputs."
+            )
+
+        image_placeholders, video_placeholders = self._count_placeholders(input_text)
+        if image_placeholders:
+            raise ValueError(
+                "GLM-5-Next video request unexpectedly contains an image placeholder."
+            )
+        if video_placeholders != 1:
+            raise ValueError(
+                "GLM-5-Next video count/placeholder count mismatch: "
+                f"videos=1, placeholders={video_placeholders}."
+            )
+
+        if isinstance(input_text, (list, tuple)):
+            input_text = self._processor.tokenizer.decode(input_text)
+        # Do not send videos through SGLang's Decord loader and then decode a
+        # second time.  The transformers-kt video processor owns PyAV sampling
+        # and returns the metadata used to build timestamp tokens.
+        with self._materialize_video(video_data[0]) as video_path:
+            base_output = BaseMultiModalProcessorOutput(
+                input_text=input_text,
+                images=[],
+                videos=[video_path],
+                audios=[],
+            )
+            mm_items, input_ids, ret = self.process_and_combine_mm_data(
+                base_output, self.mm_tokens, return_metadata=True
+            )
+        video_grid_thw = getattr(ret, "video_grid_thw", None)
+        if video_grid_thw is None and isinstance(ret, dict):
+            video_grid_thw = ret.get("video_grid_thw")
+        if video_grid_thw is None or tuple(video_grid_thw.shape) != (1, 3):
+            actual_shape = (
+                None if video_grid_thw is None else tuple(video_grid_thw.shape)
+            )
+            raise RuntimeError(
+                "GLM-5-Next processor returned an invalid video_grid_thw shape: "
+                f"expected=(1, 3), got={actual_shape}."
+            )
+        grid_t, grid_h, grid_w = (int(value) for value in video_grid_thw[0].tolist())
+        if min(grid_t, grid_h, grid_w) <= 0:
+            raise RuntimeError(
+                "GLM-5-Next video grid dimensions must be positive; "
+                f"got {(grid_t, grid_h, grid_w)}."
+            )
+        merge_size = int(self.spatial_merge_size)
+        if grid_h % merge_size or grid_w % merge_size:
+            raise RuntimeError(
+                "GLM-5-Next video grid is not divisible by the spatial merge "
+                f"size: grid={(grid_t, grid_h, grid_w)}, merge_size={merge_size}."
+            )
+        if len(mm_items) != 1 or not mm_items[0].is_video():
+            raise RuntimeError("GLM-5-Next processor must return one video item.")
+
+        expected_feature_rows = grid_t * grid_h * grid_w
+        feature = mm_items[0].feature
+        feature_shape = getattr(feature, "shape", None)
+        if feature_shape is None:
+            feature_shape = getattr(getattr(feature, "info_data", None), "shape", None)
+        if (
+            feature_shape is None
+            or len(feature_shape) != 2
+            or int(feature_shape[0]) != expected_feature_rows
+        ):
+            raise RuntimeError(
+                "GLM-5-Next video feature/grid mismatch: "
+                f"expected_rows={expected_feature_rows}, "
+                f"feature_shape={None if feature_shape is None else tuple(feature_shape)}."
+            )
+
+        tokens_per_frame = grid_h * grid_w // (merge_size**2)
+        expected_video_tokens = grid_t * tokens_per_frame
+        video_token_positions = (
+            (input_ids == self.IM_TOKEN_ID).nonzero(as_tuple=True)[0].tolist()
+        )
+        if len(video_token_positions) != expected_video_tokens:
+            raise RuntimeError(
+                "GLM-5-Next video placeholder/feature mismatch: "
+                f"expected={expected_video_tokens}, got={len(video_token_positions)}."
+            )
+        offsets = mm_items[0].offsets or []
+        if len(offsets) != grid_t:
+            raise RuntimeError(
+                "GLM-5-Next video must expose one image-token block per temporal "
+                f"grid row: expected={grid_t}, got={len(offsets)}."
+            )
+        covered_positions = []
+        for frame_index, (start, end) in enumerate(offsets):
+            start, end = int(start), int(end)
+            if end - start + 1 != tokens_per_frame:
+                raise RuntimeError(
+                    "GLM-5-Next video frame token block length mismatch at frame "
+                    f"{frame_index}: expected={tokens_per_frame}, got={end - start + 1}."
+                )
+            covered_positions.extend(range(start, end + 1))
+        if covered_positions != video_token_positions:
+            raise RuntimeError(
+                "GLM-5-Next video offsets do not cover exactly the expanded frame tokens."
+            )
+
+        video_start_positions = (
+            (input_ids == self.VIDEO_START_TOKEN_ID).nonzero(as_tuple=True)[0].tolist()
+        )
+        video_end_positions = (
+            (input_ids == self.VIDEO_END_TOKEN_ID).nonzero(as_tuple=True)[0].tolist()
+        )
+        if (
+            len(video_start_positions) != 1
+            or len(video_end_positions) != 1
+            or video_start_positions[0] >= video_end_positions[0]
+        ):
+            raise RuntimeError(
+                "GLM-5-Next video prompt must contain one ordered begin/end boundary."
+            )
+        video_start, video_end = video_start_positions[0], video_end_positions[0]
+        image_starts = (
+            (input_ids[video_start + 1 : video_end] == self.IMAGE_START_TOKEN_ID)
+            .nonzero(as_tuple=True)[0]
+            .tolist()
+        )
+        image_ends = (
+            (input_ids[video_start + 1 : video_end] == self.IMAGE_END_TOKEN_ID)
+            .nonzero(as_tuple=True)[0]
+            .tolist()
+        )
+        if len(image_starts) != grid_t or len(image_ends) != grid_t:
+            raise RuntimeError(
+                "GLM-5-Next video frame boundaries/grid mismatch: "
+                f"grid_t={grid_t}, starts={len(image_starts)}, ends={len(image_ends)}."
+            )
+        if any(start >= end for start, end in zip(image_starts, image_ends)):
+            raise RuntimeError("GLM-5-Next video frame boundaries are not ordered.")
+
+        video_metadata = getattr(ret, "video_metadata", None)
+        if video_metadata is None and isinstance(ret, dict):
+            video_metadata = ret.get("video_metadata")
+        if not isinstance(video_metadata, list) or len(video_metadata) != 1:
+            raise RuntimeError(
+                "GLM-5-Next video processor must return exactly one metadata record."
+            )
+        metadata = video_metadata[0]
+        timestamps = list(metadata.timestamps[::2])[:grid_t]
+        while len(timestamps) < grid_t:
+            timestamps.append(timestamps[-1] if timestamps else 0.0)
+        if len(timestamps) != grid_t or any(
+            not torch.isfinite(torch.tensor(timestamp)) for timestamp in timestamps
+        ):
+            raise RuntimeError("GLM-5-Next video timestamps are invalid.")
+        if any(right < left for left, right in zip(timestamps, timestamps[1:])):
+            raise RuntimeError("GLM-5-Next video timestamps must be monotonic.")
+
+        expected_frame_text = "".join(
+            self._processor.replace_frame_token_id(timestamp)
+            for timestamp in timestamps
+        )
+        expected_frame_ids = self._processor.tokenizer.encode(
+            expected_frame_text, add_special_tokens=False
+        )
+        actual_frame_ids = input_ids[video_start + 1 : video_end].tolist()
+        if actual_frame_ids != expected_frame_ids:
+            raise RuntimeError(
+                "GLM-5-Next timestamped video token expansion changed unexpectedly."
+            )
+
+        attention_mask = getattr(ret, "attention_mask", None)
+        if attention_mask is None and isinstance(ret, dict):
+            attention_mask = ret.get("attention_mask")
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids.unsqueeze(0),
+            hf_config=self.hf_config,
+            image_grid_thw=None,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+        )
+        mrope_positions = mrope_positions.squeeze(1)
+        if mrope_positions.ndim != 2 or tuple(mrope_positions.shape) != (
+            3,
+            input_ids.numel(),
+        ):
+            raise RuntimeError(
+                "GLM-5-Next video MRoPE positions must have shape (3, sequence_length)."
+            )
+
+        return {
+            "input_ids": input_ids.tolist(),
+            "mm_items": mm_items,
+            "im_token_id": self.IM_TOKEN_ID,
+            "im_start_id": self.IMAGE_START_TOKEN_ID,
+            "im_end_id": self.IMAGE_END_TOKEN_ID,
+            "video_token_id": self.IM_TOKEN_ID,
+            "mrope_positions": mrope_positions,
+            "mrope_position_delta": mrope_position_delta,
+            "glm5_next_force_hybrid_prefill": True,
         }
 
 
@@ -609,4 +787,5 @@ __all__ = [
     "Glm5NextImageProcessor",
     "Glm5NextProcessor",
     "Glm5NextSGLangProcessor",
+    "Glm5NextVideoProcessor",
 ]

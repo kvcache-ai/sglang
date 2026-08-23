@@ -740,85 +740,46 @@ def get_processor(
     if config.model_type == "glm5_next":
         if use_fast is False:
             raise ValueError(
-                "GLM-5-Next Session D requires the built-in torchvision image "
-                "processor; the slow image processor is not supported."
+                "GLM-5-Next requires the transformers-kt fast image/video "
+                "processors; slow processors are not supported."
             )
-
-        # transformers-kt 5.6.0.post1 has Glm46VProcessor, but no AutoProcessor
-        # or AutoImageProcessor registration for the checkpoint's Glmga class.
-        # Read the standard inline processor config and assemble the supported
-        # components directly, without importing a patched Transformers tree.
-        from transformers.models.glm46v.processing_glm46v import Glm46VProcessor
-        from transformers.models.glm46v.video_processing_glm46v import (
-            Glm46VVideoProcessor,
-        )
-
-        from sglang.srt.multimodal.processors.glm5_next import (
+        from transformers.models.glm5_next.image_processing_glm5_next import (
             Glm5NextImageProcessor,
+        )
+        from transformers.models.glm5_next.processing_glm5_next import (
             Glm5NextProcessor,
         )
+        from transformers.models.glm5_next.video_processing_glm5_next import (
+            Glm5NextVideoProcessor,
+        )
 
-        processor_lookup_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key
-            in {
-                "cache_dir",
-                "force_download",
-                "local_files_only",
-                "proxies",
-                "token",
-                "subfolder",
-            }
-        }
-        processor_dict, _ = Glm46VProcessor.get_processor_dict(
-            tokenizer_name,
-            revision=revision,
-            **processor_lookup_kwargs,
-        )
-        processor_class = processor_dict.get("processor_class")
-        if processor_class != "Glm46VProcessor":
-            raise ValueError(
-                "GLM-5-Next expected processor_class='Glm46VProcessor'; "
-                f"got {processor_class!r}."
-            )
-        image_config = processor_dict.get("image_processor")
-        if not isinstance(image_config, dict):
-            raise ValueError(
-                "GLM-5-Next processor_config.json must contain an inline "
-                "image_processor object."
-            )
-        image_processor = Glm5NextImageProcessor.from_checkpoint_config(
-            image_config
-        )
-        video_config = processor_dict.get("video_processor")
-        if not isinstance(video_config, dict) or video_config.get(
-            "video_processor_type"
-        ) != "Glm5NextVideoProcessor":
-            raise ValueError(
-                "GLM-5-Next pinned processor metadata must retain its "
-                "Glm5NextVideoProcessor declaration even though Session D "
-                "rejects video requests."
-            )
-        tokenizer = get_tokenizer(
+        processor = Glm5NextProcessor.from_pretrained(
             tokenizer_name,
             *args,
-            tokenizer_mode=tokenizer_mode,
             trust_remote_code=trust_remote_code,
-            tokenizer_revision=revision,
             revision=revision,
+            use_fast=True,
             **kwargs,
         )
-        # The pinned wheel does not contain Glm5NextVideoProcessor.  The parent
-        # processor's type contract nevertheless requires a video component,
-        # so use its compatible GLM46V base purely as a structural placeholder.
-        # It is never callable through the GLM5 facade or SGLang request path.
-        processor = Glm5NextProcessor(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            video_processor=Glm46VVideoProcessor(),
-            chat_template=processor_dict.get("chat_template"),
-        )
+        if not isinstance(processor.image_processor, Glm5NextImageProcessor):
+            raise TypeError(
+                "GLM-5-Next checkpoint did not load Glm5NextImageProcessor: "
+                f"got {type(processor.image_processor).__name__}."
+            )
+        if not isinstance(processor.video_processor, Glm5NextVideoProcessor):
+            raise TypeError(
+                "GLM-5-Next checkpoint did not load Glm5NextVideoProcessor: "
+                f"got {type(processor.video_processor).__name__}."
+            )
+        if (
+            processor.image_processor.patch_expand_factor != 1
+            or processor.video_processor.patch_expand_factor != 1
+            or processor.video_processor.fps != 2
+        ):
+            raise ValueError(
+                "GLM-5-Next processor metadata changed: expected factor=1 for "
+                "image/video and video fps=2."
+            )
         return processor
 
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
