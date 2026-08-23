@@ -1052,8 +1052,11 @@ class Req(ReqDllmMixin):
                 matched_eos |= token_id in self.eos_token_ids
             if self.tokenizer is not None:
                 matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+                additional_stop_token_ids = getattr(
+                    self.tokenizer, "additional_stop_token_ids", None
+                )
+                if additional_stop_token_ids:
+                    matched_eos |= token_id in additional_stop_token_ids
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i

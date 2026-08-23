@@ -178,8 +178,25 @@ def test_multimodal_hybrid_prefill_marker_survives_chunked_prefill():
     schedule_source = SCHEDULE_BATCH_PATH.read_text(encoding="utf-8")
     forward_source = FORWARD_BATCH_PATH.read_text(encoding="utf-8")
     assert schedule_source.count("glm5_next_force_hybrid_prefill") >= 4
+    assert "additional_stop_token_ids = getattr(" in schedule_source
+    assert 'self.tokenizer, "additional_stop_token_ids", None' in schedule_source
     assert "batch.forward_mode.is_extend()" in forward_source
     assert "batch.multimodal_inputs or []" in forward_source
+
+
+def test_finish_check_tolerates_tokenizer_without_optional_stop_ids():
+    check_finished = _compile_method(
+        SCHEDULE_BATCH_PATH,
+        "Req",
+        "_check_token_based_finish",
+        {"List": list},
+    )
+    request = SimpleNamespace(
+        sampling_params=SimpleNamespace(ignore_eos=False, stop_token_ids=None),
+        eos_token_ids=set(),
+        tokenizer=SimpleNamespace(eos_token_id=-1),
+    )
+    assert check_finished(request, [7]) is False
 
 
 def test_official_template_covers_media_tools_and_observations():
