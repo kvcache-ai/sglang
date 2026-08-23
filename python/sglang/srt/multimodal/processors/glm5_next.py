@@ -742,7 +742,11 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
             raise RuntimeError("GLM-5-Next video timestamps must be monotonic.")
 
         expected_frame_text = "".join(
-            self._processor.replace_frame_token_id(timestamp)
+            self._processor.replace_frame_token_id(timestamp).replace(
+                self._processor.image_token,
+                self._processor.image_token * tokens_per_frame,
+                1,
+            )
             for timestamp in timestamps
         )
         expected_frame_ids = self._processor.tokenizer.encode(

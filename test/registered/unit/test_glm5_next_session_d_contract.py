@@ -168,6 +168,7 @@ def test_video_validation_and_vision_microbatch_contracts_are_explicit():
     assert "timestamped video token expansion changed unexpectedly" in processor_source
     assert "metadata.timestamps[::2]" in processor_source
     assert "isinstance(video_metadata, (list, tuple))" in processor_source
+    assert "self._processor.image_token * tokens_per_frame" in processor_source
     assert "max_patch_rows = 32_768" in model_source
     assert "frame_grids.extend([(1, grid_h, grid_w)] * grid_t)" in model_source
     assert "def get_video_feature" in model_source
