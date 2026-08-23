@@ -723,7 +723,10 @@ class Glm5NextSGLangProcessor(Glm4vImageProcessor):
         video_metadata = getattr(ret, "video_metadata", None)
         if video_metadata is None and isinstance(ret, dict):
             video_metadata = ret.get("video_metadata")
-        if not isinstance(video_metadata, list) or len(video_metadata) != 1:
+        # BatchFeature normalizes non-tensor metadata to a tuple on the
+        # transformers-kt 5.6 release line, while newer releases preserve a
+        # list. Both representations carry the same ordered request metadata.
+        if not isinstance(video_metadata, (list, tuple)) or len(video_metadata) != 1:
             raise RuntimeError(
                 "GLM-5-Next video processor must return exactly one metadata record."
             )
