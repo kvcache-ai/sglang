@@ -230,16 +230,15 @@ def test_disk_recovery_failure_does_not_commit(monkeypatch):
 @pytest.mark.parametrize("is_ep_joiner", [True, False])
 def test_hbm_registry_is_collected_only_for_initial_cohort(monkeypatch, is_ep_joiner):
     runner = ModelRunner.__new__(ModelRunner)
-    runner.server_args = SimpleNamespace(is_ep_joiner=is_ep_joiner)
+    runner.server_args = SimpleNamespace(
+        is_ep_joiner=is_ep_joiner,
+        enable_elastic_hbm_expert_source=True,
+    )
     runner.load_config = SimpleNamespace(weight_cache_socket="/tmp/weight-cache.sock")
     runner.ps = SimpleNamespace(moe_ep_rank=0, moe_ep_size=1)
     runner.model = object()
 
     calls = []
-    monkeypatch.setattr(
-        "sglang.srt.model_executor.model_runner.get_model",
-        lambda: SimpleNamespace(enable_elastic_hbm_expert_source=True),
-    )
     monkeypatch.setattr(
         "sglang.srt.model_executor.model_runner.get_exec",
         lambda: SimpleNamespace(

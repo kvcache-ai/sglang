@@ -760,7 +760,7 @@ class ModelRunner:
         # for the fault-time EPLB restore, so do not issue its world collective
         # from a pre-admission joiner.
         if (
-            get_model().enable_elastic_hbm_expert_source
+            self.server_args.enable_elastic_hbm_expert_source
             and not self.server_args.is_ep_joiner
         ):
             from sglang.srt.distributed.parallel_state import (

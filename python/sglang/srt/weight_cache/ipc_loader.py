@@ -490,7 +490,7 @@ class IpcModelLoader(BaseModelLoader):
 
         try:
             # Build engine's config fingerprint
-            from sglang.srt.runtime_context import get_device, get_exec, get_parallel
+            from sglang.srt.runtime_context import get_exec, get_parallel
 
             ps = get_parallel()
             tp_size = ps.tp_size
@@ -529,16 +529,10 @@ class IpcModelLoader(BaseModelLoader):
                 attn_cp_size=ps.attn_cp_size,
                 moe_dense_tp_size=ps.moe_dense_tp_size,
                 moe_a2a_backend=get_exec().moe.moe_a2a_backend,
-                attention_backend=get_exec().kernel.attention_backend or "",
-                prefill_attention_backend=get_exec().kernel.prefill_attention_backend
-                or "",
-                decode_attention_backend=get_exec().kernel.decode_attention_backend
-                or "",
                 quant_method=quant_method,
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
-                random_seed=get_device().random_seed,
                 **compute_env_stamp(),
             )
 
