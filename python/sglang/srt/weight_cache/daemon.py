@@ -620,6 +620,18 @@ class WeightCacheDaemon:
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
 
+        elif req.get("type") == "fetch_expert_source":
+            if self.expert_source_descriptor is None:
+                send_msg(conn, {"status": "unavailable"})
+            else:
+                send_msg(
+                    conn,
+                    {
+                        "status": "ok",
+                        "descriptor": self.expert_source_descriptor.to_wire(),
+                    },
+                )
+
         else:
             send_msg(
                 conn,
