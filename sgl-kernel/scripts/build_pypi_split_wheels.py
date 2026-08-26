@@ -89,10 +89,11 @@ def payload_wheel(part: Path, index: int, output_dir: Path) -> tuple[str, str]:
             "Summary: Binary payload for sgl-kernel-kt\nRequires-Python: >=3.10\n\n"
         )
         (dist_info / "WHEEL").write_text(
-            "Wheel-Version: 1.0\nGenerator: kt-split-wheel\nRoot-Is-Purelib: false\nTag: py3-none-linux_x86_64\n"
+            "Wheel-Version: 1.0\nGenerator: kt-split-wheel\nRoot-Is-Purelib: false\n"
+            "Tag: py3-none-manylinux_2_35_x86_64\n"
         )
         write_record(root, dist_info)
-        output = output_dir / f"{dist}-{VERSION}-py3-none-linux_x86_64.whl"
+        output = output_dir / f"{dist}-{VERSION}-py3-none-manylinux_2_35_x86_64.whl"
         pack_wheel(root, output)
     return project, module
 
@@ -156,8 +157,17 @@ def main() -> None:
         version_py = unpacked / "sgl_kernel/version.py"
         if version_py.exists():
             version_py.write_text(version_py.read_text().replace("0.3.21.post1", VERSION))
+        wheel_metadata = new_dist_info / "WHEEL"
+        wheel_metadata.write_text(
+            wheel_metadata.read_text().replace(
+                "cp310-abi3-linux_x86_64", "cp310-abi3-manylinux_2_35_x86_64"
+            )
+        )
         write_record(unpacked, new_dist_info)
-        base_output = args.output_dir / f"sgl_kernel_kt-{VERSION}-cp310-abi3-linux_x86_64.whl"
+        base_output = (
+            args.output_dir
+            / f"sgl_kernel_kt-{VERSION}-cp310-abi3-manylinux_2_35_x86_64.whl"
+        )
         pack_wheel(unpacked, base_output)
 
     for wheel in sorted(args.output_dir.glob("*.whl")):
