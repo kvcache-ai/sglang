@@ -409,6 +409,28 @@ def mla_quantize_and_rope_for_fp8(
     return q_out, k_nope_out, k_rope_out
 
 
+def mla_quantize_for_fp8_no_rope(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize an MLA query/cache when the configured RoPE width is zero."""
+
+    q_len, num_heads = q_rope.shape[:2]
+    q_out = q_rope.new_empty(
+        q_len,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=fp8_dtype,
+    )
+    q_out[..., :kv_lora_rank] = q_nope.to(fp8_dtype)
+    q_out[..., kv_lora_rank:] = q_rope.to(fp8_dtype)
+    return q_out, k_nope.to(fp8_dtype), k_rope.to(fp8_dtype)
+
+
 def concat_mla_absorb_q_general(q_nope, q_rope):
     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
         return concat_mla_absorb_q(q_nope, q_rope)

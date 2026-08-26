@@ -208,6 +208,32 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
         )
 
+    if getattr(runner.model_config, "is_glm5_next", False):
+        from sglang.srt.layers.attention.fla.utils import check_environments
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.glm5_next_kda_backend import (
+            Glm5NextKDAAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.utils import (
+            initialize_linear_attn_config,
+        )
+        from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+
+        if not isinstance(full_attn_backend, NativeSparseAttnBackend):
+            raise ValueError(
+                "GLM-5-Next requires the nsa attention backend for its DSA layers."
+            )
+        check_environments()
+        initialize_linear_attn_config(runner.server_args)
+        linear_attn_backend = Glm5NextKDAAttnBackend(runner)
+        return HybridLinearAttnBackend(
+            full_attn_backend,
+            linear_attn_backend,
+            runner.model_config.hf_text_config.full_attention_layer_ids,
+        )
+
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (

@@ -23,6 +23,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.glm5_next import get_glm5_next_capabilities
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -183,6 +184,14 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.glm5_next_capabilities = get_glm5_next_capabilities(self.hf_config)
+        self.is_glm5_next = self.glm5_next_capabilities.is_glm5_next
+        self.uses_kpool4_compress = (
+            self.glm5_next_capabilities.uses_kpool4_compress
+        )
+        self.uses_kda_safe_gate = self.glm5_next_capabilities.uses_kda_safe_gate
+        self.uses_zero_rope_mla = self.glm5_next_capabilities.uses_zero_rope_mla
+        self.uses_mhc = self.glm5_next_capabilities.uses_mhc
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -222,6 +231,14 @@ class ModelConfig:
         self.is_multimodal = enable_multimodal and is_multimodal_model(
             self.hf_config.architectures
         )
+        if self.is_glm5_next:
+            # The model constructor receives the HF config rather than this
+            # wrapper.  Preserve the resolved (including programmatic False
+            # and --language-only) decision on that exact config so GLM can
+            # construct or skip its ~1 GiB vision tower deterministically.
+            self.hf_config._glm5_next_multimodal_active = bool(
+                self.is_multimodal and not language_only
+            )
         self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
             self.hf_config.architectures
         )
@@ -501,6 +518,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -516,9 +534,13 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_text_config)
-                if is_deepseek_nsa(self.hf_text_config)
-                else None
+                self.hf_text_config.index_head_dim
+                if self.is_glm5_next
+                else (
+                    get_nsa_index_head_dim(self.hf_text_config)
+                    if is_deepseek_nsa(self.hf_text_config)
+                    else None
+                )
             )
             # Handle rope scaling
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
@@ -1342,6 +1364,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",

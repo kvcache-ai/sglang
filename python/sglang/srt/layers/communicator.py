@@ -237,9 +237,14 @@ class AttnTpContext:
         flag = self.use_input_scattered(forward_batch)
         old_flag = self.input_scattered
         self.input_scattered_ = flag
-        yield
-        self.input_scattered_ = old_flag
-        self.attn_inputs_ = None
+        try:
+            yield
+        finally:
+            # Attention inputs can retain the current batch and its latent
+            # tensors.  Always restore/clear them, including when a model
+            # layer raises during forward.
+            self.input_scattered_ = old_flag
+            self.attn_inputs_ = None
 
 
 ATTN_TP_CONTEXT = AttnTpContext()

@@ -62,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
@@ -679,6 +680,12 @@ class CudaGraphRunner:
             profile_context = self._init_profile_context_and_memory_record()
 
         def _capture_one_stream(stream_idx: Optional[int] = None):
+            if stream_idx is None:
+                attn_backend = self.model_runner.attn_backend
+            else:
+                assert self.enable_pdmux
+                attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -701,20 +708,31 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                    # For pd_multiplexing, we need to save the graph and output buffers
-                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    self.graphs[key] = graph
-                    self.output_buffers[key] = output_buffers
+                # Exact GLM-5-Next KPool/DSA helpers resolve the selected
+                # backend through a per-forward context. Capture bypasses
+                # ModelRunner._forward_raw, so publish that context here while
+                # leaving every other model's legacy capture path unchanged.
+                if getattr(self.model_runner.model_config, "is_glm5_next", False):
+                    ctx_mgr = forward_context(
+                        ForwardContext(attn_backend=attn_backend)
+                    )
+                else:
+                    ctx_mgr = empty_context()
+                with ctx_mgr:
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
+                        # For pd_multiplexing, we need to save the graph and output buffers
+                        key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                        self.graphs[key] = graph
+                        self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes

@@ -302,6 +302,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
+    # Exact GLM-5-Next keeps image EXTEND on the CPU/hybrid MoE path.  The
+    # model sets this for image EXTEND before general_mm_embed_routine clears
+    # ``mm_inputs``; retained decode metadata must leave it false.
+    glm5_next_has_image_inputs: bool = False
+    # Request-level marker propagated from MultimodalInputs.  Unlike the
+    # historical image-only marker, this remains true for every chunk of an
+    # image or video prefill and false for decode/CUDA-graph batches.
+    glm5_next_force_hybrid_prefill: bool = False
 
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -406,6 +414,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mm_inputs=batch.multimodal_inputs,
+            glm5_next_force_hybrid_prefill=bool(
+                batch.forward_mode.is_extend()
+                and any(
+                    mm_input is not None
+                    and getattr(mm_input, "glm5_next_force_hybrid_prefill", False)
+                    for mm_input in (batch.multimodal_inputs or [])
+                )
+            ),
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,

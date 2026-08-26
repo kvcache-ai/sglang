@@ -54,6 +54,8 @@ from sglang.srt.configs import (
     DotsVLMConfig,
     ExaoneConfig,
     FalconH1Config,
+    Glm5NextConfig,
+    Glm5NextTextConfig,
     GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -94,6 +96,8 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     # effect registration. The dataclass is lightweight and doesn't pull
     # DSV4 module deps.
     DeepSeekV4Config,
+    Glm5NextConfig,
+    Glm5NextTextConfig,
     MultiModalityConfig,
     KimiVLConfig,
     InternVLChatConfig,
@@ -733,6 +737,51 @@ def get_processor(
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         _override_v_head_dim_if_zero(config)
 
+    if config.model_type == "glm5_next":
+        if use_fast is False:
+            raise ValueError(
+                "GLM-5-Next requires the transformers-kt fast image/video "
+                "processors; slow processors are not supported."
+            )
+        from transformers.models.glm5_next.image_processing_glm5_next import (
+            Glm5NextImageProcessor,
+        )
+        from transformers.models.glm5_next.processing_glm5_next import (
+            Glm5NextProcessor,
+        )
+        from transformers.models.glm5_next.video_processing_glm5_next import (
+            Glm5NextVideoProcessor,
+        )
+
+        processor = Glm5NextProcessor.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            use_fast=True,
+            **kwargs,
+        )
+        if not isinstance(processor.image_processor, Glm5NextImageProcessor):
+            raise TypeError(
+                "GLM-5-Next checkpoint did not load Glm5NextImageProcessor: "
+                f"got {type(processor.image_processor).__name__}."
+            )
+        if not isinstance(processor.video_processor, Glm5NextVideoProcessor):
+            raise TypeError(
+                "GLM-5-Next checkpoint did not load Glm5NextVideoProcessor: "
+                f"got {type(processor.video_processor).__name__}."
+            )
+        if (
+            processor.image_processor.patch_expand_factor != 1
+            or processor.video_processor.patch_expand_factor != 1
+            or processor.video_processor.fps != 2
+        ):
+            raise ValueError(
+                "GLM-5-Next processor metadata changed: expected factor=1 for "
+                "image/video and video fps=2."
+            )
+        return processor
+
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
         if "size" not in kwargs:
@@ -818,4 +867,3 @@ def get_rope_config(config):
     if rope_params is not None:
         return rope_params["rope_theta"], rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
-

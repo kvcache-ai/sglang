@@ -5,7 +5,7 @@ import re
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -780,6 +780,90 @@ class Glm47MoeDetector(BaseFormatDetector):
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
 
         return arguments
+
+    def get_forced_tool_call_ebnf(self, tools: List[Tool], tool_choice) -> str | None:
+        """Constrain forced calls to GLM's native compact XML wire format.
+
+        Arguments follow the property order in the submitted JSON schema.  A
+        deterministic order keeps the grammar linear while still enforcing
+        required keys, excluding unknown/duplicate keys, and preserving the
+        exact format understood by the model and this detector.
+        """
+
+        selected_tools = tools
+        named_choice = isinstance(tool_choice, ToolChoice)
+        if named_choice:
+            selected_tools = [
+                tool
+                for tool in tools
+                if tool.function.name == tool_choice.function.name
+            ]
+        elif tool_choice != "required":
+            return None
+        if not selected_tools:
+            raise ValueError("Forced GLM tool choice resolved to no available tools.")
+
+        rules = []
+        call_rule_names = []
+        for tool_index, tool in enumerate(selected_tools):
+            function = tool.function
+            if not function.name:
+                raise ValueError("GLM tool names must be non-empty.")
+            parameters = function.parameters or {}
+            if not isinstance(parameters, dict):
+                raise ValueError(
+                    f"GLM tool {function.name!r} must use an object parameter schema."
+                )
+            properties = parameters.get("properties", {})
+            required_names = parameters.get("required", [])
+            if not isinstance(properties, dict) or not isinstance(
+                required_names, list
+            ):
+                raise ValueError(
+                    f"GLM tool {function.name!r} must use an object parameter schema."
+                )
+            required = set(required_names)
+            unknown_required = required - set(properties)
+            if unknown_required:
+                raise ValueError(
+                    f"GLM tool {function.name!r} requires undefined properties: "
+                    f"{sorted(unknown_required)}."
+                )
+
+            argument_parts = []
+            for property_index, property_name in enumerate(properties):
+                if not isinstance(property_name, str) or not property_name:
+                    raise ValueError("GLM tool argument names must be non-empty strings.")
+                argument_rule = f"tool_{tool_index}_arg_{property_index}"
+                rules.append(
+                    f"{argument_rule} ::= "
+                    f"{json.dumps('<arg_key>' + property_name + '</arg_key>')} ws "
+                    f"{json.dumps('<arg_value>')} value {json.dumps('</arg_value>')} ws"
+                )
+                if property_name in required:
+                    argument_parts.append(argument_rule)
+                else:
+                    argument_parts.append(f"({argument_rule})?")
+
+            call_rule = f"tool_{tool_index}_call"
+            call_rule_names.append(call_rule)
+            body = " ".join(argument_parts)
+            if body:
+                body = " ws " + body
+            rules.append(
+                f"{call_rule} ::= {json.dumps('<tool_call>' + function.name)}"
+                f"{body} {json.dumps('</tool_call>')}"
+            )
+
+        root = (
+            f"root ::= {call_rule_names[0]}"
+            if named_choice
+            else "root ::= tool_call+"
+        )
+        if not named_choice:
+            rules.insert(0, f"tool_call ::= {' | '.join(call_rule_names)}")
+        rules.extend(["value ::= [^<]*", "ws ::= [ \\t\\n\\r]*"])
+        return "\n".join([root, *rules])
 
     def supports_structural_tag(self) -> bool:
         return False

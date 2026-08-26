@@ -2704,6 +2704,10 @@ class Scheduler(
             self.last_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
+            if getattr(self.model_config, "is_glm5_next", False):
+                from sglang.srt.managers.forward_hooks_registry import dispatch_named
+
+                dispatch_named("glm5_next_kpool", "on_cache_flush")
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.reset_metrics()

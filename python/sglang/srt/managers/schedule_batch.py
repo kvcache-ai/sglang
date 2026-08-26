@@ -356,6 +356,9 @@ class MultimodalProcessorOutput:
     # video
     video_token_id: Optional[int] = None
 
+    # GLM-5-Next multimodal prefill must stay on the ordinary hybrid path.
+    glm5_next_force_hybrid_prefill: bool = False
+
     # audio
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
@@ -392,6 +395,9 @@ class MultimodalInputs:
 
     # video
     video_token_id: Optional[int] = None
+
+    # Request-level routing policy retained across chunked prefill batches.
+    glm5_next_force_hybrid_prefill: bool = False
 
     # audio
     audio_token_id: Optional[int] = None
@@ -461,6 +467,7 @@ class MultimodalInputs:
             "audio_start_id",
             "audio_end_id",
             "audio_token_id",
+            "glm5_next_force_hybrid_prefill",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -518,6 +525,9 @@ class MultimodalInputs:
                 # set token_ids
                 if getattr(self, key, None) is None:
                     setattr(self, key, getattr(other, key, None))
+        self.glm5_next_force_hybrid_prefill = bool(
+            self.glm5_next_force_hybrid_prefill or other.glm5_next_force_hybrid_prefill
+        )
         # other args would be kept intact
 
 
@@ -1042,8 +1052,11 @@ class Req(ReqDllmMixin):
                 matched_eos |= token_id in self.eos_token_ids
             if self.tokenizer is not None:
                 matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+                additional_stop_token_ids = getattr(
+                    self.tokenizer, "additional_stop_token_ids", None
+                )
+                if additional_stop_token_ids:
+                    matched_eos |= token_id in additional_stop_token_ids
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
@@ -1943,9 +1956,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req = self.reqs[idx]
 
         if self.hisparse_coordinator is not None and not req.finished():
-            from sglang.srt.managers.forward_hooks_registry import dispatch
+            from sglang.srt.managers.forward_hooks_registry import dispatch_named
 
-            dispatch("on_request_retract", req)
+            dispatch_named("hisparse", "on_request_retract", req)
+        if not req.finished() and getattr(
+            server_args, "_glm5_next_session_ab_active", False
+        ):
+            from sglang.srt.managers.forward_hooks_registry import dispatch_named
+
+            dispatch_named("glm5_next_kpool", "on_request_retract", req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(

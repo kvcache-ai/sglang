@@ -695,6 +695,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
+            self._validate_glm5_next_mm_boundary(obj)
             self._validate_mm_limits(obj)
 
             mm_inputs = None
@@ -833,6 +834,33 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     raise ValueError(
                         f"{modality.capitalize()} count {count} exceeds limit {limit} per request."
                     )
+
+    def _validate_glm5_next_mm_boundary(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Reject unsupported GLM media combinations before invoking Processor."""
+
+        if not getattr(self.model_config, "is_glm5_next", False):
+            return
+
+        def count(data) -> int:
+            return len(data) if isinstance(data, list) else int(data is not None)
+
+        image_count = count(obj.image_data)
+        video_count = count(obj.video_data)
+        audio_count = count(obj.audio_data)
+        if audio_count:
+            raise ValueError("GLM-5-Next does not support audio input.")
+        if image_count and video_count:
+            raise ValueError("GLM-5-Next requests cannot mix image and video content.")
+        if image_count > 8:
+            raise ValueError(
+                f"GLM-5-Next accepts at most 8 images per request; got {image_count}."
+            )
+        if video_count > 1:
+            raise ValueError(
+                f"GLM-5-Next accepts at most one video per request; got {video_count}."
+            )
 
     def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
         """Validate the request for Matryoshka dim if it has the field set."""

@@ -140,6 +140,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         self.query_start_loc_list = []
@@ -692,10 +693,26 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        # ForwardContext exposes the active hybrid wrapper.  On this KT base,
+        # every linear sidecar owns the runner's pools while some legacy full
+        # backends do not expose them yet.  Forward the sidecar references so
+        # existing Kimi/GDN/Mamba wrappers retain their constructor contract.
+        self.token_to_kv_pool = linear_attn_backend.token_to_kv_pool
+        self.req_to_token_pool = linear_attn_backend.req_to_token_pool
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
+
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        """Delegate sparse-index metadata to the full-attention backend.
+
+        Indexers resolve the active backend through ``ForwardContext``, which
+        points at this hybrid wrapper for KDA/DSA models.  The wrapper does not
+        own NSA metadata; its full-attention child does.
+        """
+
+        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

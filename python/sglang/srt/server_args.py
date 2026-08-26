@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import orjson
 
+from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -1331,6 +1332,252 @@ class ServerArgs:
 
         return capture_sizes
 
+    def _validate_glm5_next_session_ab_boundary(self) -> None:
+        """Keep exact GLM-5-Next on the isolated Session D surface."""
+
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "GLM-5-Next Session AB does not support HiCache; "
+                "--enable-hierarchical-cache must remain disabled."
+            )
+        if self.enable_lmcache:
+            raise ValueError(
+                "GLM-5-Next Session AB does not support LMCache; "
+                "--enable-lmcache must remain disabled."
+            )
+        if self.enable_hisparse:
+            raise ValueError(
+                "GLM-5-Next Session AB does not support HiSparse; "
+                "--enable-hisparse must remain disabled."
+            )
+        if self.mm_enable_dp_encoder:
+            raise ValueError(
+                "GLM-5-Next Session D does not support "
+                "--mm-enable-dp-encoder; the vision tower is TP-only."
+            )
+        if self.encoder_only or self.language_only or self.encoder_urls:
+            raise ValueError(
+                "GLM-5-Next Session D does not support encoder/language "
+                "disaggregation; --encoder-only, --language-only, and "
+                "--encoder-urls must remain unset."
+            )
+        unsupported_mm_options = {
+            "enable_broadcast_mm_inputs_process": self.enable_broadcast_mm_inputs_process,
+            "enable_prefix_mm_cache": self.enable_prefix_mm_cache,
+            "enable_mm_global_cache": self.enable_mm_global_cache,
+            "keep_mm_feature_on_device": self.keep_mm_feature_on_device,
+            "mm_attention_backend": self.mm_attention_backend is not None,
+        }
+        enabled_unsupported_mm_options = [
+            name for name, enabled in unsupported_mm_options.items() if enabled
+        ]
+        if enabled_unsupported_mm_options:
+            raise ValueError(
+                "GLM-5-Next Session D does not support these multimodal "
+                "execution/cache options: "
+                f"{enabled_unsupported_mm_options}."
+            )
+        if self.is_embedding:
+            raise ValueError(
+                "GLM-5-Next Session AB accepts text generation only; "
+                "--is-embedding is outside the request-lifecycle boundary."
+            )
+        if self.dllm_algorithm is not None or self.dllm_algorithm_config is not None:
+            raise ValueError(
+                "GLM-5-Next diffusion-LLM inference is outside the Session AB "
+                "request-lifecycle boundary; --dllm-algorithm and its config "
+                "must remain unset."
+            )
+        if self.quantization != "fp8":
+            raise ValueError(
+                "GLM-5-Next Session AB accepts only the checkpoint-native "
+                f"FP8 weight format; got quantization={self.quantization!r}."
+            )
+
+        # Keep the released GLM topology narrow while accepting every TP width
+        # validated by the model and its dedicated Layerwise transport.
+        if self.tp_size not in GLM5_NEXT_SUPPORTED_TP_SIZES:
+            raise ValueError(
+                "GLM-5-Next Session AB supports TP sizes 1, 2, 4, and 8; "
+                f"got tp_size={self.tp_size}."
+            )
+
+        topology = {
+            "pp_size": self.pp_size,
+            "dp_size": self.dp_size,
+            "moe_dp_size": self.moe_dp_size,
+            "attn_cp_size": self.attn_cp_size,
+            "ep_size": self.ep_size,
+            "moe_a2a_backend": self.moe_a2a_backend,
+            "moe_dense_tp_size": self.moe_dense_tp_size,
+        }
+        if topology != {
+            "pp_size": 1,
+            "dp_size": 1,
+            "moe_dp_size": 1,
+            "attn_cp_size": 1,
+            "ep_size": 1,
+            "moe_a2a_backend": "none",
+            "moe_dense_tp_size": None,
+        }:
+            raise ValueError(
+                "GLM-5-Next Session AB supports tensor parallelism only; "
+                "PP, DP/DCP, EP/A2A, and dense fully-DP MoE are outside the "
+                f"accepted topology. Got {topology}."
+            )
+
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "GLM-5-Next MTP/speculative decoding is outside the current "
+                "Session AB adaptation boundary."
+            )
+        if self.enable_nsa_prefill_context_parallel:
+            raise ValueError(
+                "GLM-5-Next context-parallel prefill is outside the current "
+                "Session AB adaptation boundary."
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "GLM-5-Next Session AB does not support PD/disaggregation; "
+                "--disaggregation-mode must be 'null'."
+            )
+        if self.enable_dp_attention:
+            raise ValueError(
+                "GLM-5-Next Session AB does not support --enable-dp-attention."
+            )
+        if self.enable_two_batch_overlap:
+            raise ValueError(
+                "GLM-5-Next Session AB does not support "
+                "--enable-two-batch-overlap."
+            )
+        if self.enable_mixed_chunk:
+            raise ValueError(
+                "GLM-5-Next Session D supports plain EXTEND prefill only and "
+                "does not support --enable-mixed-chunk."
+            )
+        if self.enable_piecewise_cuda_graph:
+            raise ValueError(
+                "GLM-5-Next Session C supports decode CUDA graphs only and does "
+                "not support --enable-piecewise-cuda-graph."
+            )
+
+        if self.moe_runner_backend == "auto":
+            self.moe_runner_backend = "triton"
+        elif self.moe_runner_backend != "triton":
+            raise ValueError(
+                "GLM-5-Next Session AB requires --moe-runner-backend=triton; "
+                f"got {self.moe_runner_backend!r}. Cutlass, FlashInfer TRTLLM, "
+                "DeepGemm, and other MoE runners have not been verified to "
+                "propagate GLM's swiglu_limit correctly."
+            )
+
+        if self.kt_weight_path is not None:
+            kt_method = (self.kt_method or "").upper()
+            if kt_method != "FP8":
+                raise ValueError(
+                    "GLM-5-Next Session AB KT expert offload requires "
+                    "--kt-method FP8 so the block-E4M3 checkpoint layout is "
+                    "preserved and swiglu_limit reaches the "
+                    f"CPU expert kernel; got {self.kt_method!r}."
+                )
+
+            # The positive threshold enables GLM's layerwise full-GPU prefill
+            # route.  Its single full-layer slot cannot coexist with resident
+            # GPU experts. Normalize those placement options before expert
+            # masks or GPU weights are allocated. This fallback is deliberately
+            # silent so existing launch scripts keep working unchanged.
+            prefill_threshold = getattr(
+                self, "kt_gpu_prefill_token_threshold", None
+            )
+            if prefill_threshold is not None and prefill_threshold > 0:
+                if (
+                    (getattr(self, "kt_num_gpu_experts", None) or 0) > 0
+                    or (getattr(self, "kt_gpu_experts_ratio", None) or 0) > 0
+                ):
+                    self.kt_num_gpu_experts = 0
+                    self.kt_gpu_experts_ratio = None
+                if getattr(self, "kt_enable_dynamic_expert_update", False):
+                    raise ValueError(
+                        "GLM-5-Next KT layerwise prefill requires "
+                        "--kt-enable-dynamic-expert-update to remain disabled."
+                    )
+
+        # The shared-expert fusion path has not been accepted for GLM's
+        # clamp-before-SiLU contract.  The top-level unfused shared expert has
+        # the exact model-local activation and is the Session AB oracle.
+        self.disable_shared_experts_fusion = True
+
+        # Session C captures normal decode only.  Fixed small graph batches
+        # bound the wide 1M-context NSA page-table and activation reservation;
+        # all unsupported graph modes are rejected above.  This exact-model
+        # override intentionally does not change any non-GLM defaults.
+        if not self.disable_cuda_graph:
+            self.cuda_graph_bs = [1, 2, 4]
+            self.cuda_graph_max_bs = 4
+
+        # GLM's KPool live tail is request-local and Session AB does not yet
+        # restore it from a reused prefix.  Force the safe no-prefix-cache
+        # route even though radix cache is enabled by default for other models.
+        self.disable_radix_cache = True
+
+        # Remember the exact-model gate so later generic normalization can
+        # revalidate without loading or inspecting configs for other models.
+        self._glm5_next_session_ab_active = True
+
+    def _configure_glm5_next_session_ab_nsa(
+        self, capability: tuple[int, int]
+    ) -> None:
+        from sglang.srt.configs.glm5_next import get_glm5_next_gpu_profile
+
+        profile = get_glm5_next_gpu_profile(capability)
+        if self.kv_cache_dtype == "auto":
+            self.kv_cache_dtype = profile.kv_cache_dtype
+        elif self.kv_cache_dtype == "bf16":
+            self.kv_cache_dtype = "bfloat16"
+
+        if self.kv_cache_dtype != profile.kv_cache_dtype:
+            raise ValueError(
+                f"GLM-5-Next {profile.value} requires "
+                f"--kv-cache-dtype={profile.kv_cache_dtype}; got "
+                f"{self.kv_cache_dtype!r}."
+            )
+
+        if self.nsa_prefill_backend is None:
+            self.nsa_prefill_backend = "trtllm"
+        if self.nsa_decode_backend is None:
+            self.nsa_decode_backend = "trtllm"
+        if (
+            self.nsa_prefill_backend != "trtllm"
+            or self.nsa_decode_backend != "trtllm"
+        ):
+            raise ValueError(
+                "GLM-5-Next KPool4 requires the model-local trtllm dispatcher "
+                "for both "
+                "NSA prefill and decode; got "
+                f"prefill={self.nsa_prefill_backend!r}, "
+                f"decode={self.nsa_decode_backend!r}."
+            )
+
+        logger.warning(
+            "Set GLM-5-Next GPU profile=%s, KV cache=%s, KPool cache=%s, "
+            "NSA dispatcher=trtllm; the dispatcher selects model-local "
+            "graph-safe kernels on SM86/SM89/SM120.",
+            profile.value,
+            profile.kv_cache_dtype,
+            profile.index_cache_dtype,
+        )
+
+        prefill_threshold = getattr(self, "kt_gpu_prefill_token_threshold", None)
+        if (
+            capability == (8, 6)
+            and prefill_threshold is not None
+            and prefill_threshold > 0
+        ):
+            raise ValueError(
+                "GLM-5-Next layerwise prefill is not adapted for SM86; "
+                "set --kt-gpu-prefill-token-threshold=0."
+            )
+
     def _set_default_nsa_kv_cache_dtype(self, major: int) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
@@ -1392,6 +1639,13 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        is_glm5_next = (
+            model_arch == "Glm5NextForConditionalGeneration"
+            and getattr(hf_config, "model_type", None) == "glm5_next"
+        )
+        sparse_hf_config = (
+            hf_config.get_text_config() if is_glm5_next else hf_config
+        )
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -1457,9 +1711,20 @@ class ServerArgs:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2, GlmMoeDsaForCausalLM
+            if is_deepseek_nsa(hf_config) or is_glm5_next:
+                if is_glm5_next:
+                    if self.quantization is None:
+                        self.quantization = get_quantization_config(hf_config)
+                    self._validate_glm5_next_session_ab_boundary()
+                    if not is_cuda() or is_hip() or is_npu():
+                        raise ValueError(
+                            "GLM-5-Next Session AB supports NVIDIA CUDA only; "
+                            "CPU, ROCm, and NPU execution are outside the "
+                            "accepted boundary."
+                        )
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
                     envs.SGLANG_NSA_FORCE_MLA.set(True)
                     logger.warning(
@@ -1469,8 +1734,10 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
-                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+                index_topk_freq = getattr(sparse_hf_config, "index_topk_freq", 1)
+                index_topk_pattern = getattr(
+                    sparse_hf_config, "index_topk_pattern", None
+                )
                 if self.enable_two_batch_overlap and (
                     index_topk_freq > 1
                     or (index_topk_pattern is not None and "S" in index_topk_pattern)
@@ -1532,9 +1799,13 @@ class ServerArgs:
 
                     import torch
 
-                    major, _ = torch.cuda.get_device_capability()
-                    self._set_default_nsa_kv_cache_dtype(major)
-                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                    capability = torch.cuda.get_device_capability()
+                    major, _ = capability
+                    if is_glm5_next:
+                        self._configure_glm5_next_session_ab_nsa(capability)
+                    else:
+                        self._set_default_nsa_kv_cache_dtype(major)
+                        self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
@@ -2573,6 +2844,14 @@ class ServerArgs:
                 "mxfp8",
             ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
             self.moe_runner_backend = "cutlass"
+
+        # Model-specific adjustment runs before this generic normalization.
+        # Revalidate exact GLM after all backend rewrites so MXFP8 defaults or
+        # the legacy Cutlass environment switch cannot silently leave the
+        # correctness-first Triton boundary.
+        if getattr(self, "_glm5_next_session_ab_active", False):
+            self._validate_glm5_next_session_ab_boundary()
+
         if self.moe_runner_backend == "cutlass" and self.quantization in [
             "fp8",
             "mxfp8",

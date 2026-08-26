@@ -128,6 +128,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -1709,10 +1714,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
+    def glm5_next_linear_config(self):
+        """Return GLM-5-Next's text config for the hybrid linear runtime.
+
+        GLM-5-Next deliberately does not inherit ``KimiLinearConfig``.  Keep
+        the compatibility bridge here exact so no other multimodal or MLA
+        model is accidentally routed through the stateful KDA scheduler.
+        """
+
+        if getattr(self.model_config, "is_glm5_next", False):
+            return self.model_config.hf_text_config
+        return None
+
+    @property
     def mambaish_config(self):
         return (
             self.mamba2_config
             or self.hybrid_gdn_config
+            or self.glm5_next_linear_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
         )
@@ -2533,6 +2552,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return output
 
     def _forward_raw(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
+    ) -> ModelRunnerOutput:
+        # Exact GLM-5-Next KPool/DSA resolves active attention/pool state
+        # through a per-forward context. Preserve an explicit caller override;
+        # otherwise publish this runner's backend only for that exact model so
+        # every other model keeps the pre-Session-C execution path.
+        if has_forward_context() or not getattr(
+            self.model_config, "is_glm5_next", False
+        ):
+            ctx_mgr = empty_context()
+        else:
+            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+        with ctx_mgr:
+            return self._forward_raw_with_context(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
+    def _forward_raw_with_context(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool,

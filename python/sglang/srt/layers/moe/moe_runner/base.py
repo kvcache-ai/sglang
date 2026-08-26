@@ -49,6 +49,10 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
+    # GLM-5-Next only: preserve the released HF model's BF16 SiLU
+    # materialization before the BF16 gate/up multiply.  Generic MoE runners
+    # retain their existing fused one-round activation by default.
+    glm5_next_hf_two_round_swiglu: bool = False
 
 
 @dataclass

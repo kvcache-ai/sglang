@@ -92,14 +92,33 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         elif self.use_mla_backend:
-            cell_size = (
-                (
-                    self.model_config.qk_nope_head_dim
-                    + self.model_config.qk_rope_head_dim
-                )
-                * num_layers
-                * kv_size
+            is_glm5_next_kpool = bool(
+                getattr(self.model_config, "is_glm5_next", False)
+                and getattr(self.model_config, "uses_kpool4_compress", False)
             )
+            if is_glm5_next_kpool:
+                # GLM's absorbed query width (qk_nope_head_dim=256) is not
+                # its latent KV-cache width (kv_lora_rank=512).  Account the
+                # exact layout selected by the pool factory; otherwise memory
+                # profiling overestimates token capacity by roughly 1.66x.
+                cell_size = self.calculate_mla_kv_cache_dim() * num_layers * kv_size
+                if self.kv_cache_dtype == torch.float8_e4m3fn:
+                    # Exact GLM keeps TRTLLM's 512-byte raw latent row and a
+                    # separate FP32 descale per 128 channels.  Count the
+                    # sidecar here so 500k profiling cannot overcommit memory.
+                    latent_scale_groups = self.model_config.kv_lora_rank // 128
+                    cell_size += (
+                        latent_scale_groups * torch.float32.itemsize * num_layers
+                    )
+            else:
+                cell_size = (
+                    (
+                        self.model_config.qk_nope_head_dim
+                        + self.model_config.qk_rope_head_dim
+                    )
+                    * num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -115,16 +134,28 @@ class ModelRunnerKVCacheMixin:
                     * kv_size
                 )
 
-            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-            if is_deepseek_nsa(self.model_config.hf_config):
-                index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+            # Add indexer KV cache overhead for NSA models. GLM-5-Next is
+            # checked through its exact capability bit because its sparse
+            # fields live on the nested text config rather than the wrapper.
+            if is_deepseek_nsa(self.model_config.hf_config) or getattr(
+                self.model_config, "uses_kpool4_compress", False
+            ):
+                index_head_dim = (
+                    self.model_config.index_head_dim
+                    if getattr(self.model_config, "is_glm5_next", False)
+                    else get_nsa_index_head_dim(self.model_config.hf_config)
                 )
-                element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
+                if is_glm5_next_kpool and self.kv_cache_dtype == torch.bfloat16:
+                    indexer_size_per_token = index_head_dim
+                    element_size = torch.bfloat16.itemsize
+                else:
+                    indexer_size_per_token = (
+                        index_head_dim
+                        + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                    )
+                    element_size = torch._utils._element_size(
+                        NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
             if self.model_config.is_hybrid_swa:
@@ -160,6 +191,64 @@ class ModelRunnerKVCacheMixin:
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
         return cell_size
+
+    def _get_glm5_next_kpool_tail_size_bytes(
+        self: ModelRunner, *, num_layers: int, max_num_reqs: int
+    ) -> int:
+        """Return GLM's fixed per-request live-tail allocation.
+
+        This allocation is separate from the token-indexed latent/index KV
+        pools and therefore must not be folded into the per-token cell size.
+        Keep the capability gate exact so legacy NSA/KDA models retain their
+        historical profiling arithmetic.
+        """
+
+        if not (
+            getattr(self.model_config, "is_glm5_next", False)
+            and getattr(self.model_config, "uses_kpool4_compress", False)
+        ):
+            return 0
+
+        text_config = self.model_config.hf_text_config
+        index_kpool = int(text_config.index_kpool)
+        index_head_dim = int(text_config.index_head_dim)
+        assert index_kpool == 4
+        assert index_head_dim == 128
+        assert text_config.index_kpool_compress
+
+        # One BF16 key tail and one BF16 vector-score tail per request/layer.
+        return (
+            num_layers
+            * max_num_reqs
+            * index_kpool
+            * index_head_dim
+            * 2
+            * torch.bfloat16.itemsize
+        )
+
+    def _reserve_glm5_next_kpool_tail(
+        self: ModelRunner,
+        *,
+        max_total_num_tokens: int,
+        num_layers: int,
+        max_num_reqs: int,
+    ) -> int:
+        """Trade provisional token capacity for the fixed KPool tail bytes."""
+
+        tail_size_bytes = self._get_glm5_next_kpool_tail_size_bytes(
+            num_layers=num_layers, max_num_reqs=max_num_reqs
+        )
+        if tail_size_bytes == 0:
+            return max_total_num_tokens
+
+        cell_size = self.get_cell_size_per_token(num_layers)
+        reserved_tokens = (tail_size_bytes + cell_size - 1) // cell_size
+        logger.info(
+            "Reserve %.2f MiB (%d token slots) for GLM-5-Next KPool tails.",
+            tail_size_bytes / (1 << 20),
+            reserved_tokens,
+        )
+        return max(0, max_total_num_tokens - reserved_tokens)
 
     def profile_max_num_token(self: ModelRunner):
         available_gpu_memory = get_available_gpu_memory(
@@ -258,7 +347,9 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config) or getattr(
+            self.model_config, "uses_kpool4_compress", False
+        )
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
@@ -284,9 +375,9 @@ class ModelRunnerKVCacheMixin:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
-            assert (
-                kv_lora_rank % quant_block_size == 0
-            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            assert kv_lora_rank % quant_block_size == 0, (
+                f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            )
 
             return (
                 kv_lora_rank
@@ -365,9 +456,9 @@ class ModelRunnerKVCacheMixin:
             full_per_token * full_layers_num
             + swa_full_tokens_ratio * swa_per_token * swa_layers_num
         )
-        assert (
-            denominator > 0
-        ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+        assert denominator > 0, (
+            f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+        )
 
         self.full_max_total_num_tokens = int(total_memory / denominator)
         self.swa_max_total_num_tokens = int(
@@ -393,15 +484,15 @@ class ModelRunnerKVCacheMixin:
         logger.info(f"DSv4 compressed attention: state_dtype={self.state_dtype}")
 
         page_size = self.server_args.page_size
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             config = getattr(self.server_args, "_draft_pool_config", None)
-            assert (
-                config is not None
-            ), "Draft worker requires target's pool config but _draft_pool_config is not set."
+            assert config is not None, (
+                "Draft worker requires target's pool config but _draft_pool_config is not set."
+            )
             self.full_max_total_num_tokens = config["full_max_total_num_tokens"]
             self.swa_max_total_num_tokens = config["swa_max_total_num_tokens"]
             self.c4_max_total_num_tokens = 0
@@ -503,6 +594,19 @@ class ModelRunnerKVCacheMixin:
                 max_num_reqs = min(
                     max_num_reqs, self.server_args.max_running_requests // self.dp_size
                 )
+
+        if getattr(self.model_config, "is_glm5_next", False) and getattr(
+            self.model_config, "uses_kpool4_compress", False
+        ):
+            local_dsa_layers = sum(
+                self.start_layer <= layer_id < self.end_layer
+                for layer_id in self.model_config.hf_text_config.full_attention_layer_ids
+            )
+            self.max_total_num_tokens = self._reserve_glm5_next_kpool_tail(
+                max_total_num_tokens=self.max_total_num_tokens,
+                num_layers=local_dsa_layers,
+                max_num_reqs=max_num_reqs,
+            )
 
         if max_total_tokens_configured is not None:
             if max_total_tokens_configured > self.max_total_num_tokens:
@@ -618,6 +722,7 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_glm5_next_kpool = getattr(self.model_config, "uses_kpool4_compress", False)
         is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
         if is_v4_model:
             # Resolve V4 KV pool factory via plugin registry.
@@ -708,6 +813,18 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+        elif self.use_mla_backend and is_glm5_next_kpool:
+            # Importing the exact GLM module registers its isolated factory.
+            import sglang.srt.mem_cache.glm5_next_memory_pool  # noqa: F401
+            from sglang.srt.mem_cache.pool_registry import resolve_kv_pool_factory
+
+            resolved = resolve_kv_pool_factory(self.model_config, self.server_args)
+            assert resolved is not None and resolved[0] == "glm5_next_kpool4", (
+                "GLM-5-Next KPool4 capability was selected but its exact KV "
+                "pool factory is unavailable."
+            )
+            _, factory = resolved
+            self.token_to_kv_pool = factory(model_runner=self)
         elif self.use_mla_backend and is_nsa_model:
             self.token_to_kv_pool = NSATokenToKVPool(
                 self.max_total_num_tokens,

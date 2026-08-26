@@ -1,5 +1,8 @@
+import json
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
+
+from jsonschema import Draft202012Validator, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
@@ -75,7 +78,12 @@ class FunctionCallParser:
         "gigachat3": GigaChat3Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
+    def __init__(
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tool_choice: Optional[Union[ToolChoice, str]] = None,
+    ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             detector = detector_class()
@@ -84,7 +92,50 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
+        self.tool_choice = tool_choice
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+
+    def _validate_complete_calls(self, calls: List[ToolCallItem]) -> None:
+        if self.tool_choice != "required" and not isinstance(
+            self.tool_choice, ToolChoice
+        ):
+            return
+        if self.tool_choice == "required" and not calls:
+            raise ValueError("Required GLM tool choice produced no tool call.")
+
+        named_tool = (
+            self.tool_choice.function.name
+            if isinstance(self.tool_choice, ToolChoice)
+            else None
+        )
+        tools_by_name = {tool.function.name: tool for tool in self.tools}
+        for call in calls:
+            if named_tool is not None and call.name != named_tool:
+                raise ValueError(
+                    f"Named tool choice requires {named_tool!r}; got {call.name!r}."
+                )
+            tool = tools_by_name.get(call.name)
+            if tool is None:
+                raise ValueError(f"Model called undefined tool {call.name!r}.")
+            try:
+                arguments = json.loads(call.parameters)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Tool {call.name!r} returned invalid JSON arguments."
+                ) from error
+            if not isinstance(arguments, dict):
+                raise ValueError(
+                    f"Tool {call.name!r} arguments must decode to an object."
+                )
+            schema = tool.function.parameters
+            if schema:
+                try:
+                    Draft202012Validator(schema).validate(arguments)
+                except ValidationError as error:
+                    raise ValueError(
+                        f"Tool {call.name!r} arguments do not match its schema: "
+                        f"{error.message}"
+                    ) from error
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -117,6 +168,7 @@ class FunctionCallParser:
             return full_text, []
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
+        self._validate_complete_calls(tool_call_list)
         if tool_call_list:
             return parsed_result.normal_text, tool_call_list
         else:
@@ -214,5 +266,10 @@ class FunctionCallParser:
             tag = self.get_structure_tag()
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            native_ebnf = self.detector.get_forced_tool_call_ebnf(
+                self.tools, tool_choice
+            )
+            if native_ebnf is not None:
+                return ("ebnf", native_ebnf)
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
             return ("json_schema", json_schema)

@@ -331,6 +331,12 @@ class BaseFormatDetector(ABC):
         """Return True if this detector supports structural tag format."""
         return True
 
+    def get_forced_tool_call_ebnf(self, tools: List[Tool], tool_choice) -> str | None:
+        """Return a native-format grammar for required/named calls if supported."""
+
+        del tools, tool_choice
+        return None
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

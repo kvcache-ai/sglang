@@ -186,6 +186,7 @@ class FusedMoE(torch.nn.Module):
         gemm1_alpha: Optional[float] = None,
         gemm1_clamp_limit: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
+        glm5_next_hf_two_round_swiglu: bool = False,
         use_weight_loader_fused: bool = False,
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
@@ -268,6 +269,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
             swiglu_limit=swiglu_limit,
+            glm5_next_hf_two_round_swiglu=glm5_next_hf_two_round_swiglu,
             is_gated=is_gated,
             routing_method_type=routing_method_type,
         )

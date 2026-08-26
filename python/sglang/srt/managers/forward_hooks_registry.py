@@ -14,7 +14,7 @@ hisparse_coordinator.py is imported (triggered via deepseek_v4.py
 side-effect).
 """
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict, List
 
 
 _HOOKS: Dict[str, Any] = {}
@@ -47,6 +47,17 @@ def dispatch(event: str, *args: Any, **kwargs: Any) -> None:
         method = getattr(hook, event, None)
         if method is None:
             continue
+        method(*args, **kwargs)
+
+
+def dispatch_named(name: str, event: str, *args: Any, **kwargs: Any) -> None:
+    """Fire one registered hook without changing any other plugin's lifecycle."""
+
+    hook = _HOOKS.get(name)
+    if hook is None:
+        return
+    method = getattr(hook, event, None)
+    if method is not None:
         method(*args, **kwargs)
 
 

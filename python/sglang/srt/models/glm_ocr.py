@@ -154,6 +154,8 @@ class GlmOcrVisionModel(Glm4vVisionModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        num_dummy_heads: int = 0,
+        merger_context_dim: Optional[int] = None,
     ) -> None:
         super().__init__(vision_config, quant_config, prefix, use_data_parallel)
 
@@ -196,14 +198,23 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
+                    # Keep the shared GLM-OCR constructor's historical
+                    # behavior.  Exact GLM5 passes this explicitly after its
+                    # TP-aware config update, so a reused/mutated GLM-OCR
+                    # config cannot accidentally change old-model behavior.
+                    num_dummy_heads=num_dummy_heads,
                     use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)
             ]
         )
+        if merger_context_dim is None:
+            merger_context_dim = (
+                vision_config.out_hidden_size * vision_config.in_channels
+            )
         self.merger = GlmOcrVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=vision_config.out_hidden_size * vision_config.in_channels,
+            context_dim=merger_context_dim,
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),

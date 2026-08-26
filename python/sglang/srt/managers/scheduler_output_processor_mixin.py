@@ -185,6 +185,14 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         self.maybe_collect_indexer_topk(req)
+                        from sglang.srt.managers.forward_hooks_registry import (
+                            dispatch_named,
+                        )
+
+                        if getattr(self.model_config, "is_glm5_next", False):
+                            dispatch_named(
+                                "glm5_next_kpool", "on_request_finished", req
+                            )
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -192,10 +200,10 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             from sglang.srt.managers.forward_hooks_registry import (
-                                dispatch,
+                                dispatch_named,
                             )
 
-                            dispatch("on_request_admit", req)
+                            dispatch_named("hisparse", "on_request_admit", req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -487,12 +495,16 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)
                 else:
-                    if self.enable_hisparse:
-                        from sglang.srt.managers.forward_hooks_registry import (
-                            dispatch,
-                        )
+                    from sglang.srt.managers.forward_hooks_registry import (
+                        dispatch_named,
+                    )
 
-                        dispatch("on_request_finished", req)
+                    if self.enable_hisparse:
+                        dispatch_named("hisparse", "on_request_finished", req)
+                    if getattr(self.model_config, "is_glm5_next", False):
+                        dispatch_named(
+                            "glm5_next_kpool", "on_request_finished", req
+                        )
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()
