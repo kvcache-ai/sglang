@@ -124,6 +124,10 @@ def add_payload(root: Path, module: str, part: Path) -> None:
 def retag_wheel_metadata(wheel_metadata: Path, python_tag: str, abi_tag: str) -> None:
     lines = []
     for line in wheel_metadata.read_text().splitlines():
+        # WHEEL is email-style metadata.  A blank line would terminate the
+        # headers and make a subsequently appended Tag invisible to pip.
+        if not line.strip():
+            continue
         if line.startswith("Tag:"):
             continue
         if line.startswith("Root-Is-Purelib:"):
