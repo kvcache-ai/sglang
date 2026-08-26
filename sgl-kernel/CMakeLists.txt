@@ -206,6 +206,7 @@ endif()
 if (ENABLE_BELOW_SM90)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_80,code=sm_80"
+        "-gencode=arch=compute_86,code=sm_86"
         "-gencode=arch=compute_89,code=sm_89"
     )
     if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
