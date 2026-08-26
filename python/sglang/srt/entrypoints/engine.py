@@ -877,14 +877,21 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "at https://docs.flashinfer.ai/installation.html.",
             )
         if _is_cuda:
-            kernel_distribution = (
-                "sgl-kernel-kt"
-                if check_pkg_version_at_least("sgl-kernel-kt", "0")
-                else "sgl-kernel"
-            )
+            if check_pkg_version_at_least("sgl-kernel-kt", "0"):
+                kernel_distribution = "sgl-kernel-kt"
+                minimum_kernel_version = "0.3.21"
+            elif check_pkg_version_at_least("kt-kernel", "0.7.0.post2"):
+                # The PyPI hotfix carries the checksummed sgl_kernel runtime
+                # inside the mandatory kt-kernel wheel.  This avoids creating
+                # a new distribution solely to bypass PyPI's file-size limit.
+                kernel_distribution = "kt-kernel"
+                minimum_kernel_version = "0.7.0.post2"
+            else:
+                kernel_distribution = "sgl-kernel"
+                minimum_kernel_version = "0.3.21"
             assert_pkg_version(
                 kernel_distribution,
-                "0.3.21",
+                minimum_kernel_version,
                 "Please reinstall the latest SGL kernel distribution.",
             )
 
