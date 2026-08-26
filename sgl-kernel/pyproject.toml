@@ -7,7 +7,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "sgl-kernel"
+name = "sgl-kernel-kt"
 version = "0.3.21.post1"
 authors = [
   { name="SGLang Kernel Team", email="sglang@lmsys.org" },
