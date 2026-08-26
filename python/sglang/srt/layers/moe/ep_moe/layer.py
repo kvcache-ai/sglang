@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
@@ -29,14 +30,18 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    NPUCompressedTensorsW4A16Int4DynamicMoE,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+
+if importlib.util.find_spec("compressed_tensors") is not None:
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        NPUCompressedTensorsW4A16Int4DynamicMoE,
+    )
+else:
+    NPUCompressedTensorsW4A16Int4DynamicMoE = ()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (

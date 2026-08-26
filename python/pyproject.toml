@@ -19,6 +19,7 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
+  "av",
   "blobfile==3.0.0",
   "build",
   "cuda-python>=13.1,<13.3",
