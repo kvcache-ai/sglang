@@ -74,6 +74,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
+    check_pkg_version_at_least,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
@@ -876,10 +877,15 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "at https://docs.flashinfer.ai/installation.html.",
             )
         if _is_cuda:
+            kernel_distribution = (
+                "sgl-kernel-kt"
+                if check_pkg_version_at_least("sgl-kernel-kt", "0")
+                else "sgl-kernel"
+            )
             assert_pkg_version(
-                "sgl-kernel",
+                kernel_distribution,
                 "0.3.21",
-                "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+                "Please reinstall the latest SGL kernel distribution.",
             )
 
     # Signal handlers can only be registered from the main thread.
