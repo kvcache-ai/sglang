@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 import orjson
 
+from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -1393,13 +1394,11 @@ class ServerArgs:
                 f"FP8 weight format; got quantization={self.quantization!r}."
             )
 
-        # Session AB accepts only the TP=4 runtime layout.  Other TP widths and
-        # alternate PP/DP/CP/EP topologies are deliberately outside the
-        # released boundary.  The mHC communicator intentionally rejects the
-        # scattered states produced by A2A MoE and dense fully-DP modes.
-        if self.tp_size != 4:
+        # Keep the released GLM topology narrow while accepting every TP width
+        # validated by the model and its dedicated Layerwise transport.
+        if self.tp_size not in GLM5_NEXT_SUPPORTED_TP_SIZES:
             raise ValueError(
-                "GLM-5-Next Session AB accepts only TP=4; "
+                "GLM-5-Next Session AB supports TP sizes 1, 2, 4, and 8; "
                 f"got tp_size={self.tp_size}."
             )
 
@@ -1483,18 +1482,20 @@ class ServerArgs:
                 )
 
             # The positive threshold enables GLM's layerwise full-GPU prefill
-            # route.  It is supported only by the TP=4 runtime layout.
-            # Dynamic expert replacement mutates the resident set behind the
-            # shared context and is deliberately excluded.
+            # route.  Its single full-layer slot cannot coexist with resident
+            # GPU experts. Normalize those placement options before expert
+            # masks or GPU weights are allocated. This fallback is deliberately
+            # silent so existing launch scripts keep working unchanged.
             prefill_threshold = getattr(
                 self, "kt_gpu_prefill_token_threshold", None
             )
             if prefill_threshold is not None and prefill_threshold > 0:
-                if self.tp_size != 4:
-                    raise ValueError(
-                        "GLM-5-Next KT layerwise prefill "
-                        "(--kt-gpu-prefill-token-threshold > 0) requires TP=4."
-                    )
+                if (
+                    (getattr(self, "kt_num_gpu_experts", None) or 0) > 0
+                    or (getattr(self, "kt_gpu_experts_ratio", None) or 0) > 0
+                ):
+                    self.kt_num_gpu_experts = 0
+                    self.kt_gpu_experts_ratio = None
                 if getattr(self, "kt_enable_dynamic_expert_update", False):
                     raise ValueError(
                         "GLM-5-Next KT layerwise prefill requires "
@@ -1568,21 +1569,13 @@ class ServerArgs:
 
         prefill_threshold = getattr(self, "kt_gpu_prefill_token_threshold", None)
         if (
-            profile.is_consumer_gpu
+            capability == (8, 6)
             and prefill_threshold is not None
             and prefill_threshold > 0
         ):
             raise ValueError(
-                "GLM-5-Next layerwise prefill is not adapted for SM86/SM89; "
+                "GLM-5-Next layerwise prefill is not adapted for SM86; "
                 "set --kt-gpu-prefill-token-threshold=0."
-            )
-
-        if profile.is_consumer_gpu and bool(
-            getattr(self, "enable_multimodal", False)
-        ):
-            raise ValueError(
-                "GLM-5-Next SM86/SM89 acceptance covers text inference only; "
-                "--enable-multimodal must remain disabled."
             )
 
     def _set_default_nsa_kv_cache_dtype(self, major: int) -> str:

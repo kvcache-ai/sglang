@@ -15,6 +15,7 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 
 _GLM5_NEXT_ARCH = "Glm5NextForConditionalGeneration"
+GLM5_NEXT_SUPPORTED_TP_SIZES = frozenset((1, 2, 4, 8))
 
 
 class Glm5NextGPUProfile(str, Enum):

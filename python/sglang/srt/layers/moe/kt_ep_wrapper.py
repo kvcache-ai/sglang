@@ -27,7 +27,7 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
         whether a regression sits in the GPU MoE path or the merge math.
 
     SGLANG_KT_GLM5_NEXT_FP8_TRANSPORT=auto|native|legacy
-        Select the exact GLM-5-Next TP4 block-FP8 layer transport. ``auto``
+        Select the exact GLM-5-Next block-FP8 layer transport. ``auto``
         uses the native batch API when present and otherwise falls back before
         the first load; a native runtime failure never falls back.
 """
@@ -55,6 +55,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
@@ -85,7 +86,8 @@ _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 
 _GLM5_NEXT_FP8_TRANSPORT_ENV = "SGLANG_KT_GLM5_NEXT_FP8_TRANSPORT"
 _GLM5_NEXT_FP8_TRANSPORT_MODES = frozenset(("auto", "native", "legacy"))
-_GLM5_NEXT_FP8_CONTROL_BYTES = 4096
+_GLM5_NEXT_FP8_LEGACY_CONTROL_BYTES = 4096
+_GLM5_NEXT_FP8_LEGACY_MAX_TP_SIZE = 4
 _GLM5_NEXT_FP8_TRANSPORT_TIMEOUT_MS = 60_000
 _GLM5_NEXT_FP8_MOE_LAYER_INDICES = tuple(range(3, 45))
 
@@ -121,6 +123,39 @@ def _load_glm5_next_fp8_native_transport_api():
     if missing:
         return None, "kt_kernel_ext is missing " + ", ".join(missing)
     return kt_kernel_ext, None
+
+
+def _glm5_next_fp8_native_transport_capabilities(kt_kernel_ext) -> Tuple[int, int]:
+    """Read the installed native transport ABI without duplicating its limits."""
+
+    max_tp_size = int(
+        getattr(
+            kt_kernel_ext,
+            "FP8_LAYERWISE_MAX_TP_SIZE",
+            _GLM5_NEXT_FP8_LEGACY_MAX_TP_SIZE,
+        )
+    )
+    control_bytes = int(
+        getattr(
+            kt_kernel_ext,
+            "FP8_LAYERWISE_CONTROL_BYTES",
+            _GLM5_NEXT_FP8_LEGACY_CONTROL_BYTES,
+        )
+    )
+    if max_tp_size <= 0 or control_bytes <= 0:
+        raise RuntimeError(
+            "kt_kernel_ext exposed invalid FP8 Layerwise transport capabilities: "
+            f"max_tp_size={max_tp_size}, control_bytes={control_bytes}"
+        )
+    return max_tp_size, control_bytes
+
+
+def _validate_glm5_next_tp_size(tp_size: int, *, context: str) -> None:
+    if tp_size not in GLM5_NEXT_SUPPORTED_TP_SIZES:
+        raise RuntimeError(
+            f"GLM-5-Next {context} supports TP sizes 1, 2, 4, and 8; "
+            f"got TP={tp_size}"
+        )
 
 
 @dataclass
@@ -340,7 +375,7 @@ _MXFP4_LAYERWISE_MANAGERS = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS = {}
 # Exact GLM-5-Next block-FP8 has a deliberately separate registry/control
 # plane.  Registration is harmless for ``legacy`` transport, while manager
-# construction is hard-gated on the native TP4/gpu_experts=0 runtime below.
+# construction is hard-gated on the validated TP/gpu_experts=0 runtime below.
 _GLM5_NEXT_FP8_NATIVE_PREFETCH_LAYER_REGISTRY = {}
 _GLM5_NEXT_FP8_NATIVE_PREFETCH_MANAGERS = {}
 
@@ -409,6 +444,8 @@ class SharedFullContext:
         moe_runner_config: "MoeRunnerConfig",
         defer_cpu_buffers: bool = False,
     ):
+        self._full_init_args = init_args
+        self._global_num_experts = global_num_experts
         self._build_layers(layer, init_args, global_num_experts, moe_runner_config)
 
         # Capture original tensors to support restoration before loading
@@ -1275,6 +1312,7 @@ class SharedFullContext:
 
         self._glm5_next_fp8_transport_initialized = False
         self._glm5_next_fp8_transport_backend = None
+        self._glm5_next_fp8_native_control_bytes = None
 
     @staticmethod
     def _tp_all_gather_object(value):
@@ -1355,13 +1393,16 @@ class SharedFullContext:
             expert_nbytes,
         )
 
-    def _initialize_glm5_next_fp8_native_transport(self, kt_kernel_ext) -> None:
+    def _initialize_glm5_next_fp8_native_transport(
+        self, kt_kernel_ext, control_bytes: int
+    ) -> None:
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         control_name = f"kt_glm5_next_fp8_ctrl_{self.shm_unique_id}"
         self._glm5_next_fp8_control_shm = None
         self._glm5_next_fp8_control_owner = tp_rank == 0
         self._glm5_next_fp8_native_transport = None
+        self._glm5_next_fp8_native_control_bytes = control_bytes
 
         create_error = None
         if tp_rank == 0:
@@ -1369,7 +1410,7 @@ class SharedFullContext:
                 control_shm = shared_memory.SharedMemory(
                     name=control_name,
                     create=True,
-                    size=_GLM5_NEXT_FP8_CONTROL_BYTES,
+                    size=control_bytes,
                 )
                 self._glm5_next_fp8_control_shm = control_shm
                 control_ptr = ctypes.addressof(
@@ -1377,7 +1418,7 @@ class SharedFullContext:
                 )
                 kt_kernel_ext.initialize_fp8_layerwise_control(
                     control_ptr,
-                    _GLM5_NEXT_FP8_CONTROL_BYTES,
+                    control_bytes,
                     tp_size,
                 )
             except Exception as exc:
@@ -1400,6 +1441,11 @@ class SharedFullContext:
             control_shm = self._glm5_next_fp8_control_shm
             if control_shm is None:
                 raise RuntimeError("native control SHM is not mapped")
+            if control_shm.size < control_bytes:
+                raise RuntimeError(
+                    "native control SHM is smaller than the installed transport ABI: "
+                    f"mapped={control_shm.size}, required={control_bytes}"
+                )
             control_ptr = ctypes.addressof(
                 ctypes.c_char.from_buffer(control_shm.buf)
             )
@@ -1418,7 +1464,7 @@ class SharedFullContext:
             self._glm5_next_fp8_native_transport = (
                 kt_kernel_ext.FP8LayerwiseTransport(
                     control_ptr,
-                    _GLM5_NEXT_FP8_CONTROL_BYTES,
+                    control_bytes,
                     tp_rank,
                     tp_size,
                     cuda_device,
@@ -1457,10 +1503,8 @@ class SharedFullContext:
 
         if getattr(self, "_glm5_next_fp8_transport_initialized", False):
             return
-        if get_tensor_model_parallel_world_size() != 4:
-            raise RuntimeError(
-                "GLM-5-Next layerwise prefill transport requires TP=4"
-            )
+        tp_size = get_tensor_model_parallel_world_size()
+        _validate_glm5_next_tp_size(tp_size, context="layerwise prefill transport")
         gpu_expert_counts = self._tp_all_gather_object(int(num_gpu_experts))
         if any(count != gpu_expert_counts[0] for count in gpu_expert_counts):
             raise RuntimeError(
@@ -1492,6 +1536,20 @@ class SharedFullContext:
             _load_glm5_next_fp8_native_transport_api()
         )
         tp_rank = get_tensor_model_parallel_rank()
+        native_capabilities = None
+        if kt_kernel_ext is not None:
+            try:
+                native_capabilities = _glm5_next_fp8_native_transport_capabilities(
+                    kt_kernel_ext
+                )
+                max_tp_size, _control_bytes = native_capabilities
+                if tp_size > max_tp_size:
+                    missing_reason = (
+                        "installed KT FP8 Layerwise transport supports at most "
+                        f"TP={max_tp_size}, requested TP={tp_size}"
+                    )
+            except Exception as exc:
+                missing_reason = str(exc)
         if tp_rank == 0 and not callable(
             getattr(getattr(wrapper, "moe", None), "run_layerwise_fp8_batch", None)
         ):
@@ -1517,7 +1575,16 @@ class SharedFullContext:
             self._initialize_glm5_next_fp8_legacy_transport()
             return
 
-        self._initialize_glm5_next_fp8_native_transport(kt_kernel_ext)
+        assert native_capabilities is not None
+        capability_values = self._tp_all_gather_object(native_capabilities)
+        if any(value != capability_values[0] for value in capability_values):
+            raise RuntimeError(
+                "FP8 Layerwise transport capabilities differ across TP ranks: "
+                f"{capability_values}"
+            )
+        self._initialize_glm5_next_fp8_native_transport(
+            kt_kernel_ext, native_capabilities[1]
+        )
 
     def _initialize_glm5_next_fp8_legacy_transport(self) -> None:
         """Create the legacy Python per-expert transport resources."""
@@ -3496,11 +3563,7 @@ def _validate_glm5_next_fp8_shared_full_context(
     """Validate the lazy generic context and return GPU/host storage bytes."""
 
     tp_size = get_tensor_model_parallel_world_size()
-    if tp_size != 4:
-        raise RuntimeError(
-            "GLM-5-Next layerwise prefill requires runtime TP=4; "
-            f"got TP={tp_size}"
-        )
+    _validate_glm5_next_tp_size(tp_size, context="layerwise prefill")
     if not getattr(context, "_glm5_next_fp8_transport_initialized", False):
         raise RuntimeError(
             "GLM-5-Next layerwise prefill transport is not initialized"
@@ -3570,11 +3633,47 @@ def _validate_glm5_next_fp8_shared_full_context(
             "Triton MoE runner"
         )
 
+    init_args = getattr(context, "_full_init_args", None)
+    if init_args is None or len(init_args) != 3:
+        raise RuntimeError(
+            "GLM-5-Next layerwise prefill is missing its runtime tensor geometry"
+        )
+    hidden_size, intermediate_size_per_partition, _params_dtype = init_args
+    num_experts = int(
+        getattr(context, "_global_num_experts", layer.num_experts)
+    )
+    hidden_size = int(hidden_size)
+    intermediate_size_per_partition = int(intermediate_size_per_partition)
+    if (
+        num_experts != 288
+        or hidden_size != 4096
+        or intermediate_size_per_partition * tp_size != 2048
+    ):
+        raise RuntimeError(
+            "GLM-5-Next layerwise prefill received incompatible runtime geometry: "
+            f"experts={num_experts}, hidden={hidden_size}, "
+            f"local_intermediate={intermediate_size_per_partition}, TP={tp_size}"
+        )
+
+    block_n, block_k = tuple(base_method.weight_block_size)
+    w13_n = 2 * intermediate_size_per_partition
     expected_shapes = {
-        "w13_weight": (288, 1024, 4096),
-        "w13_weight_scale_inv": (288, 8, 32),
-        "w2_weight": (288, 4096, 512),
-        "w2_weight_scale_inv": (288, 32, 4),
+        "w13_weight": (num_experts, w13_n, hidden_size),
+        "w13_weight_scale_inv": (
+            num_experts,
+            (w13_n + block_n - 1) // block_n,
+            (hidden_size + block_k - 1) // block_k,
+        ),
+        "w2_weight": (
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+        ),
+        "w2_weight_scale_inv": (
+            num_experts,
+            (hidden_size + block_n - 1) // block_n,
+            (intermediate_size_per_partition + block_k - 1) // block_k,
+        ),
     }
     expected_dtypes = {
         "w13_weight": getattr(torch, "float8_e4m3fn", None),
@@ -3594,7 +3693,7 @@ def _validate_glm5_next_fp8_shared_full_context(
             )
         if tuple(gpu_tensor.shape) != expected_shapes[name]:
             raise RuntimeError(
-                "GLM-5-Next TP4 generic full context has an invalid shape "
+                f"GLM-5-Next TP{tp_size} generic full context has an invalid shape "
                 f"for {name}: expected={expected_shapes[name]}, "
                 f"got={tuple(gpu_tensor.shape)}"
             )
@@ -3664,11 +3763,7 @@ def _glm5_next_fp8_native_prefetch_runtime_supported(
     if getattr(context, "_glm5_next_fp8_transport_backend", None) != "native":
         return False
     tp_size = get_tensor_model_parallel_world_size()
-    if tp_size != 4:
-        raise RuntimeError(
-            "exact GLM-5-Next native successor prefetch requires TP=4; "
-            f"got TP={tp_size}"
-        )
+    _validate_glm5_next_tp_size(tp_size, context="native successor prefetch")
     if int(method.num_gpu_experts) != 0:
         raise RuntimeError(
             "exact GLM-5-Next native successor prefetch requires "

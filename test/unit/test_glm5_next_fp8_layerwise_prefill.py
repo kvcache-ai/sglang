@@ -39,6 +39,11 @@ def _load_test_target():
     stubs = {
         "sglang": _package("sglang"),
         "sglang.srt": _package("sglang.srt"),
+        "sglang.srt.configs": _package("sglang.srt.configs"),
+        "sglang.srt.configs.glm5_next": _module(
+            "sglang.srt.configs.glm5_next",
+            GLM5_NEXT_SUPPORTED_TP_SIZES=frozenset((1, 2, 4, 8)),
+        ),
         "sglang.srt.layers": _package("sglang.srt.layers"),
         "sglang.srt.layers.moe": _package("sglang.srt.layers.moe"),
         "sglang.srt.layers.quantization": _package(
@@ -518,6 +523,8 @@ class _FakeNativeExtension:
         self.calls = calls
         self.initialize_args = None
         self.transport = None
+        self.FP8_LAYERWISE_CONTROL_BYTES = 8192
+        self.FP8_LAYERWISE_MAX_TP_SIZE = 8
 
     def initialize_fp8_layerwise_control(self, control_ptr, control_size, tp_size):
         self.initialize_args = (control_ptr, control_size, tp_size)
@@ -757,7 +764,7 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
         self.assertEqual(context._glm5_next_fp8_copy_stream.synchronize_count, 1)
 
     @staticmethod
-    def _native_context():
+    def _native_context(tp_size=4):
         context = object.__new__(kt_ep_wrapper.SharedFullContext)
         context.shm_unique_id = "native_test"
         context._commit_cpu_buffer_phase = mock.Mock()
@@ -772,14 +779,15 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
             context.cpu_buffers[name] = cpu_buffer
             context.all_rank_buffer_ptrs[name] = [
                 cpu_buffer.data_ptr() + rank * 1_000_000
-                for rank in range(4)
+                for rank in range(tp_size)
             ]
             gpu_tensors[name] = gpu_tensor
         context.gpu_layer = SimpleNamespace(num_experts=3, **gpu_tensors)
         return context
 
-    def test_native_transport_uses_fixed_flattened_pointer_abi(self):
-        context = self._native_context()
+    def test_native_transport_uses_tp8_flattened_pointer_abi(self):
+        tp_size = 8
+        context = self._native_context(tp_size=tp_size)
         calls = []
         extension = _FakeNativeExtension(calls)
         writer = _FakeNativeWriter(calls)
@@ -803,7 +811,7 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
             mock.patch.object(
                 kt_ep_wrapper,
                 "get_tensor_model_parallel_world_size",
-                return_value=4,
+                return_value=tp_size,
             ),
             mock.patch.object(kt_ep_wrapper.dist, "is_initialized", return_value=False),
             mock.patch.object(
@@ -819,17 +827,20 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
 
         self.assertEqual(
             extension.initialize_args[1:],
-            (kt_ep_wrapper._GLM5_NEXT_FP8_CONTROL_BYTES, 4),
+            (extension.FP8_LAYERWISE_CONTROL_BYTES, tp_size),
         )
         args = extension.transport.args
-        self.assertEqual(args[1:5], (4096, 0, 4, 0))
+        self.assertEqual(
+            args[1:5],
+            (extension.FP8_LAYERWISE_CONTROL_BYTES, 0, tp_size, 0),
+        )
         local_host_ptrs = args[5]
         local_gpu_ptrs = args[6]
         all_rank_host_ptrs = args[7]
         expert_nbytes = args[8]
         self.assertEqual(len(local_host_ptrs), 8)
         self.assertEqual(len(local_gpu_ptrs), 4)
-        self.assertEqual(len(all_rank_host_ptrs), 32)
+        self.assertEqual(len(all_rank_host_ptrs), 2 * tp_size * 4)
         self.assertEqual(expert_nbytes, [4, 8, 12, 16])
 
         expected_local = []
@@ -841,7 +852,7 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
                     context.cpu_buffers[name].data_ptr()
                     + slot * expert_nbytes[index]
                 )
-            for rank in range(4):
+            for rank in range(tp_size):
                 for index, name in enumerate(names):
                     expected_all_rank.append(
                         context.all_rank_buffer_ptrs[name][rank]
@@ -1178,81 +1189,101 @@ class TestGlm5NextFp8SingleSlotLayout(unittest.TestCase):
             close_source.index("transport.close()"),
         )
 
-    def test_tp4_fp8_geometry_and_single_full_layer_slot_bytes(self):
+    def test_supported_tp_fp8_geometry_and_single_full_layer_slot_bytes(self):
         num_experts = 288
         hidden_size = 4096
         global_intermediate_size = 2048
-        tp_size = 4
         block_size = 128
-        intermediate_size = global_intermediate_size // tp_size
-
-        self.assertEqual(intermediate_size, 512)
-        gpu_tensors = {
-            "w13_weight": _TensorMetadata(
-                (num_experts, 2 * intermediate_size, hidden_size),
-                torch.float8_e4m3fn,
-            ),
-            "w13_weight_scale_inv": _TensorMetadata(
-                (
-                    num_experts,
-                    math.ceil(2 * intermediate_size / block_size),
-                    math.ceil(hidden_size / block_size),
-                ),
-                torch.float32,
-            ),
-            "w2_weight": _TensorMetadata(
-                (num_experts, hidden_size, intermediate_size),
-                torch.float8_e4m3fn,
-            ),
-            "w2_weight_scale_inv": _TensorMetadata(
-                (
-                    num_experts,
-                    math.ceil(hidden_size / block_size),
-                    math.ceil(intermediate_size / block_size),
-                ),
-                torch.float32,
-            ),
-        }
-        host_buffers = {
-            name: _TensorMetadata((2, *tensor.shape[1:]), tensor.dtype)
-            for name, tensor in gpu_tensors.items()
-        }
-        context = SimpleNamespace(
-            _is_fp8_quant=True,
-            _glm5_next_fp8_transport_initialized=True,
-            _glm5_next_fp8_copy_stream=object(),
-            _glm5_next_fp8_host_slot_events=(object(), object()),
-            _get_base_quant_method=lambda: SimpleNamespace(
-                block_quant=True,
-                use_mxfp8=False,
-                weight_block_size=[128, 128],
-                runner=SimpleNamespace(
-                    runner_backend=SimpleNamespace(is_triton=lambda: True)
-                ),
-            ),
-            gpu_layer=SimpleNamespace(
-                num_experts=num_experts,
-                moe_runner_config=SimpleNamespace(
-                    glm5_next_hf_two_round_swiglu=True
-                ),
-                **gpu_tensors,
-            ),
-            cpu_buffers=host_buffers,
-        )
-
-        with mock.patch.object(
-            kt_ep_wrapper,
-            "get_tensor_model_parallel_world_size",
-            return_value=4,
-        ):
-            gpu_slot_bytes, host_buffer_bytes = (
-                kt_ep_wrapper._validate_glm5_next_fp8_shared_full_context(
-                    context
+        contexts = {}
+        for tp_size in (1, 2, 4, 8):
+            with self.subTest(tp_size=tp_size):
+                intermediate_size = global_intermediate_size // tp_size
+                gpu_tensors = {
+                    "w13_weight": _TensorMetadata(
+                        (num_experts, 2 * intermediate_size, hidden_size),
+                        torch.float8_e4m3fn,
+                    ),
+                    "w13_weight_scale_inv": _TensorMetadata(
+                        (
+                            num_experts,
+                            math.ceil(2 * intermediate_size / block_size),
+                            math.ceil(hidden_size / block_size),
+                        ),
+                        torch.float32,
+                    ),
+                    "w2_weight": _TensorMetadata(
+                        (num_experts, hidden_size, intermediate_size),
+                        torch.float8_e4m3fn,
+                    ),
+                    "w2_weight_scale_inv": _TensorMetadata(
+                        (
+                            num_experts,
+                            math.ceil(hidden_size / block_size),
+                            math.ceil(intermediate_size / block_size),
+                        ),
+                        torch.float32,
+                    ),
+                }
+                host_buffers = {
+                    name: _TensorMetadata((2, *tensor.shape[1:]), tensor.dtype)
+                    for name, tensor in gpu_tensors.items()
+                }
+                context = SimpleNamespace(
+                    _is_fp8_quant=True,
+                    _full_init_args=(hidden_size, intermediate_size, torch.bfloat16),
+                    _global_num_experts=num_experts,
+                    _glm5_next_fp8_transport_initialized=True,
+                    _glm5_next_fp8_copy_stream=object(),
+                    _glm5_next_fp8_host_slot_events=(object(), object()),
+                    _get_base_quant_method=lambda: SimpleNamespace(
+                        block_quant=True,
+                        use_mxfp8=False,
+                        weight_block_size=[128, 128],
+                        runner=SimpleNamespace(
+                            runner_backend=SimpleNamespace(is_triton=lambda: True)
+                        ),
+                    ),
+                    gpu_layer=SimpleNamespace(
+                        num_experts=num_experts,
+                        moe_runner_config=SimpleNamespace(
+                            glm5_next_hf_two_round_swiglu=True
+                        ),
+                        **gpu_tensors,
+                    ),
+                    cpu_buffers=host_buffers,
                 )
-            )
-        self.assertEqual(gpu_slot_bytes, 1_812_381_696)
-        self.assertEqual(host_buffer_bytes, 12_585_984)
+                contexts[tp_size] = context
 
+                with mock.patch.object(
+                    kt_ep_wrapper,
+                    "get_tensor_model_parallel_world_size",
+                    return_value=tp_size,
+                ):
+                    gpu_slot_bytes, host_buffer_bytes = (
+                        kt_ep_wrapper._validate_glm5_next_fp8_shared_full_context(
+                            context
+                        )
+                    )
+                self.assertEqual(
+                    gpu_slot_bytes,
+                    sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in gpu_tensors.values()
+                    ),
+                )
+                self.assertEqual(
+                    host_buffer_bytes,
+                    sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in host_buffers.values()
+                    ),
+                )
+
+        context = contexts[4]
+        gpu_tensors = {
+            name: getattr(context.gpu_layer, name)
+            for name in kt_ep_wrapper._GLM5_NEXT_FP8_RAW_WEIGHT_NAMES
+        }
         context.cpu_buffers["w13_weight"] = _TensorMetadata(
             (1, *gpu_tensors["w13_weight"].shape[1:]), torch.float8_e4m3fn
         )

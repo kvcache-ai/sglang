@@ -113,6 +113,8 @@ def _boundary_args(**overrides):
         kt_weight_path=None,
         kt_method=None,
         kt_gpu_prefill_token_threshold=None,
+        kt_num_gpu_experts=None,
+        kt_gpu_experts_ratio=None,
         kt_enable_dynamic_expert_update=False,
         disable_shared_experts_fusion=False,
         disable_cuda_graph=False,
@@ -127,7 +129,11 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
     def setUpClass(cls):
         cls.validate = staticmethod(
             _compile_function(
-                "_validate_glm5_next_session_ab_boundary", class_name="ServerArgs"
+                "_validate_glm5_next_session_ab_boundary",
+                class_name="ServerArgs",
+                globals_={
+                    "GLM5_NEXT_SUPPORTED_TP_SIZES": frozenset((1, 2, 4, 8))
+                },
             )
         )
 
@@ -250,14 +256,16 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     self.validate(_boundary_args(**overrides))
 
-    def test_only_tp4_width_is_accepted(self):
-        args = _boundary_args(tp_size=4)
-        self.validate(args)
-        self.assertEqual(args.tp_size, 4)
-
-        for tp_size in (1, 2, 8, 16):
+    def test_tp1_tp2_tp4_and_tp8_are_accepted(self):
+        for tp_size in (1, 2, 4, 8):
             with self.subTest(tp_size=tp_size):
-                with self.assertRaisesRegex(ValueError, "only TP=4"):
+                args = _boundary_args(tp_size=tp_size)
+                self.validate(args)
+                self.assertEqual(args.tp_size, tp_size)
+
+        for tp_size in (0, 3, 16):
+            with self.subTest(tp_size=tp_size):
+                with self.assertRaisesRegex(ValueError, "1, 2, 4, and 8"):
                     self.validate(_boundary_args(tp_size=tp_size))
 
     def test_only_tensor_parallel_topology_is_accepted(self):
@@ -318,14 +326,16 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                         )
                     )
 
-    def test_layerwise_prefill_requires_tp4_and_static_experts(self):
-        accepted = _boundary_args(
-            tp_size=4,
-            kt_weight_path="stub/experts",
-            kt_method="fp8",
-            kt_gpu_prefill_token_threshold=4096,
-        )
-        self.validate(accepted)
+    def test_layerwise_prefill_accepts_supported_tp_sizes(self):
+        for tp_size in (1, 2, 4, 8):
+            with self.subTest(tp_size=tp_size):
+                accepted = _boundary_args(
+                    tp_size=tp_size,
+                    kt_weight_path="stub/experts",
+                    kt_method="fp8",
+                    kt_gpu_prefill_token_threshold=4096,
+                )
+                self.validate(accepted)
 
         with self.assertRaisesRegex(ValueError, "dynamic-expert-update"):
             self.validate(
@@ -337,6 +347,38 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                     kt_enable_dynamic_expert_update=True,
                 )
             )
+
+    def test_layerwise_silently_normalizes_resident_gpu_experts_to_zero(self):
+        count = _boundary_args(
+            kt_weight_path="stub/experts",
+            kt_method="fp8",
+            kt_gpu_prefill_token_threshold=2048,
+            kt_num_gpu_experts=80,
+        )
+        self.validate(count)
+        self.assertEqual(count.kt_num_gpu_experts, 0)
+        self.assertIsNone(count.kt_gpu_experts_ratio)
+
+        ratio = _boundary_args(
+            kt_weight_path="stub/experts",
+            kt_method="fp8",
+            kt_gpu_prefill_token_threshold=2048,
+            kt_num_gpu_experts=80,
+            kt_gpu_experts_ratio=0.25,
+        )
+        self.validate(ratio)
+        self.assertEqual(ratio.kt_num_gpu_experts, 0)
+        self.assertIsNone(ratio.kt_gpu_experts_ratio)
+
+    def test_non_layerwise_gpu_expert_placement_is_preserved(self):
+        args = _boundary_args(
+            kt_weight_path="stub/experts",
+            kt_method="fp8",
+            kt_gpu_prefill_token_threshold=0,
+            kt_num_gpu_experts=80,
+        )
+        self.validate(args)
+        self.assertEqual(args.kt_num_gpu_experts, 80)
 
     def test_glm_layerwise_context_is_not_eagerly_initialized_by_model_runner(self):
         source = MODEL_RUNNER_PATH.read_text(encoding="utf-8")
@@ -433,8 +475,8 @@ class TestGlm5NextSessionABNSA(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SM86, SM89, or Blackwell"):
             self._configure()(self._args(), (9, 0))
 
-    def test_consumer_gpu_rejects_layerwise_prefill(self):
-        with self.assertRaisesRegex(ValueError, "not adapted for SM86/SM89"):
+    def test_sm86_rejects_layerwise_prefill(self):
+        with self.assertRaisesRegex(ValueError, "not adapted for SM86"):
             self._configure()(
                 self._args(
                     kv_cache_dtype="bfloat16",
@@ -443,19 +485,28 @@ class TestGlm5NextSessionABNSA(unittest.TestCase):
                 (8, 6),
             )
 
-    def test_consumer_gpu_rejects_multimodal_but_blackwell_is_unchanged(self):
-        with self.assertRaisesRegex(ValueError, "text inference only"):
-            self._configure()(
-                self._args(
-                    kv_cache_dtype="bfloat16",
-                    enable_multimodal=True,
-                ),
-                (8, 6),
-            )
+    def test_sm89_accepts_layerwise_prefill(self):
+        args = self._args(kt_gpu_prefill_token_threshold=1)
 
-        blackwell = self._args(enable_multimodal=True)
-        self._configure()(blackwell, (12, 0))
-        self.assertTrue(blackwell.enable_multimodal)
+        self._configure()(args, (8, 9))
+
+        self.assertEqual(args.nsa_prefill_backend, "trtllm")
+        self.assertEqual(args.nsa_decode_backend, "trtllm")
+
+    def test_sm86_sm89_and_blackwell_accept_multimodal(self):
+        cases = (
+            ((8, 6), "bfloat16"),
+            ((8, 9), "fp8_e4m3"),
+            ((12, 0), "fp8_e4m3"),
+        )
+        for capability, kv_cache_dtype in cases:
+            with self.subTest(capability=capability):
+                args = self._args(
+                    kv_cache_dtype=kv_cache_dtype,
+                    enable_multimodal=True,
+                )
+                self._configure()(args, capability)
+                self.assertTrue(args.enable_multimodal)
 
     def test_non_trtllm_sparse_backend_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "both NSA prefill and decode"):
@@ -599,7 +650,11 @@ class TestGlm5NextBoundaryIsolation(unittest.TestCase):
             },
         )
         validate = _compile_function(
-            "_validate_glm5_next_session_ab_boundary", class_name="ServerArgs"
+            "_validate_glm5_next_session_ab_boundary",
+            class_name="ServerArgs",
+            globals_={
+                "GLM5_NEXT_SUPPORTED_TP_SIZES": frozenset((1, 2, 4, 8))
+            },
         )
 
         def make_args(*, exact_glm: bool, backend: str):
