@@ -150,6 +150,7 @@ def build_python_carrier(
     part: Path,
     output_dir: Path,
     replacements: tuple[tuple[str, str], ...] = (),
+    overlays: tuple[tuple[Path, str], ...] = (),
 ) -> Path:
     with tempfile.TemporaryDirectory() as temp_name:
         root = Path(temp_name)
@@ -157,6 +158,11 @@ def build_python_carrier(
             wheel.extractall(root)
         dist_info = next(root.glob("*.dist-info"))
         add_payload(root, module, part)
+        for source, relative_destination in overlays:
+            destination = root / relative_destination
+            if not destination.is_file():
+                raise RuntimeError(f"Missing carrier overlay destination: {destination}")
+            shutil.copy2(source, destination)
         metadata = dist_info / "METADATA"
         text = metadata.read_text()
         for old, new in replacements:
@@ -298,6 +304,13 @@ def main() -> None:
                 parts["sglang"],
                 args.output_dir,
                 (("sgl-kernel-kt==0.3.21.post2", "kt-kernel==0.7.0.post2"),),
+                (
+                    (
+                        Path(__file__).resolve().parents[2]
+                        / "python/sglang/srt/entrypoints/engine.py",
+                        "sglang/srt/entrypoints/engine.py",
+                    ),
+                ),
             ),
             build_python_carrier(
                 args.ktransformers_wheel,
