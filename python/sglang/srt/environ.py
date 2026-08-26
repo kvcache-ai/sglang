@@ -522,6 +522,8 @@ class Envs:
     SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(False)
     SGLANG_OPT_MXFP4_STATIC_SCALE_ONES = EnvBool(False)
     SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING = EnvBool(False)
+    # Allow the Marlin W4A16 MoE backend for a KT resident partial-expert image.
+    SGLANG_V4_MARLIN_PARTIAL = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(False)
     SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
