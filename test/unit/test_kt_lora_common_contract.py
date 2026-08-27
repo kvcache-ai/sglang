@@ -234,6 +234,36 @@ def test_cli_all_allocates_only_targets_executable_by_this_model():
     assert manager.get_runtime_target_modules() == {"gate"}
 
 
+def test_static_model_weight_finalizer_receives_loaded_adapter_slot():
+    calls = []
+
+    class _StaticModel:
+        def finalize_static_lora_weights(self, **kwargs):
+            calls.append(kwargs)
+
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.static_kt_lora_id = "static-id"
+    manager.base_model = _StaticModel()
+    manager.memory_pool = SimpleNamespace(get_buffer_id=lambda uid: 1)
+    manager.loras = {
+        "static-id": SimpleNamespace(
+            config=SimpleNamespace(r=8),
+            scaling=2.0,
+        )
+    }
+
+    manager._finalize_static_lora_model_weights()
+
+    assert calls == [
+        {
+            "adapter_id": "static-id",
+            "buffer_id": 1,
+            "lora_rank": 8,
+            "scaling": 2.0,
+        }
+    ]
+
+
 def test_expert_only_adapter_rejected_from_lora_paths(tmp_path):
     adapter = tmp_path / "expert"
     _write_adapter(

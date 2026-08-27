@@ -415,6 +415,25 @@ class LoRAManager:
         self.validate_all_lora_weight_consumption()
         self.init_memory_pool()
         self.update_lora_info()
+        self._finalize_static_lora_model_weights()
+
+    def _finalize_static_lora_model_weights(self) -> None:
+        """Materialize model-specific weights derived from a static adapter."""
+
+        if self.static_kt_lora_id is None:
+            return
+
+        finalize = getattr(self.base_model, "finalize_static_lora_weights", None)
+        if finalize is None:
+            return
+
+        adapter = self.loras[self.static_kt_lora_id]
+        finalize(
+            adapter_id=self.static_kt_lora_id,
+            buffer_id=self.memory_pool.get_buffer_id(self.static_kt_lora_id),
+            lora_rank=adapter.config.r,
+            scaling=adapter.scaling,
+        )
 
     def init_lora_adapters(self, lora_paths: Optional[List[LoRARef]] = None):
         # Configs of all active LoRA adapters, indexed by LoRA ID.

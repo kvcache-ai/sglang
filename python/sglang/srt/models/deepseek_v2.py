@@ -1749,6 +1749,125 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         self.init_mha_forward()
 
+    @torch.no_grad()
+    def set_static_kv_b_lora_for_mla(
+        self,
+        adapter_id: str,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        scaling: float,
+    ) -> None:
+        """Install the static ``kv_b_proj`` delta used by MLA absorb paths.
+
+        MLA decode consumes ``w_kc`` and ``w_vc`` directly instead of invoking
+        ``kv_b_proj``. Keep the low-rank factors separate so native FP8 base
+        weights remain untouched. MHA prefill continues to use the ordinary
+        projection wrapper and therefore must not call the helpers below.
+        """
+
+        installed_adapter = getattr(self, "_mla_static_lora_adapter_id", None)
+        if installed_adapter is not None:
+            if installed_adapter != adapter_id:
+                raise RuntimeError(
+                    "MLA already contains static LoRA adapter "
+                    f"{installed_adapter!r}; cannot replace it with {adapter_id!r}."
+                )
+            return
+
+        expected_a_shape = (lora_a.shape[0], self.kv_lora_rank)
+        expected_b_shape = (
+            self.num_local_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            lora_a.shape[0],
+        )
+        if (
+            tuple(lora_a.shape) != expected_a_shape
+            or tuple(lora_b.shape) != expected_b_shape
+        ):
+            raise ValueError(
+                "DeepSeek kv_b_proj LoRA has incompatible TP-local shapes: "
+                f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}, "
+                f"expected A={expected_a_shape}, B={expected_b_shape}."
+            )
+
+        b_k, b_v = lora_b.unflatten(
+            0,
+            (
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+            ),
+        ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        self.register_buffer(
+            "_mla_static_kv_b_lora_a", lora_a.detach().clone(), persistent=False
+        )
+        self.register_buffer(
+            "_mla_static_kv_b_lora_b_k", b_k.detach().clone(), persistent=False
+        )
+        self.register_buffer(
+            "_mla_static_kv_b_lora_b_v", b_v.detach().clone(), persistent=False
+        )
+        self._mla_static_kv_b_lora_scaling = float(scaling)
+        self._mla_static_lora_adapter_id = adapter_id
+
+    def _has_static_kv_b_lora_for_mla(self) -> bool:
+        return hasattr(self, "_mla_static_kv_b_lora_a")
+
+    def _apply_static_kv_b_lora_to_mla_query(
+        self, q_nope: torch.Tensor, base_output: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._has_static_kv_b_lora_for_mla():
+            return base_output
+
+        update = torch.bmm(
+            q_nope.transpose(0, 1).to(self._mla_static_kv_b_lora_a.dtype),
+            self._mla_static_kv_b_lora_b_k,
+        )
+        update = torch.matmul(update, self._mla_static_kv_b_lora_a)
+        return base_output + update.transpose(0, 1).to(base_output.dtype).mul(
+            self._mla_static_kv_b_lora_scaling
+        )
+
+    def _apply_static_kv_b_lora_to_mla_value(
+        self, attn_output: torch.Tensor, base_output: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._has_static_kv_b_lora_for_mla():
+            return base_output
+
+        update = torch.matmul(
+            attn_output.transpose(0, 1).to(self._mla_static_kv_b_lora_a.dtype),
+            self._mla_static_kv_b_lora_a.transpose(0, 1),
+        )
+        update = torch.bmm(update, self._mla_static_kv_b_lora_b_v.transpose(1, 2))
+        update = update.transpose(0, 1).flatten(1, 2)
+        if tuple(update.shape) != tuple(base_output.shape):
+            raise RuntimeError(
+                "DeepSeek MLA value output has an incompatible shape for "
+                f"static kv_b_proj LoRA: base={tuple(base_output.shape)}, "
+                f"update={tuple(update.shape)}."
+            )
+        return base_output + update.to(base_output.dtype).mul(
+            self._mla_static_kv_b_lora_scaling
+        )
+
+    def _validate_static_kv_b_lora_attention_path(
+        self, attn_forward_method: AttnForwardMethod
+    ) -> None:
+        if not self._has_static_kv_b_lora_for_mla():
+            return
+        if attn_forward_method in (
+            AttnForwardMethod.MLA_FUSED_ROPE_CPU,
+            AttnForwardMethod.MLA_NPU,
+            AttnForwardMethod.DSA_NPU,
+        ) or (
+            _is_hip
+            and attn_forward_method
+            in (AttnForwardMethod.MLA, AttnForwardMethod.MLA_FUSED_ROPE)
+        ):
+            raise RuntimeError(
+                "DeepSeek static kv_b_proj LoRA is not implemented for "
+                f"attention path {attn_forward_method.name}; refusing to "
+                "silently omit the adapter delta."
+            )
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -1833,6 +1952,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
+        self._validate_static_kv_b_lora_attention_path(attn_forward_method)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -2165,7 +2285,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+        q_nope_out = self._apply_static_kv_b_lora_to_mla_query(
+            q_nope, q_nope_out.transpose(0, 1)
+        )
 
         if (
             self.rotary_emb is not None
@@ -2378,6 +2500,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
+        attn_bmm_output = self._apply_static_kv_b_lora_to_mla_value(
+            attn_output, attn_bmm_output
+        )
         output, _ = self.o_proj(attn_bmm_output)
 
         return output
@@ -2433,7 +2558,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-        q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
+        q_input[..., : self.kv_lora_rank] = self._apply_static_kv_b_lora_to_mla_query(
+            q_nope, q_nope_out.transpose(0, 1)
+        )
         v_input = latent_cache[..., : self.kv_lora_rank]
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
@@ -2622,7 +2749,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        attn_output = self._apply_static_kv_b_lora_to_mla_value(
+            attn_output, attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        )
         output, _ = self.o_proj(attn_output)
 
         return output
@@ -3354,6 +3483,43 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def finalize_static_lora_weights(
+        self,
+        adapter_id: str,
+        buffer_id: int,
+        lora_rank: int,
+        scaling: float,
+    ) -> None:
+        """Finalize DeepSeek weights whose optimized path bypasses a projection."""
+
+        installed_layers = 0
+        for layer in self.model.layers:
+            attention = getattr(layer, "self_attn", None)
+            projection = getattr(attention, "kv_b_proj", None)
+            has_a_buffer = hasattr(projection, "A_buffer")
+            has_b_buffer = hasattr(projection, "B_buffer")
+            if has_a_buffer != has_b_buffer:
+                raise RuntimeError(
+                    "DeepSeek kv_b_proj LoRA wrapper has incomplete A/B buffers."
+                )
+            if not has_a_buffer:
+                continue
+
+            attention.set_static_kv_b_lora_for_mla(
+                adapter_id=adapter_id,
+                lora_a=projection.A_buffer[buffer_id, :lora_rank, :],
+                lora_b=projection.B_buffer[buffer_id, :, :lora_rank],
+                scaling=scaling,
+            )
+            installed_layers += 1
+
+        if installed_layers:
+            logger.info(
+                "Installed static kv_b_proj LoRA correction for MLA on "
+                "%d local layers.",
+                installed_layers,
+            )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         """

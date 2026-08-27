@@ -50,12 +50,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
@@ -215,6 +215,10 @@ _KT_SFT_METHOD_BY_INFERENCE_METHOD = {
     "AMXINT4": "AMXINT4_SFT",
 }
 
+_KT_SFT_METHODS_REQUIRING_SHARED_BACKWARD_BB = frozenset(
+    ("AMXFP8_SFT", "AMXINT8_SFT")
+)
+
 
 def _map_kt_method_to_sft_method(method: str) -> str:
     normalized = method.upper()
@@ -224,6 +228,11 @@ def _map_kt_method_to_sft_method(method: str) -> str:
         "--kt-expert-lora-path requires one of the SFT-compatible KT methods "
         f"{sorted(_KT_SFT_METHOD_BY_INFERENCE_METHOD)}, got {method!r}."
     )
+
+
+def _configure_kt_sft_wrapper_for_serving(wrapper, method: str) -> None:
+    if method in _KT_SFT_METHODS_REQUIRING_SHARED_BACKWARD_BB:
+        wrapper.share_backward_bb = True
 
 
 def _validate_kt_sft_runtime(method: str) -> None:
@@ -5244,6 +5253,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     lora_alpha=self.kt_expert_lora_weights.alpha,
                     max_cache_depth=1,
                 )
+                _configure_kt_sft_wrapper_for_serving(self.wrapper, sft_method)
             else:
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
