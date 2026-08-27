@@ -70,18 +70,15 @@ def _validate_glm5_next_dsa_config(config: Glm5NextTextConfig) -> None:
     if config.qk_rope_head_dim != 0:
         raise ValueError("GLM-5-Next DSA is zero-RoPE and requires qk_rope_head_dim=0")
 
-    # KPool's CP/MTP and cross-layer top-k reuse contracts are deliberately
-    # not enabled yet.  Refuse those modes instead of silently entering the
-    # generic DeepSeek paths with a wider (index_topk + 3) index tensor.
+    # KPool's CP and cross-layer top-k reuse contracts are deliberately not
+    # enabled yet. Refuse those modes instead of silently entering the generic
+    # DeepSeek paths with a wider (index_topk + 3) index tensor.
     if config.index_topk_freq != 1:
         raise ValueError("GLM-5-Next KPool does not support index_topk_freq != 1")
     if config.index_topk_pattern is not None:
         raise ValueError("GLM-5-Next KPool does not support index_topk_pattern")
     if config.index_skip_topk_offset is not None:
         raise ValueError("GLM-5-Next KPool does not support index_skip_topk_offset")
-    if config.index_share_for_mtp_iteration is not False:
-        raise ValueError("GLM-5-Next KPool does not support index sharing for MTP")
-
 
 class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
     """DeepSeek MLA tensor layout with GLM's KPool4 DSA indexer."""
@@ -159,6 +156,10 @@ class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
         # still initialized by DeepseekV2AttentionMLA.
         base_config = copy.copy(config)
         base_config.index_topk = None
+        # The official checkpoint advertises MTP index sharing even when MTP
+        # is not requested. Keep that metadata on the real config, but prevent
+        # the generic DeepSeek base from enabling its unsupported MTP path.
+        base_config.index_share_for_mtp_iteration = False
         base_rope_scaling = copy.deepcopy(rope_scaling)
         super().__init__(
             config=base_config,
