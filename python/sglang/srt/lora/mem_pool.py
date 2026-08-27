@@ -3,7 +3,6 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
-from sglang.srt.distributed import divide
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -11,7 +10,6 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
-    ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
     get_normalized_target_modules,
@@ -56,6 +54,7 @@ class LoRAMemoryPool:
         max_lora_rank: int,
         target_modules: Set[str],
         base_model: torch.nn.Module,
+        lora_modules: List[Dict[str, BaseLayerWithLoRA]],
         eviction_policy: str,
         lora_added_tokens_size: int,
     ):
@@ -69,6 +68,7 @@ class LoRAMemoryPool:
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
         self.base_model: torch.nn.Module = base_model
+        self.lora_modules = lora_modules
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -100,7 +100,84 @@ class LoRAMemoryPool:
             EMPTY_SLOT
         ] * self.max_loras_per_batch
 
+        self._target_module_wrappers = self._index_target_module_wrappers()
         self.init_buffers(base_model)
+
+    def _index_target_module_wrappers(
+        self,
+    ) -> Dict[str, Dict[int, List[BaseLayerWithLoRA]]]:
+        """Index executable LoRA wrappers by exact target and transformer layer."""
+
+        result: Dict[str, Dict[int, List[BaseLayerWithLoRA]]] = {
+            target: {} for target in self.target_modules - set(EMBEDDING_NAMES)
+        }
+        for layer_idx, layer_modules in enumerate(self.lora_modules):
+            for full_name, module in layer_modules.items():
+                target = get_target_module_name(full_name, self.target_modules)
+                result.setdefault(target, {}).setdefault(layer_idx, []).append(module)
+
+        missing = sorted(target for target, layers in result.items() if not layers)
+        if missing:
+            raise ValueError(
+                "LoRA targets have no executable module in the loaded base model: "
+                f"{missing}. The adapter would otherwise be accepted but never applied."
+            )
+        return result
+
+    def _get_target_wrappers(
+        self, module_name: str, layer_idx: int
+    ) -> List[BaseLayerWithLoRA]:
+        wrappers_by_layer = self._target_module_wrappers[module_name]
+        # Hybrid architectures legitimately omit a target on some layers. The
+        # unused buffer still needs a shape, so use a real wrapper from another
+        # layer as the layout template. Layers that execute the target always
+        # use their own wrapper(s).
+        wrappers = wrappers_by_layer.get(layer_idx)
+        if wrappers:
+            return wrappers
+        return wrappers_by_layer[min(wrappers_by_layer)]
+
+    def _slice_with_target_wrappers(
+        self,
+        module_name: str,
+        layer_idx: int,
+        weight: torch.Tensor,
+        lora_type: LoRAType,
+    ) -> torch.Tensor:
+        """Apply the TP contract of the actual wrapped base module.
+
+        A target may occur more than once in a layer (for example in multiple
+        sub-stacks). Sharing one memory-pool buffer is safe only when every
+        executable wrapper produces the same local shape.
+        """
+
+        sliced_weights = []
+        for wrapper in self._get_target_wrappers(module_name, layer_idx):
+            base_layer = getattr(wrapper, "base_layer", None)
+            # Some model components deliberately use local TP=1 even when the
+            # server's global TP is larger (for example Qwen3.5 shared/attention
+            # projections). Their slice methods use base-layer local partition
+            # sizes, so the matching local rank must be supplied as well.
+            local_tp_rank = getattr(base_layer, "tp_rank", self.tp_rank)
+            if lora_type == LoRAType.LORA_A:
+                sliced = wrapper.slice_lora_a_weights(weight, local_tp_rank)
+            else:
+                sliced = wrapper.slice_lora_b_weights(weight, local_tp_rank)
+            if sliced is None:
+                raise TypeError(
+                    f"LoRA wrapper {type(wrapper).__name__} for target "
+                    f"{module_name!r} does not define TP slicing for {lora_type.name}."
+                )
+            sliced_weights.append(sliced)
+
+        shapes = {tuple(sliced.shape) for sliced in sliced_weights}
+        if len(shapes) != 1:
+            raise ValueError(
+                f"LoRA target {module_name!r} maps to incompatible TP-local "
+                f"shapes in layer {layer_idx}: {sorted(shapes)}. Use distinct "
+                "scoped target module names for modules with different layouts."
+            )
+        return sliced_weights[0]
 
     def can_support(self, config: Union[LoRAConfig, Iterable[LoRAConfig]]) -> bool:
         """
@@ -139,12 +216,15 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
+        local = self._slice_with_target_wrappers(
+            module_name,
+            layer_idx,
+            torch.empty((max_lora_dim * c, input_dim), device="meta"),
+            LoRAType.LORA_A,
+        )
         return (
             self.max_loras_per_batch,
-            max_lora_dim * c,
-            input_dim,
+            *local.shape,
         )
 
     def get_embedding_lora_A_shape(
@@ -177,12 +257,15 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            output_dim = divide(output_dim, self.tp_size)
+        local = self._slice_with_target_wrappers(
+            module_name,
+            layer_idx,
+            torch.empty((output_dim, max_lora_dim), device="meta"),
+            LoRAType.LORA_B,
+        )
         return (
             self.max_loras_per_batch,
-            output_dim,
-            max_lora_dim,
+            *local.shape,
         )
 
     def get_embedding_lora_B_shape(
@@ -396,61 +479,6 @@ class LoRAMemoryPool:
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 buffer_view.copy_(weight, non_blocking=True)
 
-        def get_column_output_sizes(target_module: str) -> Optional[Tuple[int, ...]]:
-            config = self.base_hf_config
-            if target_module == "qkv_proj":
-                hidden_size = config.hidden_size
-                head_dim = getattr(
-                    config, "head_dim", hidden_size // config.num_attention_heads
-                )
-                gate_multiplier = 1 + int(getattr(config, "attn_output_gate", False))
-                q_dim = config.num_attention_heads * head_dim * gate_multiplier
-                kv_dim = config.num_key_value_heads * head_dim
-                return q_dim, kv_dim, kv_dim
-            if target_module == "in_proj_qkv":
-                key_dim = config.linear_num_key_heads * config.linear_key_head_dim
-                value_dim = (
-                    config.linear_num_value_heads * config.linear_value_head_dim
-                )
-                return key_dim, key_dim, value_dim
-            if target_module == "gate_up_proj":
-                _, output_dim = get_hidden_dim(
-                    target_module, self.base_hf_config, self.base_model, 0
-                )
-                return output_dim // 2, output_dim // 2
-            return None
-
-        def slice_column_lora_b_if_needed(
-            target_module: str,
-            weights: Optional[torch.Tensor],
-            expected_shape: torch.Size,
-        ) -> Optional[torch.Tensor]:
-            if weights is None or weights.shape == expected_shape:
-                return weights
-            if weights.ndim != 2 or weights.shape[1] != expected_shape[1]:
-                return weights
-
-            output_sizes = get_column_output_sizes(target_module)
-            if output_sizes is not None and sum(output_sizes) == weights.shape[0]:
-                shards = []
-                offset = 0
-                for output_size in output_sizes:
-                    shard_size = output_size // self.tp_size
-                    start_idx = offset + self.tp_rank * shard_size
-                    end_idx = start_idx + shard_size
-                    shards.append(weights[start_idx:end_idx, :])
-                    offset += output_size
-                sliced = torch.cat(shards, dim=0).contiguous()
-                if sliced.shape == expected_shape:
-                    return sliced
-
-            if weights.shape[0] == expected_shape[0] * self.tp_size:
-                start_idx = self.tp_rank * expected_shape[0]
-                end_idx = start_idx + expected_shape[0]
-                return weights[start_idx:end_idx, :].contiguous()
-
-            return weights
-
         if uid is None:
             for i in range(self.num_layer):
                 for k in self.A_buffer.keys():
@@ -481,56 +509,26 @@ class LoRAMemoryPool:
                     temp_B_buffer[target_module] = weights
 
             if self.tp_size > 1:
-                cur_layer_modules = lora_modules[layer_id]
-                for module_name, module in cur_layer_modules.items():
-                    target_module = get_target_module_name(
-                        module_name, self.target_modules
-                    )
-
-                    if temp_A_buffer[target_module] is None:
-                        # Skip weight slicing if the weight is not present in the adapter
-                        continue
-
-                    temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                        temp_A_buffer[target_module], self.tp_rank
-                    )
-                    temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                        temp_B_buffer[target_module], self.tp_rank
-                    )
-
-                for target_module in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-                    weights = temp_A_buffer.get(target_module)
-                    if weights is None or target_module not in self.A_buffer:
-                        continue
-
-                    c = get_stacked_multiply(target_module)
-                    expected_shape = self.A_buffer[target_module][layer_id][
-                        buffer_id, : lora_rank * c, :
-                    ].shape
-                    if weights.shape == expected_shape:
-                        continue
-                    if (
-                        weights.ndim == 2
-                        and weights.shape[0] == expected_shape[0]
-                        and weights.shape[1] == expected_shape[1] * self.tp_size
-                    ):
-                        start_idx = self.tp_rank * expected_shape[1]
-                        end_idx = start_idx + expected_shape[1]
-                        temp_A_buffer[target_module] = weights[
-                            :, start_idx:end_idx
-                        ].contiguous()
-
+                for target_module, weights in temp_A_buffer.items():
+                    if weights is not None:
+                        temp_A_buffer[target_module] = (
+                            self._slice_with_target_wrappers(
+                                target_module,
+                                layer_id,
+                                weights,
+                                LoRAType.LORA_A,
+                            )
+                        )
                 for target_module, weights in temp_B_buffer.items():
-                    if weights is None:
-                        continue
-                    expected_shape = self.B_buffer[target_module][layer_id][
-                        buffer_id, :, :lora_rank
-                    ].shape
-                    temp_B_buffer[target_module] = slice_column_lora_b_if_needed(
-                        target_module,
-                        weights,
-                        expected_shape,
-                    )
+                    if weights is not None:
+                        temp_B_buffer[target_module] = (
+                            self._slice_with_target_wrappers(
+                                target_module,
+                                layer_id,
+                                weights,
+                                LoRAType.LORA_B,
+                            )
+                        )
 
             for name, weights in temp_A_buffer.items():
                 c = get_stacked_multiply(name)

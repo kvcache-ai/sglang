@@ -93,6 +93,39 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 
+def get_static_kt_lora_ref(server_args: ServerArgs) -> Optional[LoRARef]:
+    """Return the request-selected half of a static KT composite adapter."""
+
+    composite_name = getattr(server_args, "kt_composite_lora_name", None)
+    composite_id = getattr(server_args, "kt_composite_lora_id", None)
+    if composite_name is None and composite_id is None:
+        return None
+    if not composite_name or not composite_id:
+        raise ValueError(
+            "KT composite LoRA identity is incomplete: both "
+            "kt_composite_lora_name and kt_composite_lora_id must be set."
+        )
+
+    lora_paths = getattr(server_args, "lora_paths", None)
+    if (
+        not isinstance(lora_paths, list)
+        or len(lora_paths) != 1
+        or not isinstance(lora_paths[0], LoRARef)
+    ):
+        raise ValueError(
+            "KT composite LoRA must have exactly one request-selected "
+            "non-expert LoRARef."
+        )
+
+    lora_ref = lora_paths[0]
+    if lora_ref.lora_name != composite_name or lora_ref.lora_id != composite_id:
+        raise ValueError(
+            "KT composite LoRA identity does not match its request-selected "
+            "non-expert LoRARef."
+        )
+    return lora_ref
+
+
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
 
@@ -636,6 +669,14 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
 
         try:
+            static_kt_lora = get_static_kt_lora_ref(self.server_args)
+            if static_kt_lora is not None:
+                raise ValueError(
+                    "Dynamic LoRA loading is disabled because KT expert LoRA is "
+                    f"statically paired with adapter {static_kt_lora.lora_name!r}. "
+                    "Restart the server to change this adapter."
+                )
+
             if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
@@ -714,6 +755,14 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
 
         try:
+            static_kt_lora = get_static_kt_lora_ref(self.server_args)
+            if static_kt_lora is not None:
+                raise ValueError(
+                    "Dynamic LoRA loading is disabled because KT expert LoRA is "
+                    f"statically paired with adapter {static_kt_lora.lora_name!r}. "
+                    "Restart the server to change this adapter."
+                )
+
             if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
@@ -784,6 +833,14 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
 
         try:
+            static_kt_lora = get_static_kt_lora_ref(self.server_args)
+            if static_kt_lora is not None:
+                raise ValueError(
+                    "LoRA unloading is disabled because KT expert LoRA is "
+                    f"statically paired with adapter {static_kt_lora.lora_name!r}. "
+                    "Restart the server to remove or change this adapter."
+                )
+
             if not self.server_args.enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."

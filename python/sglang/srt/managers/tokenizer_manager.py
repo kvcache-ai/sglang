@@ -75,7 +75,10 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
-from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
+from sglang.srt.managers.tokenizer_communicator_mixin import (
+    TokenizerCommunicatorMixin,
+    get_static_kt_lora_ref,
+)
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
@@ -2171,6 +2174,30 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
+        static_kt_lora = get_static_kt_lora_ref(self.server_args)
+        if static_kt_lora is not None:
+            expected_name = static_kt_lora.lora_name
+            if is_health_check_generate_req(obj):
+                # Health checks are internal requests. Bind them to the complete
+                # static-expert + dynamic-nonexpert adapter so they exercise the
+                # same executable model as user traffic.
+                obj.lora_path = expected_name
+
+            requested_names = (
+                [obj.lora_path]
+                if isinstance(obj.lora_path, str)
+                else obj.lora_path
+            )
+            if not requested_names or any(
+                name != expected_name for name in requested_names
+            ):
+                raise ValueError(
+                    "This server has KT expert LoRA statically paired with "
+                    f"adapter {expected_name!r}. Every request in the batch must "
+                    "select exactly that adapter; base, mixed, and other-adapter "
+                    "requests are not supported."
+                )
+
         if not obj.lora_path:
             return
 

@@ -842,9 +842,7 @@ class CudaGraphRunner:
             )
 
         if self.model_runner.server_args.enable_lora:
-            # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
-            # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
-            lora_ids = [None] * bs
+            lora_ids = self.model_runner.lora_manager.get_internal_lora_ids(bs)
         else:
             lora_ids = None
 

@@ -2133,7 +2133,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if self.server_args.enable_lora:
-            lora_ids = [None] * batch_size
+            lora_ids = self.lora_manager.get_internal_lora_ids(batch_size)
         else:
             lora_ids = None
 

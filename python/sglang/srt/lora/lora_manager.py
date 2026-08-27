@@ -16,7 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 
@@ -45,6 +45,18 @@ from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _lora_weight_kind(name: str) -> Optional[str]:
+    if ".lora_A" in name or ".lora_embedding_A" in name:
+        return "A"
+    if ".lora_B" in name or ".lora_embedding_B" in name:
+        return "B"
+    return None
+
+
+def _is_routed_expert_lora_weight(name: str) -> bool:
+    return ".mlp.experts." in name and _lora_weight_kind(name) is not None
 
 
 def _get_lora_hf_config(base_hf_config: AutoConfig) -> AutoConfig:
@@ -91,6 +103,9 @@ class LoRAManager:
         self.lora_added_tokens_size: Optional[int] = None
         self.enable_lora_overlap_loading: Optional[bool] = (
             server_args.enable_lora_overlap_loading
+        )
+        self.static_kt_lora_id: Optional[str] = getattr(
+            server_args, "kt_composite_lora_id", None
         )
 
         # Store eviction policy from server args
@@ -156,10 +171,20 @@ class LoRAManager:
             # load weights
             self.load_lora_weights(lora_ref)
 
+            # Initial adapters are loaded before executable modules are wrapped;
+            # they are audited together immediately after init_lora_modules().
+            # Dynamically loaded adapters can be audited here.
+            if hasattr(self, "lora_modules"):
+                self.validate_lora_weight_consumption(
+                    self.loras[lora_ref.lora_id], lora_ref.lora_name
+                )
+
             # keep metadata for displayed messages
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            self.configs.pop(lora_ref.lora_id, None)
+            self.loras.pop(lora_ref.lora_id, None)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
@@ -279,9 +304,28 @@ class LoRAManager:
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
+    def _validate_static_kt_lora_batch(
+        self, lora_ids: Optional[List[Optional[str]]]
+    ) -> None:
+        if self.static_kt_lora_id is not None:
+            if not lora_ids or any(
+                lora_id != self.static_kt_lora_id for lora_id in lora_ids
+            ):
+                raise RuntimeError(
+                    "Static KT expert LoRA requires every sequence in the "
+                    f"forward batch to use adapter ID {self.static_kt_lora_id!r}; "
+                    f"got {lora_ids!r}."
+                )
+
+    def get_internal_lora_ids(self, batch_size: int) -> List[Optional[str]]:
+        """Select the executable adapter for internal warmup/capture batches."""
+
+        return [self.static_kt_lora_id] * batch_size
+
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
+        self._validate_static_kt_lora_batch(forward_batch.lora_ids)
 
         use_cuda_graph = (
             hasattr(self, "max_bs_in_cuda_graph")
@@ -368,6 +412,7 @@ class LoRAManager:
             target_modules=target_modules,
         )
         self.init_lora_modules()
+        self.validate_all_lora_weight_consumption()
         self.init_memory_pool()
         self.update_lora_info()
 
@@ -495,7 +540,22 @@ class LoRAManager:
             self.load_config,
             self.lora_backend,
         )
-        lora_adapter.initialize_weights()
+        source_weight_names = []
+        process_weight = lora_adapter._process_weight
+
+        def audited_process_weight(name, weight):
+            source_weight_names.append(name)
+            return process_weight(name, weight)
+
+        # LoRAAdapter historically drops unsupported top-level tensors. Record
+        # iterator input here so the post-load audit can prove full consumption
+        # without loading the checkpoint a second time.
+        lora_adapter._process_weight = audited_process_weight
+        try:
+            lora_adapter.initialize_weights()
+        finally:
+            del lora_adapter._process_weight
+        lora_adapter._source_lora_weight_names = tuple(source_weight_names)
 
         # If we want to overlap loading LoRA adapters with compute, they must be pinned in CPU memory
         if self.enable_lora_overlap_loading:
@@ -517,6 +577,7 @@ class LoRAManager:
             self.lora_backend,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
+        lora_adapter._source_lora_weight_names = tuple(tensors)
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_adapter_from_tensors(
@@ -543,9 +604,16 @@ class LoRAManager:
 
             self.load_lora_weights_from_tensors(lora_ref, tensors)
 
+            if hasattr(self, "lora_modules"):
+                self.validate_lora_weight_consumption(
+                    self.loras[lora_ref.lora_id], lora_ref.lora_name
+                )
+
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            self.configs.pop(lora_ref.lora_id, None)
+            self.loras.pop(lora_ref.lora_id, None)
             return self.create_lora_update_result(
                 success=False,
                 error_message=str(e),
@@ -553,8 +621,28 @@ class LoRAManager:
 
         return self.create_lora_update_result(success=True)
 
+    def get_runtime_target_modules(self) -> Set[str]:
+        # The CLI target set may intentionally be broader than the current
+        # model (notably --lora-target-modules all). Allocate only targets that
+        # were materialized as executable wrappers. Keep self.target_modules
+        # unchanged so dynamic-adapter validation can still report the user's
+        # declared contract, while memory_pool.can_support rejects targets the
+        # model cannot actually execute.
+        runtime_target_modules = set()
+        for layer_modules in self.lora_modules:
+            for module_name in layer_modules:
+                runtime_target_modules.add(
+                    get_target_module_name(module_name, self.target_modules)
+                )
+        if self.embed_tokens_module is not None:
+            runtime_target_modules.add("embed_tokens")
+        if self.lm_head_module is not None:
+            runtime_target_modules.add("lm_head")
+        return runtime_target_modules
+
     def init_memory_pool(self):
         """(Re)initialize the LoRA memory pool based on the current configurations."""
+        runtime_target_modules = self.get_runtime_target_modules()
         self.memory_pool = LoRAMemoryPool(
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,
@@ -562,14 +650,18 @@ class LoRAManager:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             max_lora_rank=self.max_lora_rank,
-            target_modules=self.target_modules,
+            target_modules=runtime_target_modules,
             base_model=self.base_model,
+            lora_modules=self.lora_modules,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
         )
 
-        # Initializing memory pool with base model
-        self.fetch_new_loras({None})
+        # A composite KT server cannot execute the base model: its CPU expert
+        # half is already fixed to one adapter. Preload the matching non-expert
+        # half so internal warmup can use it before any scheduler request runs.
+        initial_lora_id = self.static_kt_lora_id
+        self.fetch_new_loras({initial_lora_id})
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)
@@ -648,9 +740,163 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
-            # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
-                layer_id = get_layer_id(module_name)
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
+            # Resolve complete path segments, never substrings (for example,
+            # target "gate" must not capture "gate_up_proj").
+            try:
+                get_target_module_name(module_name, self.target_modules)
+            except ValueError:
+                continue
+
+            layer_id = get_layer_id(module_name)
+            if layer_id is None:
+                raise ValueError(
+                    f"LoRA target module {module_name!r} is not associated with "
+                    "a transformer layer and cannot use the layerwise LoRA pool."
                 )
+            self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                module_name, module
+            )
+
+    def _wrappers_for_target(
+        self, layer_id: int, target_module: str
+    ) -> List[BaseLayerWithLoRA]:
+        wrappers = []
+        for full_name, module in self.lora_modules[layer_id].items():
+            try:
+                resolved = get_target_module_name(full_name, self.target_modules)
+            except ValueError:
+                continue
+            if resolved == target_module:
+                wrappers.append(module)
+        return wrappers
+
+    def validate_lora_weight_consumption(
+        self, adapter: LoRAAdapter, adapter_name: str
+    ) -> None:
+        """Fail if any loaded non-expert LoRA tensor has no executable consumer."""
+
+        embedding_slots = set()
+        for weight_name in adapter.embedding_layers:
+            kind = _lora_weight_kind(weight_name)
+            if kind is not None:
+                embedding_slots.add(
+                    (
+                        get_target_module_name(weight_name, self.target_modules),
+                        kind,
+                    )
+                )
+
+        added_token_weight_names = set(
+            getattr(adapter, "added_tokens_embeddings", {})
+        )
+        for source_name in getattr(adapter, "_source_lora_weight_names", ()):
+            kind = _lora_weight_kind(source_name)
+            if _is_routed_expert_lora_weight(source_name):
+                raise ValueError(
+                    f"LoRA adapter {adapter_name!r} routed-expert tensor "
+                    f"{source_name!r} cannot use the ordinary LoRA memory pool. "
+                    "Load a converted expert-only adapter with "
+                    "--kt-expert-lora-path, or pass one merged adapter through "
+                    "--lora-paths at server startup."
+                )
+            if get_layer_id(source_name) is not None:
+                continue
+            if source_name in added_token_weight_names:
+                continue
+            if kind is None:
+                raise ValueError(
+                    f"LoRA adapter {adapter_name!r} contains unsupported source "
+                    f"tensor {source_name!r}; every adapter tensor must have an "
+                    "explicit runtime consumer."
+                )
+
+            normalized_source_name = source_name.replace(
+                "unembed_tokens", "lm_head"
+            )
+            if "embed_tokens" in normalized_source_name or "lm_head" in normalized_source_name:
+                try:
+                    source_target = get_target_module_name(
+                        normalized_source_name, self.target_modules
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"LoRA adapter {adapter_name!r} source tensor "
+                        f"{source_name!r} was not assigned to any runtime target."
+                    ) from exc
+                if (source_target, kind) in embedding_slots:
+                    continue
+
+            raise ValueError(
+                f"LoRA adapter {adapter_name!r} source tensor {source_name!r} "
+                "was not archived by the LoRA loader and would otherwise be "
+                "silently ignored."
+            )
+
+        consumed_slots: Set[Tuple[int, str, str]] = set()
+        for layer_id, layer in enumerate(adapter.layers):
+            for weight_name in layer.weights:
+                if _is_routed_expert_lora_weight(weight_name):
+                    raise ValueError(
+                        f"LoRA adapter {adapter_name!r} routed-expert tensor "
+                        f"{weight_name!r} cannot use the ordinary LoRA memory pool."
+                    )
+                kind = _lora_weight_kind(weight_name)
+                if kind is None:
+                    raise ValueError(
+                        f"LoRA adapter {adapter_name!r} contains unsupported tensor "
+                        f"{weight_name!r}; expected a LoRA A or B tensor."
+                    )
+                try:
+                    target_module = get_target_module_name(
+                        weight_name, self.target_modules
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"LoRA adapter {adapter_name!r} tensor {weight_name!r} "
+                        "does not match any initialized target module and would "
+                        "otherwise be silently ignored."
+                    ) from exc
+
+                if not self._wrappers_for_target(layer_id, target_module):
+                    raise ValueError(
+                        f"LoRA adapter {adapter_name!r} tensor {weight_name!r} "
+                        f"targets {target_module!r}, but layer {layer_id} has no "
+                        "executable LoRA wrapper for that target."
+                    )
+
+                slot = (layer_id, target_module, kind)
+                if slot in consumed_slots:
+                    raise ValueError(
+                        f"LoRA adapter {adapter_name!r} has multiple tensors for "
+                        f"the same runtime buffer slot {slot}: {weight_name!r}. "
+                        "Use distinct scoped target module names."
+                    )
+                consumed_slots.add(slot)
+
+        for weight_name in adapter.embedding_layers:
+            kind = _lora_weight_kind(weight_name)
+            try:
+                target_module = get_target_module_name(
+                    weight_name, self.target_modules
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"LoRA adapter {adapter_name!r} embedding tensor "
+                    f"{weight_name!r} is not consumed by any initialized target."
+                ) from exc
+            consumer = (
+                self.embed_tokens_module
+                if target_module == "embed_tokens"
+                else self.lm_head_module
+            )
+            if kind is None or consumer is None:
+                raise ValueError(
+                    f"LoRA adapter {adapter_name!r} embedding tensor "
+                    f"{weight_name!r} has no executable LoRA consumer."
+                )
+
+    def validate_all_lora_weight_consumption(self) -> None:
+        for lora_id, adapter in self.loras.items():
+            lora_ref = self.lora_refs.get(lora_id)
+            adapter_name = lora_ref.lora_name if lora_ref is not None else lora_id
+            self.validate_lora_weight_consumption(adapter, adapter_name)
