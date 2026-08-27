@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -7,12 +8,107 @@ from sglang.srt.lora.layers import (
     TensorOutputLinearWithLoRA,
     get_lora_layer,
 )
+from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.triton_ops import chunked_sgmv_lora_expand_forward
+from sglang.srt.lora.triton_ops.chunked_sgmv_expand import (
+    _chunked_lora_expand_kernel,
+)
+from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import (
+    _chunked_lora_shrink_kernel,
+)
+from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
 )
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
-from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+
+
+def test_csgmv_cache_keys_cover_shape_dependent_constants():
+    expand = {
+        "NUM_SLICES": 1,
+        "OUTPUT_DIM": 4096,
+        "MAX_RANK": 8,
+        "BLOCK_M": 16,
+        "BLOCK_N": 64,
+        "BLOCK_K": 16,
+    }
+    expand_key = _chunked_lora_expand_kernel.key_fn((), expand)
+    for name, other in (
+        ("NUM_SLICES", 2),
+        ("OUTPUT_DIM", 32),
+        ("MAX_RANK", 16),
+        ("BLOCK_M", 32),
+        ("BLOCK_N", 32),
+        ("BLOCK_K", 32),
+    ):
+        assert (
+            _chunked_lora_expand_kernel.key_fn((), {**expand, name: other})
+            != expand_key
+        )
+
+    shrink = {
+        "N": 8,
+        "K": 512,
+        "NUM_SLICES": 1,
+        "BLOCK_M": 16,
+        "BLOCK_N": 16,
+        "BLOCK_K": 256,
+    }
+    shrink_key = _chunked_lora_shrink_kernel.key_fn((), shrink)
+    for name, other in (
+        ("N", 16),
+        ("K", 1024),
+        ("NUM_SLICES", 2),
+        ("BLOCK_M", 32),
+        ("BLOCK_N", 32),
+        ("BLOCK_K", 128),
+    ):
+        assert (
+            _chunked_lora_shrink_kernel.key_fn((), {**shrink, name: other})
+            != shrink_key
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_csgmv_expand_does_not_reuse_kernel_across_output_dimensions():
+    _chunked_lora_expand_kernel._clear_cache()
+    tokens, rank = 19, 8
+    batch_info = LoRABatchInfo(
+        use_cuda_graph=False,
+        bs=1,
+        num_segments=2,
+        seg_indptr=torch.tensor([0, 16, 19], dtype=torch.int32, device="cuda"),
+        weight_indices=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        lora_ranks=torch.tensor([rank], dtype=torch.int32, device="cuda"),
+        scalings=torch.tensor([2.0], dtype=torch.float32, device="cuda"),
+        max_len=16,
+        seg_lens=None,
+        permutation=torch.arange(tokens, dtype=torch.int64, device="cuda"),
+    )
+    hidden = torch.randn(tokens, rank, dtype=torch.bfloat16, device="cuda")
+
+    for output_dim in (6144, 32):
+        weights = torch.randn(
+            1, output_dim, rank, dtype=torch.bfloat16, device="cuda"
+        )
+        base = torch.randn(
+            tokens, output_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        expected = base + (hidden @ weights[0].T) * 2.0
+        actual = chunked_sgmv_lora_expand_forward(
+            hidden,
+            weights,
+            batch_info,
+            torch.tensor([0, output_dim], dtype=torch.int32, device="cuda"),
+            output_dim,
+            base_output=base,
+        )
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    assert len(_chunked_lora_expand_kernel.kernel_cache) == 2
+    _chunked_lora_expand_kernel._clear_cache()
 
 
 class _TorchLoRABackend:
@@ -119,11 +215,14 @@ def test_qwen35_moe_all_target_dimensions_use_shared_expert_size():
     assert model.get_hidden_dim("down_proj", 0) == (1024, 4096)
 
 
-def test_qwen35_conditional_filter_accepts_every_nonexpert_training_target():
+def test_qwen35_conditional_filter_accepts_runtime_nonexpert_targets():
     model = object.__new__(Qwen3_5MoeForConditionalGeneration)
     accepted = {
-        "model.language_model.layers.0.self_attn.qkv_proj",
-        "model.language_model.layers.0.self_attn.o_proj",
+        # Full-attention projections are direct decoder-layer children.
+        "model.language_model.layers.0.qkv_proj",
+        "model.language_model.layers.0.o_proj",
+        "model.layers.3.qkv_proj",
+        "model.layers.3.o_proj",
         "model.language_model.layers.1.linear_attn.in_proj_qkv",
         "model.language_model.layers.1.linear_attn.in_proj_z",
         "model.language_model.layers.1.linear_attn.in_proj_b",
@@ -145,3 +244,53 @@ def test_qwen35_conditional_filter_accepts_every_nonexpert_training_target():
     }
     for module_name in rejected:
         assert not model.should_apply_lora(module_name), module_name
+
+
+def test_qwen35_flat_attention_modules_are_wrapped_and_audited():
+    class _RuntimeModel(nn.Module):
+        should_apply_lora = Qwen3_5MoeForConditionalGeneration.should_apply_lora
+
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([nn.Module() for _ in range(4)])
+            self.model.layers[3].qkv_proj = nn.Linear(4, 6, bias=False)
+            self.model.layers[3].o_proj = nn.Linear(6, 4, bias=False)
+
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.base_model = _RuntimeModel()
+    manager.base_hf_config = SimpleNamespace(num_hidden_layers=4)
+    manager.lora_backend = _TorchLoRABackend()
+    manager.target_modules = {"qkv_proj", "o_proj"}
+    manager.init_lora_modules()
+
+    assert set(manager.lora_modules[3]) == {
+        "model.layers.3.qkv_proj",
+        "model.layers.3.o_proj",
+    }
+    adapter = SimpleNamespace(
+        layers=[
+            SimpleNamespace(weights={}),
+            SimpleNamespace(weights={}),
+            SimpleNamespace(weights={}),
+            SimpleNamespace(
+                weights={
+                    "model.layers.3.self_attn.qkv_proj.lora_A.weight": torch.empty(
+                        2, 4
+                    ),
+                    "model.layers.3.self_attn.qkv_proj.lora_B.weight": torch.empty(
+                        6, 2
+                    ),
+                    "model.layers.3.self_attn.o_proj.lora_A.weight": torch.empty(
+                        2, 6
+                    ),
+                    "model.layers.3.self_attn.o_proj.lora_B.weight": torch.empty(
+                        4, 2
+                    ),
+                }
+            ),
+        ],
+        embedding_layers={},
+        _source_lora_weight_names=(),
+    )
+    manager.validate_lora_weight_consumption(adapter, "qwen35")

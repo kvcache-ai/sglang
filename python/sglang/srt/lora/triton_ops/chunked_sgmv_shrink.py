@@ -7,7 +7,14 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
+    lambda _, kwargs: (
+        kwargs["N"],
+        kwargs["K"],
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["BLOCK_N"],
+        kwargs["BLOCK_K"],
+    )
 )
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_shrink_kernel(

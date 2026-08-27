@@ -89,7 +89,7 @@ cached_get_processor = lru_cache(get_processor)
 _LORA_PREFIXES = ("", "base_model.", "base_model.model.", "base_model.model.model.")
 _QWEN3_5_LORA_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(\d+)\.(?:"
-    r"self_attn\.(?:qkv_proj|o_proj)|"
+    r"(?:qkv_proj|o_proj)|"
     r"linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)|"
     r"mlp\.(?:gate|shared_expert_gate|shared_expert\.(?:gate_up_proj|down_proj))"
     r")$"
