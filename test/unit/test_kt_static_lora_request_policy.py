@@ -22,12 +22,41 @@ class _Registry:
     def __init__(self, adapter):
         self.adapter = adapter
         self.acquired = None
+        self.released = None
+        self.acquire_calls = []
+        self.release_calls = []
 
     async def acquire(self, names):
         self.acquired = names
+        self.acquire_calls.append(names)
         if isinstance(names, list):
             return [self.adapter.lora_id for _ in names]
         return self.adapter.lora_id
+
+    async def release(self, lora_id):
+        self.released = lora_id
+        self.release_calls.append(lora_id)
+
+    async def get_unregistered_loras(self, _):
+        return set()
+
+
+class _AsyncContext:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+
+class _PauseContext(_AsyncContext):
+    async def wait_for(self, predicate):
+        assert predicate()
+
+
+class _ReaderLock:
+    def __init__(self):
+        self.reader_lock = _AsyncContext()
 
 
 def _static_manager():
@@ -55,6 +84,35 @@ def _static_manager():
 
     manager._resolve_lora_path = resolve_lora_path
     return manager, adapter
+
+
+def _tokenizer_manager_for_validation(adapter=None):
+    manager = TokenizerManager.__new__(TokenizerManager)
+    manager.server_args = SimpleNamespace(
+        language_only=False,
+        tokenizer_worker_num=1,
+        enable_lora=True,
+        max_loaded_loras=1,
+        kt_expert_lora_path="/converted/expert" if adapter is not None else None,
+        kt_composite_lora_name=(adapter.lora_name if adapter is not None else None),
+        kt_composite_lora_id=adapter.lora_id if adapter is not None else None,
+        lora_paths=[adapter] if adapter is not None else [],
+    )
+    manager.rid_to_state = {}
+    manager.lora_registry = _Registry(
+        adapter or LoRARef("static-id", "production-adapter", "/converted/nonexpert")
+    )
+    manager.lora_ref_cache = {}
+    manager.auto_create_handle_loop = lambda: None
+    manager._req_stats_init = lambda obj, _: manager.rid_to_state.__setitem__(
+        obj.rid, object()
+    )
+    manager.request_logger = SimpleNamespace(log_received_request=lambda *_: None)
+    manager.tokenizer = None
+    manager.is_pause = False
+    manager.is_pause_cond = _PauseContext()
+    manager.model_update_lock = _ReaderLock()
+    return manager
 
 
 def test_static_kt_lora_ref_requires_exactly_one_matching_dynamic_adapter():
@@ -116,7 +174,11 @@ def test_static_kt_lora_accepts_only_the_paired_adapter(requested):
 
     asyncio.run(TokenizerManager._validate_and_resolve_lora(manager, request))
 
-    assert manager.lora_registry.acquired == requested
+    assert manager.lora_registry.acquired is None
+    assert manager.lora_registry.released is None
+    assert manager.lora_registry.acquire_calls == []
+    assert manager.lora_registry.release_calls == []
+    assert not TokenizerManager._uses_lora_registry_references(manager)
     expected_id = (
         adapter.lora_id
         if isinstance(requested, str)
@@ -137,6 +199,102 @@ def test_static_kt_lora_health_check_is_bound_to_complete_adapter():
 
     assert request.lora_path == adapter.lora_name
     assert request.lora_id == adapter.lora_id
+    assert manager.lora_registry.acquired is None
+    assert manager.lora_registry.released is None
+    assert manager.lora_registry.acquire_calls == []
+    assert manager.lora_registry.release_calls == []
+    assert not TokenizerManager._uses_lora_registry_references(manager)
+
+
+def test_ordinary_dynamic_lora_keeps_registry_reference_semantics():
+    manager = _tokenizer_manager_for_validation()
+    request = SimpleNamespace(
+        rid="dynamic-request",
+        lora_path="production-adapter",
+        lora_id=None,
+    )
+
+    asyncio.run(TokenizerManager._validate_and_resolve_lora(manager, request))
+
+    assert request.lora_id == "static-id"
+    assert manager.lora_registry.acquire_calls == ["production-adapter"]
+    assert manager.lora_registry.release_calls == []
+    assert manager._uses_lora_registry_references()
+
+
+def test_rejected_static_lora_request_cleans_tokenizer_state():
+    adapter = LoRARef("static-id", "production-adapter", "/converted/nonexpert")
+    manager = _tokenizer_manager_for_validation(adapter)
+    request = SimpleNamespace(
+        rid="rejected-request",
+        is_single=True,
+        lora_path=None,
+        lora_id="caller-controlled-id",
+        normalize_batch_and_arguments=lambda: None,
+    )
+
+    async def consume():
+        stream = TokenizerManager.generate_request(manager, request)
+        with pytest.raises(ValueError, match="Every request in the batch"):
+            await anext(stream)
+
+    asyncio.run(consume())
+
+    assert manager.rid_to_state == {}
+    assert request.lora_id is None
+    assert manager.lora_registry.released is None
+    assert manager.lora_registry.acquire_calls == []
+    assert manager.lora_registry.release_calls == []
+
+
+def test_cancelled_lora_validation_cleans_tokenizer_state():
+    manager = _tokenizer_manager_for_validation()
+
+    async def cancel(_):
+        raise asyncio.CancelledError
+
+    manager._validate_and_resolve_lora = cancel
+    request = SimpleNamespace(
+        rid="cancelled-request",
+        is_single=True,
+        lora_id=None,
+        normalize_batch_and_arguments=lambda: None,
+    )
+
+    async def consume():
+        stream = TokenizerManager.generate_request(manager, request)
+        with pytest.raises(asyncio.CancelledError):
+            await anext(stream)
+
+    asyncio.run(consume())
+
+    assert manager.rid_to_state == {}
+
+
+def test_failed_lora_validation_releases_acquired_adapter_reference():
+    manager = _tokenizer_manager_for_validation()
+
+    async def acquire_then_reject(obj):
+        obj.lora_id = "static-id"
+        raise ValueError("post-acquire rejection")
+
+    manager._validate_and_resolve_lora = acquire_then_reject
+    request = SimpleNamespace(
+        rid="post-acquire-rejection",
+        is_single=True,
+        lora_id=None,
+        normalize_batch_and_arguments=lambda: None,
+    )
+
+    async def consume():
+        stream = TokenizerManager.generate_request(manager, request)
+        with pytest.raises(ValueError, match="post-acquire rejection"):
+            await anext(stream)
+
+    asyncio.run(consume())
+
+    assert manager.rid_to_state == {}
+    assert manager.lora_registry.released == "static-id"
 
 
 def test_static_kt_lora_disables_dynamic_load_and_unload():
