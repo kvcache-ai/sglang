@@ -245,12 +245,11 @@ class TestGlm5NextDSAAttention(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, message):
                     _build(self.module.Glm5NextDSAAttention, config=config)
 
-    def test_rejects_cp_mtp_and_index_sharing_modes(self):
+    def test_rejects_cp_mtp_and_cross_layer_topk_modes(self):
         invalid_configs = (
             ("index_topk_freq", 2),
             ("index_topk_pattern", "N"),
             ("index_skip_topk_offset", 1),
-            ("index_share_for_mtp_iteration", True),
         )
         for field, value in invalid_configs:
             with self.subTest(field=field):
@@ -258,12 +257,27 @@ class TestGlm5NextDSAAttention(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _build(self.module.Glm5NextDSAAttention, config=config)
 
+        mtp_config = _Glm5NextTextConfig(index_share_for_mtp_iteration=True)
         with self.assertRaisesRegex(NotImplementedError, "MTP"):
-            _build(self.module.Glm5NextDSAAttention, is_nextn=True)
+            _build(
+                self.module.Glm5NextDSAAttention,
+                config=mtp_config,
+                is_nextn=True,
+            )
 
         cp_module = _load_module(cp_enabled=True)
         with self.assertRaisesRegex(NotImplementedError, "context parallel"):
             _build(cp_module.Glm5NextDSAAttention)
+
+    def test_accepts_official_mtp_index_sharing_metadata_for_base_inference(self):
+        config = _Glm5NextTextConfig(index_share_for_mtp_iteration=True)
+        attention = _build(self.module.Glm5NextDSAAttention, config=config)
+
+        self.assertTrue(config.index_share_for_mtp_iteration)
+        self.assertIs(attention.config, config)
+        self.assertFalse(
+            attention.base_kwargs["config"].index_share_for_mtp_iteration
+        )
 
     def test_rejects_rope_or_dimension_drift(self):
         with self.assertRaisesRegex(ValueError, "skip_rope=True"):
