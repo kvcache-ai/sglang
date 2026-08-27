@@ -90,7 +90,8 @@ _LORA_PREFIXES = ("", "base_model.", "base_model.model.", "base_model.model.mode
 _QWEN3_5_LORA_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(\d+)\.(?:"
     r"self_attn\.(?:qkv_proj|o_proj)|"
-    r"linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)"
+    r"linear_attn\.(?:in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|out_proj)|"
+    r"mlp\.(?:gate|shared_expert_gate|shared_expert\.(?:gate_up_proj|down_proj))"
     r")$"
 )
 
@@ -1045,8 +1046,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         config = self.config
         hidden_size = config.hidden_size
 
-        head_dim = getattr(
-            config, "head_dim", hidden_size // config.num_attention_heads
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or hidden_size // config.num_attention_heads
         )
         attn_gate_multiplier = 1 + int(getattr(config, "attn_output_gate", True))
         full_q_dim = config.num_attention_heads * head_dim * attn_gate_multiplier
@@ -1056,9 +1058,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         linear_value_dim = (
             config.linear_num_value_heads * config.linear_value_head_dim
         )
-        intermediate_size = getattr(config, "intermediate_size", None)
-        if intermediate_size is None:
-            intermediate_size = getattr(config, "moe_intermediate_size", None)
+        if config.model_type == "qwen3_5_moe_text":
+            intermediate_size = config.shared_expert_intermediate_size
+        else:
+            intermediate_size = config.intermediate_size
 
         if module_name == "qkv_proj":
             return hidden_size, full_q_dim + 2 * full_kv_dim
@@ -1072,17 +1075,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             return hidden_size, config.linear_num_value_heads
         elif module_name == "out_proj":
             return linear_value_dim, hidden_size
+        elif module_name == "gate":
+            return hidden_size, config.num_experts
+        elif module_name == "shared_expert_gate":
+            return hidden_size, 1
         elif module_name == "gate_up_proj":
-            if intermediate_size is None:
-                raise NotImplementedError(
-                    "Qwen3.5 config does not define an MLP intermediate size"
-                )
             return hidden_size, intermediate_size * 2
         elif module_name == "down_proj":
-            if intermediate_size is None:
-                raise NotImplementedError(
-                    "Qwen3.5 config does not define an MLP intermediate size"
-                )
             return intermediate_size, hidden_size
         elif module_name == "embed_tokens":
             return config.vocab_size, hidden_size

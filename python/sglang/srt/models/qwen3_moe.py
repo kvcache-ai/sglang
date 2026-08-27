@@ -1006,6 +1006,36 @@ class Qwen3MoeForCausalLM(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        """Return full, pre-TP dimensions for supported LoRA projections."""
+        del layer_idx
+        config = self.config
+        hidden_size = config.hidden_size
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or hidden_size // config.num_attention_heads
+        )
+
+        if module_name == "qkv_proj":
+            return hidden_size, head_dim * (
+                config.num_attention_heads + 2 * config.num_key_value_heads
+            )
+        if module_name == "o_proj":
+            return head_dim * config.num_attention_heads, hidden_size
+        if module_name == "gate":
+            return hidden_size, config.num_experts
+        if module_name == "gate_up_proj":
+            return hidden_size, config.intermediate_size * 2
+        if module_name == "down_proj":
+            return config.intermediate_size, hidden_size
+        if module_name == "embed_tokens":
+            return config.vocab_size, hidden_size
+        if module_name == "lm_head":
+            return hidden_size, config.vocab_size
+        raise NotImplementedError(
+            f"get_hidden_dim not implemented for {module_name}"
+        )
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
