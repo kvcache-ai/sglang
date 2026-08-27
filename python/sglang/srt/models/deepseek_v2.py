@@ -222,6 +222,17 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
+def _deepseek_lora_serving_enabled() -> bool:
+    return bool(getattr(get_global_server_args(), "enable_lora", False))
+
+
+def _should_fuse_qkv_a_proj(config: PretrainedConfig) -> bool:
+    return (
+        getattr(config, "q_lora_rank", None) is not None
+        and (not _deepseek_lora_serving_enabled() or _is_npu)
+    )
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -301,7 +312,7 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
-class MoEGate(nn.Module):
+class MoEGate(nn.Linear):
     def __init__(
         self,
         config,
@@ -310,11 +321,19 @@ class MoEGate(nn.Module):
         is_nextn: bool = False,
         is_hash_moe: bool = False,
     ):
-        super().__init__()
+        # This is deliberately an ``nn.Linear`` subclass so the generic LoRA
+        # manager can wrap the router with its tensor-output linear adapter.
+        # Keep the hand-written initialization and forward below: DeepSeek's
+        # router has FP32-output and platform-specific kernel semantics that a
+        # stock ``nn.Linear.forward`` would lose.
+        nn.Module.__init__(self)
+        self.in_features = config.hidden_size
+        self.out_features = config.n_routed_experts
         self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
+        self.register_parameter("bias", None)
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = (
@@ -1461,13 +1480,34 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
-            )
+            self.fuse_qkv_a_proj = _should_fuse_qkv_a_proj(config)
+            if self.fuse_qkv_a_proj:
+                self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
+                    self.hidden_size,
+                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                )
+            else:
+                # PEFT stores q_a and kv_a as two independent LoRA modules.
+                # Keep two real base modules while LoRA serving is enabled so
+                # each projection retains its own A/B pair.  In particular,
+                # concatenating B while sharing A is not mathematically valid.
+                self.q_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.q_lora_rank,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("q_a_proj", prefix),
+                )
+                self.kv_a_proj_with_mqa = ReplicatedLinear(
+                    self.hidden_size,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+                )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -1865,6 +1905,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        if not self.fuse_qkv_a_proj:
+            q_latent = self.q_a_proj(hidden_states)[0]
+            kv_latent = self.kv_a_proj_with_mqa(hidden_states)[0]
+            return torch.cat((q_latent, kv_latent), dim=-1)
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
@@ -2360,7 +2404,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
         )
         if self.q_lora_rank is not None:
-            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+            q, latent_cache = self.prepare_qkv_latent(hidden_states, forward_batch).split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
@@ -3200,9 +3244,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        self.fuse_qkv_a_proj = (
-            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
-        )
+        self.fuse_qkv_a_proj = _should_fuse_qkv_a_proj(config)
+        # ``packed_modules_mapping`` is a class-level compatibility default;
+        # never leak one instance's LoRA-dependent choice into another model.
+        self.packed_modules_mapping = dict(type(self).packed_modules_mapping)
         if self.fuse_qkv_a_proj:
             self.packed_modules_mapping["fused_qkv_a_proj_with_mqa"] = [
                 "q_a_proj",
@@ -3267,7 +3312,12 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
         disable_reason = None
-        if (
+        if _deepseek_lora_serving_enabled():
+            # PEFT carries shared-expert gate/up/down adapters as ordinary
+            # modules.  Fusing the shared expert into the routed FusedMoE would
+            # remove those modules and silently drop their LoRA deltas.
+            disable_reason = "LoRA serving requires explicit shared-expert modules."
+        elif (
             self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
@@ -3326,6 +3376,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 config.hidden_size,
                 config.num_attention_heads * qk_head_dim,
             )
+        elif module_name == "q_a_proj":
+            return config.hidden_size, config.q_lora_rank
+        elif module_name == "q_b_proj":
+            qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+            return config.q_lora_rank, config.num_attention_heads * qk_head_dim
         elif module_name == "kv_a_proj_with_mqa":
             # KV compression: hidden_size -> kv_lora_rank + qk_rope_head_dim
             return (
@@ -3344,6 +3399,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 config.num_attention_heads * config.v_head_dim,
                 config.hidden_size,
             )
+        elif module_name == "gate":
+            return config.hidden_size, config.n_routed_experts
         # MLP modules (MoE or shared experts)
         elif module_name == "gate_up_proj" or module_name == "down_proj":
             # Determine the correct intermediate size based on layer structure
