@@ -74,6 +74,8 @@ from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs, is_large_dummy_model
+from contextlib import nullcontext
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
@@ -1389,13 +1391,26 @@ class DeepseekV4Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
+            # yiqiliu2 / 2026-05-08: wrap each layer call with the recorder's
+            # current_layer context. Without this, the recorder hook's
+            # `self._current_layer_idx.value` stays at None and every
+            # `on_select_experts` write lands in slot 0 of the gatherer's
+            # `_data` tensor, so the dumped logical_count.pt only has
+            # data for layer 0 and torch.topk on it places all GPU
+            # experts on layer 0 regardless of K.
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            with ctx:
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
 
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
