@@ -97,6 +97,7 @@ class DeepseekV2WeightLoaderMixin:
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn: bool = False,
+        run_post_load: bool = True,
     ):
         """Load model weights from checkpoint.
 
@@ -291,6 +292,22 @@ class DeepseekV2WeightLoaderMixin:
                                     []
                                 ) and kv_a_proj_weight.shape == torch.Size([]):
                                     fused_weight = q_a_proj_weight
+                                elif name.endswith("weight_shape") and (
+                                    q_a_proj_weight.numel() == 2
+                                ):
+                                    # compressed-tensors shape metadata [out, in]:
+                                    # the fused projection stacks outputs, so sum
+                                    # the out dims instead of concatenating the
+                                    # 2-element metadata vectors into a 4-vector.
+                                    assert q_a_proj_weight[1] == kv_a_proj_weight[1]
+                                    fused_weight = torch.tensor(
+                                        [
+                                            int(q_a_proj_weight[0])
+                                            + int(kv_a_proj_weight[0]),
+                                            int(q_a_proj_weight[1]),
+                                        ],
+                                        dtype=q_a_proj_weight.dtype,
+                                    )
                                 else:
                                     cat_dim = 0
                                     if self.quant_config is not None and (
@@ -361,7 +378,8 @@ class DeepseekV2WeightLoaderMixin:
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if run_post_load:
+            self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
