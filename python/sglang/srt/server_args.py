@@ -57,7 +57,6 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
-    mxfp8_block_convert_required,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -67,6 +66,7 @@ from sglang.srt.utils.common import (
     is_triton_kernels_available,
     is_valid_ipv6_address,
     json_list_type,
+    mxfp8_block_convert_required,
     nullable_str,
     parse_connector_type,
     torch_release,
@@ -79,7 +79,8 @@ from sglang.utils import is_in_ci
 logger = logging.getLogger(__name__)
 
 KT_EXPERT_LORA_MODULES = {"gate_proj", "up_proj", "down_proj"}
-KT_COMPOSITE_LORA_CACHE_VERSION = "v1"
+KT_COMPOSITE_LORA_CACHE_VERSION = "v3"
+KT_COMPOSITE_LORA_MANIFEST = "kt_composite_manifest.json"
 
 
 def _infer_lora_target_module_from_key(key: str) -> Optional[str]:
@@ -104,6 +105,88 @@ def _is_kt_expert_lora_key(key: str) -> bool:
     )
 
 
+def _safetensor_keys(weight_path: Path) -> List[str]:
+    try:
+        from safetensors import safe_open
+    except Exception as exc:
+        raise RuntimeError(
+            "safetensors is required to validate a KT expert LoRA adapter."
+        ) from exc
+
+    try:
+        with safe_open(str(weight_path), framework="pt", device="cpu") as f:
+            return list(f.keys())
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot read KT expert LoRA safetensors file {weight_path}: {exc}"
+        ) from exc
+
+
+def _validate_kt_expert_lora_adapter_path(
+    adapter_path: str, *, allow_nonexpert: bool
+) -> None:
+    """Validate the converted, per-expert adapter contract before model loading."""
+
+    path = Path(adapter_path).expanduser().resolve()
+    if path.is_file():
+        raise ValueError(
+            f"KT expert LoRA path {path} is a file. Pass the converted expert "
+            "adapter directory containing adapter_config.json and "
+            "adapter_model.safetensors. A raw fused_expert_lora.safetensors "
+            "training artifact must be converted first."
+        )
+    if not path.is_dir():
+        raise ValueError(f"KT expert LoRA adapter directory does not exist: {path}")
+
+    config_path = path / "adapter_config.json"
+    weight_path = path / "adapter_model.safetensors"
+    raw_compact_path = path / "fused_expert_lora.safetensors"
+    if not config_path.is_file() or not weight_path.is_file():
+        if raw_compact_path.is_file():
+            raise ValueError(
+                f"{path} is a raw KT training adapter containing "
+                "fused_expert_lora.safetensors. Convert it to the SGLang "
+                "per-expert adapter layout before serving; do not pass the raw "
+                "training directory to --kt-expert-lora-path or --lora-paths."
+            )
+        raise ValueError(
+            f"KT expert LoRA adapter {path} must contain adapter_config.json "
+            "and adapter_model.safetensors."
+        )
+
+    keys = _safetensor_keys(weight_path)
+    expert_keys = [key for key in keys if _is_kt_expert_lora_key(key)]
+    lora_keys = [
+        key
+        for key in keys
+        if ".lora_A" in key
+        or ".lora_B" in key
+        or ".lora_embedding_A" in key
+        or ".lora_embedding_B" in key
+    ]
+    if not expert_keys:
+        raw_hint = (
+            " The directory also contains fused_expert_lora.safetensors, which "
+            "is the compact training layout and must be converted first."
+            if raw_compact_path.is_file()
+            else ""
+        )
+        raise ValueError(
+            f"KT expert LoRA adapter {path} contains no converted per-expert "
+            f"gate_proj/up_proj/down_proj tensors.{raw_hint}"
+        )
+
+    nonexpert_keys = [key for key in lora_keys if key not in expert_keys]
+    if nonexpert_keys and not allow_nonexpert:
+        raise ValueError(
+            f"--kt-expert-lora-path expects an expert-only converted adapter, "
+            f"but {path} also contains {len(nonexpert_keys)} non-expert LoRA "
+            f"tensors (for example, {nonexpert_keys[0]!r}). Pass the merged "
+            "adapter through --lora-paths so SGLang can split and consume both "
+            "parts."
+        )
+
+
 def _ordered_lora_target_modules(modules: set[str]) -> List[str]:
     preferred = [
         "q_proj",
@@ -126,6 +209,44 @@ def _ordered_lora_target_modules(modules: set[str]) -> List[str]:
     return ordered
 
 
+def _is_prepared_kt_composite_pair(
+    expert_path: Union[str, Path], nonexpert_path: Union[str, Path]
+) -> bool:
+    """Verify that two runtime directories came from one completed split."""
+
+    expert_dir = Path(expert_path).expanduser().resolve()
+    nonexpert_dir = Path(nonexpert_path).expanduser().resolve()
+    if (
+        expert_dir.name != "expert"
+        or nonexpert_dir.name != "nonexpert"
+        or expert_dir.parent != nonexpert_dir.parent
+    ):
+        return False
+
+    manifest_path = expert_dir.parent / KT_COMPOSITE_LORA_MANIFEST
+    try:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        with (expert_dir / "adapter_config.json").open("r", encoding="utf-8") as f:
+            expert_config = json.load(f)
+        with (nonexpert_dir / "adapter_config.json").open(
+            "r", encoding="utf-8"
+        ) as f:
+            nonexpert_config = json.load(f)
+    except (OSError, TypeError, ValueError):
+        return False
+
+    return (
+        manifest.get("cache_version") == KT_COMPOSITE_LORA_CACHE_VERSION
+        and manifest.get("cache_key") == expert_dir.parent.name
+        and bool(manifest.get("source_adapter"))
+        and expert_config.get("kt_adapter_format") == "kt_moe_expert_v1"
+        and nonexpert_config.get("kt_adapter_format") == "kt_moe_nonexpert_v1"
+        and (expert_dir / "adapter_model.safetensors").is_file()
+        and (nonexpert_dir / "adapter_model.safetensors").is_file()
+    )
+
+
 def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str, str]]:
     """Split a merged KT MoE LoRA adapter into runtime expert/non-expert dirs.
 
@@ -133,33 +254,48 @@ def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str,
     adapter. Returns None for ordinary LoRA adapters.
     """
     adapter_dir = Path(adapter_path).expanduser().resolve()
+    if adapter_dir.is_file() and adapter_dir.suffix == ".safetensors":
+        raise ValueError(
+            f"--lora-paths expects an adapter directory, not {adapter_dir}. "
+            "Raw fused_expert_lora.safetensors files must be converted to the "
+            "SGLang per-expert adapter layout first."
+        )
     weight_path = adapter_dir / "adapter_model.safetensors"
     config_path = adapter_dir / "adapter_config.json"
+    raw_compact_path = adapter_dir / "fused_expert_lora.safetensors"
+    if adapter_dir.is_dir() and raw_compact_path.is_file() and not weight_path.is_file():
+        raise ValueError(
+            f"--lora-paths received raw KT training adapter {adapter_dir}. "
+            "Convert fused_expert_lora.safetensors to a merged or expert-only "
+            "SGLang adapter before serving."
+        )
     if not adapter_dir.is_dir() or not weight_path.is_file() or not config_path.is_file():
         return None
 
     try:
-        from safetensors.torch import load_file, save_file
-    except Exception as exc:
-        raise RuntimeError(
-            "safetensors is required to prepare a merged KT LoRA adapter."
-        ) from exc
-
-    try:
-        tensors = load_file(str(weight_path), device="cpu")
-    except Exception:
+        tensor_keys = _safetensor_keys(weight_path)
+    except ValueError:
         # Let the normal LoRA loader handle non-safetensors or malformed adapters.
         return None
 
-    expert_keys = [key for key in tensors if _is_kt_expert_lora_key(key)]
+    expert_keys = [key for key in tensor_keys if _is_kt_expert_lora_key(key)]
     if not expert_keys:
+        if raw_compact_path.is_file():
+            raise ValueError(
+                f"--lora-paths received raw KT training adapter {adapter_dir}. "
+                "adapter_model.safetensors contains only the non-expert part and "
+                "fused_expert_lora.safetensors is still compact. Convert the "
+                "training artifact before serving."
+            )
         return None
 
-    nonexpert_keys = [key for key in tensors if key not in expert_keys]
+    nonexpert_keys = [key for key in tensor_keys if key not in expert_keys]
     if not nonexpert_keys:
         raise ValueError(
             f"KT composite LoRA adapter {adapter_dir} contains expert tensors "
-            "but no non-expert tensors for SGLang --lora-paths."
+            "but no non-expert tensors. This is an expert-only adapter: pass it "
+            "with --kt-expert-lora-path together with --kt-weight-path, not "
+            "through --lora-paths."
         )
 
     digest = hashlib.sha256()
@@ -179,13 +315,19 @@ def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str,
     expert_dir = cache_dir / "expert"
     nonexpert_dir = cache_dir / "nonexpert"
 
-    if (
-        (expert_dir / "adapter_model.safetensors").is_file()
-        and (expert_dir / "adapter_config.json").is_file()
-        and (nonexpert_dir / "adapter_model.safetensors").is_file()
-        and (nonexpert_dir / "adapter_config.json").is_file()
-    ):
+    if _is_prepared_kt_composite_pair(expert_dir, nonexpert_dir):
         return str(expert_dir), str(nonexpert_dir)
+
+    try:
+        from safetensors.torch import load_file, save_file
+    except Exception as exc:
+        raise RuntimeError(
+            "safetensors is required to prepare a merged KT LoRA adapter."
+        ) from exc
+
+    # Materialize the potentially multi-gigabyte tensor payload only on a
+    # cache miss. Cache discovery and key classification above read metadata.
+    tensors = load_file(str(weight_path), device="cpu")
 
     with config_path.open("r", encoding="utf-8") as f:
         base_config = json.load(f)
@@ -205,11 +347,11 @@ def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str,
 
     expert_config = dict(base_config)
     expert_config["target_modules"] = _ordered_lora_target_modules(expert_targets)
-    expert_config["kt_adapter_format"] = "qwen3_5_moe_expert"
+    expert_config["kt_adapter_format"] = "kt_moe_expert_v1"
 
     nonexpert_config = dict(base_config)
     nonexpert_config["target_modules"] = _ordered_lora_target_modules(nonexpert_targets)
-    nonexpert_config["kt_adapter_format"] = "qwen3_5_moe_nonexpert"
+    nonexpert_config["kt_adapter_format"] = "kt_moe_nonexpert_v1"
 
     expert_dir.mkdir(parents=True, exist_ok=True)
     nonexpert_dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +372,17 @@ def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str,
         with (output_dir / "adapter_config.json").open("w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, sort_keys=True)
             f.write("\n")
+
+    manifest = {
+        "cache_version": KT_COMPOSITE_LORA_CACHE_VERSION,
+        "cache_key": cache_dir.name,
+        "source_adapter": str(adapter_dir),
+    }
+    with (cache_dir / KT_COMPOSITE_LORA_MANIFEST).open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
 
     logger.info(
         "Prepared merged KT LoRA adapter %s for runtime: expert=%s (%d tensors), "
@@ -736,6 +889,13 @@ class ServerArgs:
     kt_expert_placement_strategy: str = "uniform"
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
+    # Identity of the sole composite adapter internally split from --lora-paths.
+    # Kept explicit so request-layer enforcement can bind the static expert
+    # half to the matching non-expert LoRA ID instead of treating it as global.
+    kt_composite_lora_name: Optional[str] = dataclasses.field(
+        default=None, repr=False
+    )
+    kt_composite_lora_id: Optional[str] = dataclasses.field(default=None, repr=False)
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -910,23 +1070,8 @@ class ServerArgs:
         # Set missing default values.
         self._handle_missing_default_values()
 
-        if self.kt_lora_path:
-            if (
-                self.kt_expert_lora_path
-                and self.kt_expert_lora_path != self.kt_lora_path
-            ):
-                raise ValueError(
-                    "--kt-lora-path and --kt-expert-lora-path cannot point to "
-                    "different adapters in the static single-adapter implementation."
-                )
-            self.kt_expert_lora_path = self.kt_lora_path
-
-        if (self.kt_lora_path or self.kt_expert_lora_path) and not self.disable_cuda_graph:
-            logger.warning(
-                "Cuda graph is disabled because KT LoRA uses "
-                "KT SFT CPU expert forward with host-side input copies."
-            )
-            self.disable_cuda_graph = True
+        self._normalize_deprecated_kt_lora_path()
+        self._disable_kt_lora_cuda_graphs()
 
         if (
             self.enable_piecewise_cuda_graph
@@ -5910,8 +6055,10 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
+        return cls(
+            **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
+        )
 
     def url(self):
         if is_valid_ipv6_address(self.host):
@@ -6162,6 +6309,64 @@ class ServerArgs:
                 "enter prefill/forward."
             )
 
+    def _disable_kt_lora_cuda_graphs(self) -> None:
+        if not (self.kt_lora_path or self.kt_expert_lora_path):
+            return
+        if not self.disable_cuda_graph:
+            logger.warning(
+                "Cuda graph is disabled because KT LoRA uses "
+                "KT SFT CPU expert forward with host-side input copies."
+            )
+            self.disable_cuda_graph = True
+        if self.enable_piecewise_cuda_graph:
+            logger.warning(
+                "Piecewise CUDA graph is disabled because KT LoRA uses "
+                "host-side CPU expert execution."
+            )
+            self.enable_piecewise_cuda_graph = False
+
+    def _normalize_deprecated_kt_lora_path(self) -> None:
+        if not self.kt_lora_path:
+            return
+        if (
+            self.kt_expert_lora_path
+            and self.kt_expert_lora_path != self.kt_lora_path
+        ):
+            raise ValueError(
+                "--kt-lora-path and --kt-expert-lora-path cannot point to "
+                "different adapters."
+            )
+        logger.warning(
+            "--kt-lora-path is deprecated and is treated as an alias for "
+            "--kt-expert-lora-path. It accepts only a converted expert-only "
+            "adapter; pass merged expert/non-expert adapters through --lora-paths."
+        )
+        self.kt_expert_lora_path = self.kt_lora_path
+        # Prevent model_runner from entering the obsolete Qwen3.5-only static
+        # non-expert loader. Non-expert tensors use the standard LoRA manager.
+        self.kt_lora_path = None
+
+    def _validate_kt_lora_serving_paths(self) -> None:
+        if not (self.kt_lora_path or self.kt_expert_lora_path):
+            return
+        if not self.kt_weight_path:
+            raise ValueError(
+                "KT LoRA serving requires --kt-weight-path for the base routed "
+                "expert weights whenever --kt-lora-path or "
+                "--kt-expert-lora-path is used."
+            )
+
+        if self.kt_lora_path:
+            _validate_kt_expert_lora_adapter_path(
+                self.kt_lora_path,
+                allow_nonexpert=False,
+            )
+        elif self.kt_expert_lora_path:
+            _validate_kt_expert_lora_adapter_path(
+                self.kt_expert_lora_path,
+                allow_nonexpert=False,
+            )
+
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
 
@@ -6217,11 +6422,14 @@ class ServerArgs:
                         assert (
                             "lora_name" in lora_path and "lora_path" in lora_path
                         ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
-                        lora_ref = LoRARef(
+                        lora_ref_kwargs = dict(
                             lora_name=lora_path["lora_name"],
                             lora_path=lora_path["lora_path"],
                             pinned=lora_path.get("pinned", False),
                         )
+                        if lora_path.get("lora_id"):
+                            lora_ref_kwargs["lora_id"] = lora_path["lora_id"]
+                        lora_ref = LoRARef(**lora_ref_kwargs)
                     else:
                         raise ValueError(
                             f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
@@ -6239,6 +6447,26 @@ class ServerArgs:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
                     "Expected a list or a dictionary."
+                )
+
+            prepared_pair = (
+                self.kt_expert_lora_path is not None
+                and self.kt_composite_lora_name is not None
+                and self.kt_composite_lora_id is not None
+                and len(self.lora_paths) == 1
+                and self.lora_paths[0].lora_name == self.kt_composite_lora_name
+                and self.lora_paths[0].lora_id == self.kt_composite_lora_id
+                and _is_prepared_kt_composite_pair(
+                    self.kt_expert_lora_path,
+                    self.lora_paths[0].lora_path,
+                )
+            )
+            if self.kt_expert_lora_path and self.lora_paths and not prepared_pair:
+                raise ValueError(
+                    "Explicit --kt-expert-lora-path cannot be combined with "
+                    "--lora-paths. For a merged KT adapter, pass the single "
+                    "merged directory through --lora-paths and let SGLang "
+                    "create the only supported expert/non-expert pair."
                 )
 
             kt_composite_lora_ref: Optional[LoRARef] = None
@@ -6282,6 +6510,8 @@ class ServerArgs:
             if kt_composite_lora_ref is not None:
                 self.lora_paths = rewritten_lora_paths
                 self.kt_expert_lora_path = kt_composite_expert_path
+                self.kt_composite_lora_name = kt_composite_lora_ref.lora_name
+                self.kt_composite_lora_id = kt_composite_lora_ref.lora_id
                 logger.warning(
                     "Using merged KT composite LoRA adapter %s as %s. "
                     "The adapter is internally split into expert/non-expert "
@@ -6290,12 +6520,13 @@ class ServerArgs:
                     kt_composite_lora_ref.lora_path,
                     kt_composite_lora_ref.lora_name,
                 )
-                if not self.disable_cuda_graph:
-                    logger.warning(
-                        "Cuda graph is disabled because KT expert LoRA uses "
-                        "KT SFT CPU expert forward with host-side input copies."
-                    )
-                    self.disable_cuda_graph = True
+            if self.kt_composite_lora_id is not None and self.pp_size != 1:
+                raise ValueError(
+                    "Merged KT composite LoRA serving currently supports "
+                    "tensor parallelism only; set --pp-size 1. Pipeline "
+                    "parallel ranks do not each own every non-expert LoRA "
+                    "tensor required by the full-consumption contract."
+                )
 
             # Expand target modules
             if self.lora_target_modules:
@@ -6338,6 +6569,11 @@ class ServerArgs:
                     16 <= self.max_lora_chunk_size <= 128
                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+
+        # This must run after merged --lora-paths adapters are split above,
+        # because that operation populates kt_expert_lora_path.
+        self._validate_kt_lora_serving_paths()
+        self._disable_kt_lora_cuda_graphs()
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)

@@ -245,9 +245,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 else:
+                    shared_gate_output = self.shared_expert_gate(hidden_states)
+                    if isinstance(shared_gate_output, tuple):
+                        shared_gate_output = shared_gate_output[0]
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
-                        * shared_output
+                        F.sigmoid(shared_gate_output) * shared_output
                     )
 
         return shared_output

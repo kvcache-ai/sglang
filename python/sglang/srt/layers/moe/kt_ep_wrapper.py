@@ -50,12 +50,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from sglang.srt.configs.glm5_next import GLM5_NEXT_SUPPORTED_TP_SIZES
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
@@ -209,9 +209,15 @@ class KTExpertLoraWeights:
 _KT_SFT_METHOD_BY_INFERENCE_METHOD = {
     "AMXBF16": "AMXBF16_SFT",
     "BF16": "AMXBF16_SFT",
+    "AMXFP8": "AMXFP8_SFT",
+    "FP8": "AMXFP8_SFT",
     "AMXINT8": "AMXINT8_SFT",
     "AMXINT4": "AMXINT4_SFT",
 }
+
+_KT_SFT_METHODS_REQUIRING_SHARED_BACKWARD_BB = frozenset(
+    ("AMXFP8_SFT", "AMXINT8_SFT")
+)
 
 
 def _map_kt_method_to_sft_method(method: str) -> str:
@@ -219,8 +225,103 @@ def _map_kt_method_to_sft_method(method: str) -> str:
     if normalized in _KT_SFT_METHOD_BY_INFERENCE_METHOD:
         return _KT_SFT_METHOD_BY_INFERENCE_METHOD[normalized]
     raise ValueError(
-        f"--kt-expert-lora-path currently supports only AMX/BF16 SFT-compatible "
-        f"KT methods {sorted(_KT_SFT_METHOD_BY_INFERENCE_METHOD)}, got {method!r}."
+        "--kt-expert-lora-path requires one of the SFT-compatible KT methods "
+        f"{sorted(_KT_SFT_METHOD_BY_INFERENCE_METHOD)}, got {method!r}."
+    )
+
+
+def _configure_kt_sft_wrapper_for_serving(wrapper, method: str) -> None:
+    if method in _KT_SFT_METHODS_REQUIRING_SHARED_BACKWARD_BB:
+        wrapper.share_backward_bb = True
+
+
+def _validate_kt_sft_runtime(method: str) -> None:
+    """Feature-probe quantized SFT kernels before allocating layer state."""
+    if method != "AMXFP8_SFT":
+        return
+    try:
+        from kt_kernel.sft import get_fp8_runtime
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "KT native-FP8 expert LoRA requires a kt-kernel wheel exposing "
+            "get_fp8_runtime() and AMXFP8_SFT_MOE."
+        ) from exc
+    get_fp8_runtime()
+
+
+def _load_native_fp8_sft_weights(
+    *,
+    weight_path: str,
+    layer_idx: int,
+    num_experts: int,
+    hidden_size: int,
+    moe_intermediate_size: int,
+    num_experts_per_tok: int,
+):
+    """Load original per-expert E4M3 tensors and 128x128 inverse scales."""
+    try:
+        from kt_kernel.sft import (
+            MOEArchConfig,
+            load_block_fp8_experts_from_checkpoint_files,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "The loaded kt-kernel wheel has no native FP8 checkpoint loader."
+        ) from exc
+
+    checkpoint_dir = Path(weight_path)
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(
+            "KT native-FP8 expert LoRA requires --kt-weight-path to point to "
+            f"the original Hugging Face checkpoint directory, got {weight_path!r}."
+        )
+
+    index_path = checkpoint_dir / "model.safetensors.index.json"
+    sharded_metadata = None
+    if index_path.is_file():
+        with index_path.open("r", encoding="utf-8") as handle:
+            sharded_metadata = json.load(handle)
+        weight_map = sharded_metadata.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(
+                f"Invalid safetensors index without weight_map: {index_path}"
+            )
+        checkpoint_files = sorted(
+            {str(checkpoint_dir / filename) for filename in weight_map.values()}
+        )
+    else:
+        checkpoint_files = sorted(
+            str(path) for path in checkpoint_dir.glob("*.safetensors")
+        )
+    if not checkpoint_files:
+        raise FileNotFoundError(
+            f"No original .safetensors shards found under {checkpoint_dir}."
+        )
+    missing_files = [path for path in checkpoint_files if not Path(path).is_file()]
+    if missing_files:
+        raise FileNotFoundError(
+            f"Safetensors index references missing shard {missing_files[0]!r}."
+        )
+
+    moe_config = MOEArchConfig(
+        moe_layer_attr="mlp",
+        router_attr="gate",
+        experts_attr="experts",
+        weight_names=("gate_proj", "up_proj", "down_proj"),
+        expert_num=num_experts,
+        intermediate_size=moe_intermediate_size,
+        num_experts_per_tok=num_experts_per_tok,
+        has_shared_experts=True,
+        router_type="deepseek_gate",
+    )
+    return load_block_fp8_experts_from_checkpoint_files(
+        checkpoint_files=checkpoint_files,
+        sharded_metadata=sharded_metadata,
+        layers_prefix="model.layers",
+        moe_config=moe_config,
+        layer_idx=layer_idx,
+        hidden_size=hidden_size,
+        block_size=(128, 128),
     )
 
 
@@ -5141,15 +5242,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                     moe_intermediate_size=intermediate_size_full,
                 )
+                sft_method = _map_kt_method_to_sft_method(self.kt_config.method)
+                _validate_kt_sft_runtime(sft_method)
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
-                    method=_map_kt_method_to_sft_method(self.kt_config.method),
+                    method=sft_method,
                     mode="sft",
                     num_gpu_experts=0,
                     lora_rank=self.kt_expert_lora_weights.rank,
                     lora_alpha=self.kt_expert_lora_weights.alpha,
                     max_cache_depth=1,
                 )
+                _configure_kt_sft_wrapper_for_serving(self.wrapper, sft_method)
             else:
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
@@ -5197,7 +5301,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 physical_to_logical_map_cpu = torch.arange(
                     layer.num_experts, dtype=torch.int64, device="cpu"
                 )
-            self.wrapper.load_weights(physical_to_logical_map_cpu)
+            sft_method = (
+                _map_kt_method_to_sft_method(self.kt_config.method)
+                if self.kt_expert_lora_enabled
+                else None
+            )
+            if sft_method == "AMXFP8_SFT":
+                if not hasattr(self.wrapper, "load_block_fp8_weights"):
+                    raise RuntimeError(
+                        "The loaded kt-kernel FP8 SFT wrapper has no "
+                        "load_block_fp8_weights() capability."
+                    )
+                block_fp8_weights = _load_native_fp8_sft_weights(
+                    weight_path=self.kt_config.weight_path,
+                    layer_idx=self.kt_config.layer_idx,
+                    num_experts=self.global_num_experts,
+                    hidden_size=self._full_init_args[0],
+                    moe_intermediate_size=(
+                        self._full_init_args[1] * layer.moe_tp_size
+                    ),
+                    num_experts_per_tok=layer.top_k,
+                )
+                self.wrapper.load_block_fp8_weights(
+                    block_fp8_weights,
+                    physical_to_logical_map_cpu,
+                )
+            else:
+                self.wrapper.load_weights(physical_to_logical_map_cpu)
             if self.kt_expert_lora_enabled:
                 if self.kt_expert_lora_weights is None:
                     raise RuntimeError(

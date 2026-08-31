@@ -424,6 +424,63 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         return B
 
 
+class TensorOutputLinearWithLoRA(BaseLayerWithLoRA):
+    """LoRA wrapper for replicated linear modules that return a tensor.
+
+    SGLang's tensor-parallel linear layers return ``(output, bias)``, while a
+    few replicated projections (for example Qwen MoE's CUDA shared-expert
+    gate) deliberately use ``torch.nn.Linear`` and return the output tensor
+    directly.  Keeping a separate wrapper preserves that public forward
+    contract and leaves the non-LoRA path delegated to the original module.
+    """
+
+    def __init__(
+        self,
+        base_layer: nn.Module,
+        lora_backend: BaseLoRABackend,
+    ) -> None:
+        super().__init__(base_layer, lora_backend)
+        if not hasattr(base_layer, "weight") or base_layer.weight.ndim != 2:
+            raise ValueError(
+                "TensorOutputLinearWithLoRA requires a two-dimensional weight"
+            )
+        self.output_offset = torch.tensor(
+            [0, base_layer.weight.shape[0]],
+            dtype=torch.int32,
+            device=base_layer.weight.device,
+        )
+
+    def set_lora_info(
+        self,
+        A_buffer: torch.Tensor,
+        B_buffer: torch.Tensor,
+    ):
+        self.set_lora = True
+        self.A_buffer = A_buffer
+        self.B_buffer = B_buffer
+
+    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
+        return self.lora_backend.run_lora_b_sgemm(
+            x=lora_a_output,
+            weights=self.B_buffer,
+            output_offset=self.output_offset,
+            base_output=base_output,
+        )
+
+    def forward(self, input_: torch.Tensor, *args, **kwargs):
+        output = self.base_layer(input_, *args, **kwargs)
+        if self.set_lora:
+            output = self.apply_lora(output, input_)
+        return output
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        return B
+
+
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
         self,
@@ -680,6 +737,7 @@ def get_lora_layer(
         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
         ReplicatedLinear: ReplicatedLinearWithLoRA,
         RowParallelLinear: RowParallelLinearWithLoRA,
+        nn.Linear: TensorOutputLinearWithLoRA,
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck

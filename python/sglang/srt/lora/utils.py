@@ -154,16 +154,38 @@ def get_stacked_multiply(module_name: str) -> int:
 
 def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> str:
     """
-    Get the target module name in target_modules that can match full_module_name.
+    Resolve a LoRA target by an exact module-path suffix.
 
-    If there is a target module name in target_modules that can match full_module_name, return this name
-    Else raise ValueError.
+    ``str in str`` is intentionally not used here.  Besides being dependent on
+    set iteration order, substring matching maps targets such as ``gate`` to
+    ``gate_up_proj`` or ``shared_expert_gate``.  Adapter weight names are first
+    reduced to the module path before the LoRA marker, then the longest exact
+    path suffix wins.  This supports both leaf targets (``q_proj``) and scoped
+    targets (``self_attn.q_proj``) deterministically.
     """
-    for target_module in target_modules:
-        if target_module in full_module_name:
-            return target_module
+
+    module_path = full_module_name
+    for marker in (".lora_", ".lora_embedding_"):
+        if marker in module_path:
+            module_path = module_path.split(marker, 1)[0]
+            break
+
+    matches = [
+        target_module
+        for target_module in target_modules
+        if module_path == target_module or module_path.endswith(f".{target_module}")
+    ]
+    if matches:
+        # Segment count captures path specificity; length and lexical order make
+        # the result stable even for unusual but equivalent-looking inputs.
+        return max(
+            matches,
+            key=lambda name: (len(name.split(".")), len(name), name),
+        )
+
     raise ValueError(
-        f"Cannot find target module name for {full_module_name} in {target_modules}"
+        f"Cannot resolve LoRA module path {module_path!r} from target modules "
+        f"{sorted(target_modules)}. Targets must match complete path segments."
     )
 
 

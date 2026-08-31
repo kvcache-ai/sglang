@@ -8,7 +8,16 @@ from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
+@cached_triton_kernel(
+    lambda _, kwargs: (
+        kwargs["NUM_SLICES"],
+        kwargs["OUTPUT_DIM"],
+        kwargs["MAX_RANK"],
+        kwargs["BLOCK_M"],
+        kwargs["BLOCK_N"],
+        kwargs["BLOCK_K"],
+    )
+)
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_expand_kernel(
     # Pointers to matrices

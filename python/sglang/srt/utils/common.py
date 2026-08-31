@@ -3648,6 +3648,20 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "down_proj",
     "qkv_proj",
     "gate_up_proj",
+    # Replicated MoE router and shared-expert router projections.
+    "gate",
+    "shared_expert_gate",
+    # Qwen3.5 GatedDeltaNet projections.
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
+    # DeepSeek MLA projections.
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "kv_b_proj",
     "embed_tokens",
     "lm_head",
 ]

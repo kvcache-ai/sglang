@@ -75,7 +75,10 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
-from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
+from sglang.srt.managers.tokenizer_communicator_mixin import (
+    TokenizerCommunicatorMixin,
+    get_static_kt_lora_ref,
+)
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
@@ -496,7 +499,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
-            await self._validate_and_resolve_lora(obj)
+            try:
+                await self._validate_and_resolve_lora(obj)
+            except (Exception, asyncio.CancelledError):
+                try:
+                    await self._cleanup_failed_lora_validation(obj)
+                except Exception:
+                    logger.exception(
+                        "Failed to release LoRA bookkeeping after request "
+                        "validation failed for rid=%r.",
+                        obj.rid,
+                    )
+                raise
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
@@ -1178,7 +1192,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             del self.rid_to_state[state.obj.rid]
 
                         # Mark ongoing LoRA request as finished.
-                        if self.server_args.enable_lora and state.obj.lora_path:
+                        if (
+                            self._uses_lora_registry_references()
+                            and state.obj.lora_path
+                        ):
                             await self.lora_registry.release(state.obj.lora_id)
                         if not is_stream:
                             raise fastapi.HTTPException(
@@ -1624,7 +1641,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
+                if self._uses_lora_registry_references() and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             state.out_list.append(out_dict)
@@ -2171,6 +2188,44 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def _validate_and_resolve_lora(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ) -> None:
+        # lora_id is internal request state. Never release or dispatch a value
+        # supplied by a caller when validation fails before registry.acquire().
+        obj.lora_id = None
+
+        static_kt_lora = get_static_kt_lora_ref(self.server_args)
+        if static_kt_lora is not None:
+            expected_name = static_kt_lora.lora_name
+            if is_health_check_generate_req(obj):
+                # Health checks are internal requests. Bind them to the complete
+                # static-expert + dynamic-nonexpert adapter so they exercise the
+                # same executable model as user traffic.
+                obj.lora_path = expected_name
+
+            requested_names = (
+                [obj.lora_path]
+                if isinstance(obj.lora_path, str)
+                else obj.lora_path
+            )
+            if not requested_names or any(
+                name != expected_name for name in requested_names
+            ):
+                raise ValueError(
+                    "This server has KT expert LoRA statically paired with "
+                    f"adapter {expected_name!r}. Every request in the batch must "
+                    "select exactly that adapter; base, mixed, and other-adapter "
+                    "requests are not supported."
+                )
+
+            # The paired adapter is immutable for this server: dynamic load and
+            # unload are disabled. Bind its stable ID directly so internal health
+            # probes and user requests do not participate in unload refcounting.
+            obj.lora_id = (
+                static_kt_lora.lora_id
+                if isinstance(obj.lora_path, str)
+                else [static_kt_lora.lora_id] * len(requested_names)
+            )
+            return
+
         if not obj.lora_path:
             return
 
@@ -2188,6 +2243,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
         await self._resolve_lora_path(obj)
+
+    async def _cleanup_failed_lora_validation(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Undo request bookkeeping when LoRA validation fails before dispatch."""
+
+        rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
+        for rid in rids:
+            self.rid_to_state.pop(rid, None)
+
+        lora_id = getattr(obj, "lora_id", None)
+        if self._uses_lora_registry_references() and lora_id:
+            await self.lora_registry.release(lora_id)
+            obj.lora_id = None
+
+    def _uses_lora_registry_references(self) -> bool:
+        """Return whether requests must guard a dynamically unloadable adapter."""
+
+        return self.server_args.enable_lora and get_static_kt_lora_ref(
+            self.server_args
+        ) is None
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):

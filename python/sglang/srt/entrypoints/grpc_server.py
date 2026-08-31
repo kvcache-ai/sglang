@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.tokenizer_communicator_mixin import get_static_kt_lora_ref
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -159,6 +160,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.static_kt_lora_ref = get_static_kt_lora_ref(server_args)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -323,6 +325,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 stream=False,
                 mm_inputs=None,
                 token_ids_logprob=None,
+                lora_id=(
+                    self.static_kt_lora_ref.lora_id
+                    if self.static_kt_lora_ref is not None
+                    else None
+                ),
             )
             # Set disaggregation params if needed
             if self.server_args.disaggregation_mode != DisaggregationMode.NULL.value:
@@ -337,6 +344,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 image_inputs={"mm_items": []},
                 token_type_ids=[0],
                 sampling_params=sampling_params,
+                lora_id=(
+                    self.static_kt_lora_ref.lora_id
+                    if self.static_kt_lora_ref is not None
+                    else None
+                ),
             )
 
         # Submit health check request
@@ -540,6 +552,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> TokenizedGenerateReqInput:
         """Convert gRPC GenerateRequest to internal format."""
 
+        if self.static_kt_lora_ref is not None:
+            expected_id = self.static_kt_lora_ref.lora_id
+            requested_id = grpc_req.lora_id if grpc_req.lora_id else None
+            if requested_id != expected_id:
+                raise ValueError(
+                    "This server has KT expert LoRA statically paired with "
+                    f"adapter {self.static_kt_lora_ref.lora_name!r}. gRPC "
+                    f"GenerateRequest.lora_id must be {expected_id!r}; base and "
+                    "other-adapter requests are not supported."
+                )
+
         # Extract tokenized input
         if not grpc_req.HasField("tokenized"):
             raise ValueError("Tokenized input must be provided")
@@ -599,6 +622,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest
     ) -> TokenizedEmbeddingReqInput:
         """Convert gRPC EmbedRequest to internal format."""
+
+        if self.static_kt_lora_ref is not None:
+            raise ValueError(
+                "gRPC EmbedRequest cannot select the adapter required by this "
+                "static KT expert LoRA server."
+            )
 
         # Extract tokenized input
         if not grpc_req.HasField("tokenized"):

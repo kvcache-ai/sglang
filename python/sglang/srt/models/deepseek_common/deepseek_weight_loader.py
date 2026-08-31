@@ -133,8 +133,10 @@ class DeepseekV2WeightLoaderMixin:
             )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
+        fuse_qkv_a_proj = getattr(
+            self,
+            "fuse_qkv_a_proj",
+            hasattr(self.config, "q_lora_rank") and self.config.q_lora_rank is not None,
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
