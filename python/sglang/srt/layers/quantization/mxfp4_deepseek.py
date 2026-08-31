@@ -591,7 +591,7 @@ class DeepSeekMxfp4MoEMethod:
                     topk_ids + local_expert_offset,
                     topk_ids,
                 )
-            rsf = layer.moe_runner_config.routed_scaling_factor
+            rsf = self.moe_runner_config.routed_scaling_factor
             # 2604B SwiGLU clamp: thread swiglu_limit through so the triton-
             # kernels GPU MoE path applies the same gate/up clamp as
             # trtllm's gemm1_clamp_limit and deep_gemm's _apply_swiglu_limit.
@@ -747,7 +747,7 @@ class DeepSeekMxfp4MoEMethod:
         )[0]
 
         if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
-            rsf = layer.moe_runner_config.routed_scaling_factor
+            rsf = self.moe_runner_config.routed_scaling_factor
             if rsf is not None and rsf != 1.0:
                 output.mul_(rsf)
 
