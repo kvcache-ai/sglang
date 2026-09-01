@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+# World16 K3 loading can have multi-minute rank skew after CPU/H2D materialization.
+# Keep the guard, but allow the slowest rank to rendezvous before declaring failure.
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 7200
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
