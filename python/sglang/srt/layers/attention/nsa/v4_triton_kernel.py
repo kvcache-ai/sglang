@@ -383,11 +383,11 @@ def _decode_sparse_attention_bf16_kernel(
     )
 
 
-def decode_sparse_attention_bf16(
+def decode_sparse_attention_bf16_legacy(
     q, swa_cache, swa_indices, swa_lens, scale, attn_sink, out,
     extra_cache=None, extra_indices=None, extra_lens=None,
 ) -> None:
-    """SM_86 BF16 decode: cache is all-bf16, no FP8 at all."""
+    """Legacy SM86 BF16 decode with one CTA per eight attention heads."""
     if swa_indices.ndim == 3:
         swa_indices = swa_indices.squeeze(1)
     if extra_indices is not None and extra_indices.ndim == 3:
@@ -437,6 +437,400 @@ def decode_sparse_attention_bf16(
         HAS_EXTRA=has_extra, HAS_SINK=attn_sink is not None,
         LOG2E_CONST=LOG2E,
         num_stages=1, num_warps=8,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SM_86 BF16 parallel decode fast path.
+# ---------------------------------------------------------------------------
+
+DSV4_SM86_SPARSE_BLOCK_H = 8
+DSV4_SM86_SPARSE_BLOCK_N = 16
+DSV4_SM86_SPARSE_NUM_WARPS = 8
+
+
+# Compute QK in parallel over selected-token tiles, then preserve the legacy
+# left-to-right online-softmax recurrence in the value kernel. Splitting the
+# independent value columns adds CTA parallelism without reassociating any
+# reduction that contributes to an output element.
+DSV4_SM86_SPARSE_BLOCK_D_OUT = 128
+
+
+@triton.jit
+def _decode_sparse_attention_bf16_qk_kernel(
+    q_ptr,
+    swa_cache_bf16_ptr,
+    swa_indices_ptr,
+    swa_lens_ptr,
+    extra_cache_bf16_ptr,
+    extra_indices_ptr,
+    extra_lens_ptr,
+    qk_ptr,
+    num_tokens: tl.constexpr,
+    num_heads: tl.constexpr,
+    swa_index_topk: tl.constexpr,
+    extra_index_topk: tl.constexpr,
+    swa_num_blocks: tl.constexpr,
+    extra_num_blocks: tl.constexpr,
+    swa_block_size: tl.constexpr,
+    extra_block_size: tl.constexpr,
+    swa_stride_block_elems: tl.constexpr,
+    extra_stride_block_elems: tl.constexpr,
+    sm_scale_log2: tl.constexpr,
+    stride_qt: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_swa_idx_t: tl.constexpr,
+    stride_swa_idx_k: tl.constexpr,
+    stride_extra_idx_t: tl.constexpr,
+    stride_extra_idx_k: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TOKEN_ELEMS: tl.constexpr,
+    SELECTED_CAPACITY: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_block = tl.program_id(1)
+    tile_id = tl.program_id(2)
+    heads = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_n = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_h = heads < num_heads
+
+    q = tl.load(
+        q_ptr
+        + token_id * stride_qt
+        + heads[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd,
+        mask=mask_h[:, None],
+        other=0.0,
+    )
+
+    swa_len = tl.load(swa_lens_ptr + token_id)
+    extra_len = tl.load(extra_lens_ptr + token_id) if HAS_EXTRA else 0
+    total_len = extra_len + swa_len
+    use_extra = HAS_EXTRA & (offs_n < extra_len)
+    use_swa = (offs_n >= extra_len) & (offs_n < total_len)
+
+    extra_cols = offs_n
+    swa_cols = offs_n - extra_len
+    extra_idx = tl.load(
+        extra_indices_ptr
+        + token_id * stride_extra_idx_t
+        + extra_cols * stride_extra_idx_k,
+        mask=HAS_EXTRA & (extra_cols < extra_index_topk),
+        other=-1,
+    )
+    swa_idx = tl.load(
+        swa_indices_ptr + token_id * stride_swa_idx_t + swa_cols * stride_swa_idx_k,
+        mask=(swa_cols >= 0) & (swa_cols < swa_index_topk),
+        other=-1,
+    )
+    idx = tl.where(use_extra, extra_idx, swa_idx)
+
+    extra_block = idx // extra_block_size
+    extra_pos = idx - extra_block * extra_block_size
+    swa_block = idx // swa_block_size
+    swa_pos = idx - swa_block * swa_block_size
+    valid_extra = use_extra & (idx >= 0) & (extra_block < extra_num_blocks)
+    valid_swa = use_swa & (idx >= 0) & (swa_block < swa_num_blocks)
+    valid = valid_extra | valid_swa
+
+    extra_token_base = extra_block * extra_stride_block_elems
+    extra_token_base += extra_pos * TOKEN_ELEMS
+    swa_token_base = swa_block * swa_stride_block_elems
+    swa_token_base += swa_pos * TOKEN_ELEMS
+    token_base = tl.where(use_extra, extra_token_base, swa_token_base)
+    k = tl.load(
+        tl.where(use_extra[:, None], extra_cache_bf16_ptr, swa_cache_bf16_ptr)
+        + token_base[:, None]
+        + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    qk = tl.dot(q, tl.trans(k.to(q.dtype))) * sm_scale_log2
+    qk = tl.where(
+        mask_h[:, None] & valid[None, :],
+        qk,
+        -3.4028234663852886e38,
+    )
+    qk_offsets = (token_id * num_heads + heads[:, None]) * SELECTED_CAPACITY + offs_n[
+        None, :
+    ]
+    tl.store(
+        qk_ptr + qk_offsets,
+        qk,
+        mask=mask_h[:, None] & (offs_n[None, :] < SELECTED_CAPACITY),
+    )
+
+
+@triton.jit
+def _decode_sparse_attention_bf16_value_kernel(
+    swa_cache_bf16_ptr,
+    swa_indices_ptr,
+    swa_lens_ptr,
+    extra_cache_bf16_ptr,
+    extra_indices_ptr,
+    extra_lens_ptr,
+    sink_ptr,
+    qk_ptr,
+    out_ptr,
+    num_tokens: tl.constexpr,
+    num_heads: tl.constexpr,
+    swa_index_topk: tl.constexpr,
+    extra_index_topk: tl.constexpr,
+    swa_num_blocks: tl.constexpr,
+    extra_num_blocks: tl.constexpr,
+    swa_block_size: tl.constexpr,
+    extra_block_size: tl.constexpr,
+    swa_stride_block_elems: tl.constexpr,
+    extra_stride_block_elems: tl.constexpr,
+    stride_swa_idx_t: tl.constexpr,
+    stride_swa_idx_k: tl.constexpr,
+    stride_extra_idx_t: tl.constexpr,
+    stride_extra_idx_k: tl.constexpr,
+    stride_out_t: tl.constexpr,
+    stride_out_h: tl.constexpr,
+    stride_out_d: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D_OUT: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOKEN_ELEMS: tl.constexpr,
+    SELECTED_CAPACITY: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    LOG2E_CONST: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_block = tl.program_id(1)
+    value_block = tl.program_id(2)
+    heads = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_d = value_block * BLOCK_D_OUT + tl.arange(0, BLOCK_D_OUT)
+    mask_h = heads < num_heads
+    mask_d = offs_d < HEAD_DIM
+
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + heads, mask=mask_h, other=-float("inf"))
+        e_max = sink * LOG2E_CONST
+        e_sum = tl.where(mask_h, 1.0, 0.0)
+    else:
+        e_max = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
+        e_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D_OUT), dtype=tl.float32)
+
+    swa_len = tl.load(swa_lens_ptr + token_id)
+    extra_len = tl.load(extra_lens_ptr + token_id) if HAS_EXTRA else 0
+    total_len = extra_len + swa_len
+    loop_end = tl.cdiv(total_len, BLOCK_N) * BLOCK_N
+
+    for start in range(0, loop_end, BLOCK_N):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        use_extra = HAS_EXTRA & (offs_n < extra_len)
+        use_swa = (offs_n >= extra_len) & (offs_n < total_len)
+
+        extra_cols = offs_n
+        swa_cols = offs_n - extra_len
+        extra_idx = tl.load(
+            extra_indices_ptr
+            + token_id * stride_extra_idx_t
+            + extra_cols * stride_extra_idx_k,
+            mask=HAS_EXTRA & (extra_cols < extra_index_topk),
+            other=-1,
+        )
+        swa_idx = tl.load(
+            swa_indices_ptr + token_id * stride_swa_idx_t + swa_cols * stride_swa_idx_k,
+            mask=(swa_cols >= 0) & (swa_cols < swa_index_topk),
+            other=-1,
+        )
+        idx = tl.where(use_extra, extra_idx, swa_idx)
+
+        extra_block = idx // extra_block_size
+        extra_pos = idx - extra_block * extra_block_size
+        swa_block = idx // swa_block_size
+        swa_pos = idx - swa_block * swa_block_size
+        valid_extra = use_extra & (idx >= 0) & (extra_block < extra_num_blocks)
+        valid_swa = use_swa & (idx >= 0) & (swa_block < swa_num_blocks)
+        valid = valid_extra | valid_swa
+
+        extra_token_base = extra_block * extra_stride_block_elems
+        extra_token_base += extra_pos * TOKEN_ELEMS
+        swa_token_base = swa_block * swa_stride_block_elems
+        swa_token_base += swa_pos * TOKEN_ELEMS
+        token_base = tl.where(use_extra, extra_token_base, swa_token_base)
+        k = tl.load(
+            tl.where(use_extra[:, None], extra_cache_bf16_ptr, swa_cache_bf16_ptr)
+            + token_base[:, None]
+            + offs_d[None, :],
+            mask=valid[:, None] & mask_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        qk_offsets = (
+            token_id * num_heads + heads[:, None]
+        ) * SELECTED_CAPACITY + offs_n[None, :]
+        qk = tl.load(
+            qk_ptr + qk_offsets,
+            mask=mask_h[:, None]
+            & valid[None, :]
+            & (offs_n[None, :] < SELECTED_CAPACITY),
+            other=-3.4028234663852886e38,
+        )
+        next_max = tl.maximum(tl.max(qk, 1), e_max)
+        old_scale = tl.exp2(e_max - next_max)
+        probabilities = tl.exp2(qk - next_max[:, None])
+        probabilities = tl.where(mask_h[:, None] & valid[None, :], probabilities, 0.0)
+        acc = acc * old_scale[:, None] + tl.dot(probabilities.to(k.dtype), k)
+        e_sum = e_sum * old_scale + tl.sum(probabilities, 1)
+        e_max = next_max
+
+    acc = acc / tl.maximum(e_sum, 1.0e-20)[:, None]
+    tl.store(
+        out_ptr
+        + token_id * stride_out_t
+        + heads[:, None] * stride_out_h
+        + offs_d[None, :] * stride_out_d,
+        acc.to(tl.bfloat16),
+        mask=mask_h[:, None] & mask_d[None, :],
+    )
+
+
+def decode_sparse_attention_bf16(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor | None,
+    out: torch.Tensor,
+    extra_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_lens: torch.Tensor | None = None,
+) -> None:
+    """Parallel QK plus order-preserving SM86 BF16 sparse MLA decode."""
+    if swa_indices.ndim == 3:
+        swa_indices = swa_indices.squeeze(1)
+    if extra_indices is not None and extra_indices.ndim == 3:
+        extra_indices = extra_indices.squeeze(1)
+
+    num_tokens, num_heads, head_dim = q.shape
+    if num_tokens == 0:
+        return
+    if q.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise TypeError("SM86 sparse attention requires BF16 query and output")
+    if head_dim != FP8_DS_BF16_TOKEN_ELEMS or num_heads != 64:
+        raise ValueError(f"DSV4 sparse attention expects H=64,D=512, got {q.shape}")
+
+    has_extra = bool(
+        extra_cache is not None and extra_indices is not None and extra_lens is not None
+    )
+    if not has_extra:
+        extra_cache = swa_cache
+        extra_indices = swa_indices[:, :1]
+        extra_lens = swa_lens
+
+    assert extra_cache is not None
+    assert extra_indices is not None
+    assert extra_lens is not None
+    swa_cache_bf16 = swa_cache.view(torch.bfloat16)
+    extra_cache_bf16 = extra_cache.view(torch.bfloat16)
+    selected_capacity = swa_indices.shape[-1]
+    if has_extra:
+        selected_capacity += extra_indices.shape[-1]
+    qk = torch.empty(
+        (num_tokens, num_heads, selected_capacity),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    qk_grid = (
+        num_tokens,
+        triton.cdiv(num_heads, DSV4_SM86_SPARSE_BLOCK_H),
+        triton.cdiv(selected_capacity, DSV4_SM86_SPARSE_BLOCK_N),
+    )
+    _decode_sparse_attention_bf16_qk_kernel[qk_grid](
+        q,
+        swa_cache_bf16,
+        swa_indices,
+        swa_lens,
+        extra_cache_bf16,
+        extra_indices,
+        extra_lens,
+        qk,
+        num_tokens,
+        num_heads,
+        swa_indices.shape[-1],
+        extra_indices.shape[-1] if has_extra else 0,
+        swa_cache_bf16.shape[0],
+        extra_cache_bf16.shape[0],
+        swa_cache_bf16.shape[1],
+        extra_cache_bf16.shape[1],
+        swa_cache_bf16.stride(0),
+        extra_cache_bf16.stride(0),
+        scale * LOG2E,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        swa_indices.stride(0),
+        swa_indices.stride(1),
+        extra_indices.stride(0),
+        extra_indices.stride(1),
+        BLOCK_H=DSV4_SM86_SPARSE_BLOCK_H,
+        BLOCK_N=DSV4_SM86_SPARSE_BLOCK_N,
+        BLOCK_D=head_dim,
+        TOKEN_ELEMS=FP8_DS_BF16_TOKEN_ELEMS,
+        SELECTED_CAPACITY=selected_capacity,
+        HAS_EXTRA=has_extra,
+        num_stages=1,
+        num_warps=DSV4_SM86_SPARSE_NUM_WARPS,
+    )
+
+    value_grid = (
+        num_tokens,
+        triton.cdiv(num_heads, DSV4_SM86_SPARSE_BLOCK_H),
+        triton.cdiv(head_dim, DSV4_SM86_SPARSE_BLOCK_D_OUT),
+    )
+    _decode_sparse_attention_bf16_value_kernel[value_grid](
+        swa_cache_bf16,
+        swa_indices,
+        swa_lens,
+        extra_cache_bf16,
+        extra_indices,
+        extra_lens,
+        attn_sink if attn_sink is not None else q,
+        qk,
+        out,
+        num_tokens,
+        num_heads,
+        swa_indices.shape[-1],
+        extra_indices.shape[-1] if has_extra else 0,
+        swa_cache_bf16.shape[0],
+        extra_cache_bf16.shape[0],
+        swa_cache_bf16.shape[1],
+        extra_cache_bf16.shape[1],
+        swa_cache_bf16.stride(0),
+        extra_cache_bf16.stride(0),
+        swa_indices.stride(0),
+        swa_indices.stride(1),
+        extra_indices.stride(0),
+        extra_indices.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BLOCK_H=DSV4_SM86_SPARSE_BLOCK_H,
+        BLOCK_N=DSV4_SM86_SPARSE_BLOCK_N,
+        BLOCK_D_OUT=DSV4_SM86_SPARSE_BLOCK_D_OUT,
+        HEAD_DIM=head_dim,
+        TOKEN_ELEMS=FP8_DS_BF16_TOKEN_ELEMS,
+        SELECTED_CAPACITY=selected_capacity,
+        HAS_EXTRA=has_extra,
+        HAS_SINK=attn_sink is not None,
+        LOG2E_CONST=LOG2E,
+        num_stages=1,
+        num_warps=DSV4_SM86_SPARSE_NUM_WARPS,
     )
 
 
