@@ -2846,7 +2846,13 @@ class ServerArgs:
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
-            self.grammar_backend = "xgrammar"
+            # xgrammar declares a dependency on the upstream ``transformers``
+            # distribution. sglang-kt intentionally uses transformers-kt,
+            # which provides the same import package, so installing both would
+            # make their files overwrite one another. llguidance is already a
+            # required dependency and provides the default structured-output
+            # backend without that namespace collision.
+            self.grammar_backend = "llguidance"
 
     def _handle_mamba_backend(self):
         if self.mamba_backend == "flashinfer":
@@ -6259,7 +6265,14 @@ class ServerArgs:
         if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
             return
 
-        if self.get_model_config().is_multimodal:
+        model_config = self.get_model_config()
+        # GLM-5.3-flash flattens each non-overlapping vision patch and applies
+        # the Conv3d weights with F.linear, so it does not execute the affected
+        # cuDNN Conv3d path. Keep the global guard for every other VLM.
+        if getattr(model_config, "is_glm5_next", False):
+            return
+
+        if model_config.is_multimodal:
             import torch
 
             if torch_release[:3] == (2, 9, 1):
