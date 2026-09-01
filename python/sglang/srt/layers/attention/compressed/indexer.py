@@ -764,6 +764,7 @@ class C4IndexerBackend:
         # Backend selection (capability-driven, env override):
         #   - env SGLANG_OPT_USE_TILELANG_INDEXER=1 forces tilelang.
         #   - env SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 forces torch.
+        #   - SM86 decode uses the page-parallel BF16 Triton kernel.
         #   - Otherwise: cap in DEEPGEMM_CAPS -> deep_gemm; else tilelang.
         # Origin: sglang 本身.
         _has_dg_caps = (torch.cuda.get_device_capability() in DEEPGEMM_CAPS
@@ -786,9 +787,16 @@ class C4IndexerBackend:
         elif _force_torch:
             fn = fp8_paged_mqa_logits_torch
             seq_lens_2d = False
+        elif _cc == (8, 6) and forward_batch.forward_mode.is_decode():
+            from sglang.srt.layers.attention.compressed.sm86_indexer import (
+                bf16_direct_paged_mqa_logits_triton as fn,
+            )
+
+            seq_lens_2d = False
         elif _cc < (8, 9):
             # SM_86: KV cache already bfloat16 (no act_quant in compressor),
             # so the kernel reads BF16 directly — no dequant, no scales.
+            # Prefill and speculative modes stay on the existing path.
             fn = bf16_direct_paged_mqa_logits_tilelang
             seq_lens_2d = False
         else:

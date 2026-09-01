@@ -118,12 +118,29 @@ def _v4_triton_decode_dispatch(
     # SM_86 BF16 mode: cache is all-bf16 (1024 B/token), no FP8.
     from sglang.srt.layers.attention.nsa.v4_triton_kernel import (
         decode_sparse_attention_bf16,
+        decode_sparse_attention_bf16_legacy,
         decode_sparse_attention_triton,
     )
 
     if swa_cache.shape[-1] == 1024:
         # BF16 cache (nope 448×2 + rope 64×2 = 1024 bytes)
-        decode_sparse_attention_bf16(
+        # Two-stage QK/value decode pays off for batch-1 C4, while its QK
+        # workspace scales with num_tokens and must not be allocated by
+        # prefill/extend calls. The extra launch is also slower for SWA-only
+        # and short C128 selections.
+        # Use static tensor widths so CUDA Graph capture never reads a length
+        # tensor back to the host.
+        selected_capacity = indices.shape[-1]
+        if extra_indices_in_kvcache is not None:
+            selected_capacity += extra_indices_in_kvcache.shape[-1]
+        bf16_decode = (
+            decode_sparse_attention_bf16
+            if _device_capability() == (8, 6)
+            and num_tokens == 1
+            and selected_capacity >= 512
+            else decode_sparse_attention_bf16_legacy
+        )
+        bf16_decode(
             q=q_2d if q_2d.dtype == torch.bfloat16 else q_2d.to(torch.bfloat16),
             swa_cache=swa_cache,
             swa_indices=indices,
