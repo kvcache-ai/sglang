@@ -219,8 +219,15 @@ class Glm4vVisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        x = self.proj(x).view(-1, self.hidden_size)
-        return x
+        # Every input item is exactly one non-overlapping 3D patch.  Flattening
+        # that patch and applying the Conv3d weights as a linear projection is
+        # mathematically identical to Conv3d(kernel_size=stride=patch_size),
+        # while avoiding the broken/very slow torch 2.9.1 + cuDNN < 9.15 path.
+        return F.linear(
+            x.flatten(start_dim=1),
+            self.proj.weight.flatten(start_dim=1),
+            self.proj.bias,
+        )
 
 
 class Glm4vPatchMerger(nn.Module):
