@@ -78,6 +78,15 @@ class TestCacheReport(CustomTestCase):
         )
         return response
 
+    def run_openai_with_cache_identity(self, message, identity):
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": message}],
+            temperature=0,
+            max_tokens=1,
+            extra_body=identity,
+        )
+
     async def run_openai_async(self, message):
         response = await self.aclient.chat.completions.create(
             model=self.model,
@@ -283,6 +292,72 @@ class TestCacheReport(CustomTestCase):
         assert (
             cached_tokens_2_second == cached_tokens_2_first
         ), "Should have cache hit with same cache_salt for salt2"
+
+    def test_cache_identity_collision_resistance(self):
+        collision_pairs = [
+            (
+                {"cache_salt": "same-value"},
+                {"extra_key": "same-value"},
+            ),
+            (
+                {"cache_salt": "a", "extra_key": "bc"},
+                {"cache_salt": "ab", "extra_key": "c"},
+            ),
+        ]
+
+        for index, (first_identity, second_identity) in enumerate(collision_pairs):
+            with self.subTest(index=index):
+                message = (
+                    f"Unique cache identity collision regression case {index}: "
+                    "the same prompt must remain isolated across namespaces."
+                )
+                first = self.run_openai_with_cache_identity(message, first_identity)
+                repeated = self.run_openai_with_cache_identity(message, first_identity)
+                isolated = self.run_openai_with_cache_identity(message, second_identity)
+
+                first_cached = int(first.usage.prompt_tokens_details.cached_tokens)
+                repeated_cached = int(
+                    repeated.usage.prompt_tokens_details.cached_tokens
+                )
+                isolated_cached = int(
+                    isolated.usage.prompt_tokens_details.cached_tokens
+                )
+
+                assert repeated_cached == int(repeated.usage.prompt_tokens) - 1
+                assert isolated_cached <= first_cached + self.min_cached
+
+    def test_session_extra_key_isolation(self):
+        requests.post(self.base_url + "/flush_cache")
+        session_id = requests.post(
+            self.base_url + "/open_session",
+            json={"capacity_of_str_len": 1000},
+        ).json()
+        payload = {
+            "text": (
+                "Unique session cache namespace regression prompt whose KV cache "
+                "must not be reused by another extra key."
+            ),
+            "session_params": {
+                "id": session_id,
+                "rid": None,
+                "offset": 0,
+                "replace": False,
+            },
+            "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            "extra_key": "session-a",
+        }
+
+        first = requests.post(self.base_url + "/generate", json=payload).json()
+        repeated = requests.post(self.base_url + "/generate", json=payload).json()
+        payload["extra_key"] = "session-b"
+        isolated = requests.post(self.base_url + "/generate", json=payload).json()
+
+        first_cached = int(first["meta_info"]["cached_tokens"])
+        repeated_cached = int(repeated["meta_info"]["cached_tokens"])
+        isolated_cached = int(isolated["meta_info"]["cached_tokens"])
+
+        assert repeated_cached == int(repeated["meta_info"]["prompt_tokens"]) - 1
+        assert isolated_cached <= first_cached + self.min_cached
 
 
 if __name__ == "__main__":
