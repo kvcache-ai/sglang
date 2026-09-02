@@ -307,6 +307,7 @@ class TestCacheReport(CustomTestCase):
 
         for index, (first_identity, second_identity) in enumerate(collision_pairs):
             with self.subTest(index=index):
+                requests.post(self.base_url + "/flush_cache")
                 message = (
                     f"Unique cache identity collision regression case {index}: "
                     "the same prompt must remain isolated across namespaces."
