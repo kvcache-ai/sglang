@@ -2606,7 +2606,8 @@ class SharedFullContext:
             if _cur is None or _cur.shape != _shape or _cur.dtype != _dtype:
                 setattr(self.gpu_layer, _sn,
                         torch.nn.Parameter(
-                            torch.empty(_shape, dtype=_dtype, device=_device)))
+                            torch.empty(_shape, dtype=_dtype, device=_device),
+                            requires_grad=False))
     def load(self, layer_idx, wrapper, original_layer=None, gpu_experts_mask=None,
              logical_to_gpu_index=None):
         """Load weights from disk to GPU via shared memory.
