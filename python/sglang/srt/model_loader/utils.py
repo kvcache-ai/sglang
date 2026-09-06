@@ -133,6 +133,29 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
             model.post_load_weights()
 
 
+def restore_weights_before_loading(model: nn.Module) -> None:
+    """Restore modules back to checkpoint-loading layout before online updates.
+
+    Some quantization schemes, such as compressed-tensors Marlin MoE, repack
+    weights into a runtime-optimized layout after loading. External update
+    paths must first restore those parameters to their checkpoint-loading
+    layout before calling `model.load_weights(...)` again.
+    """
+
+    for _, module in model.named_modules():
+        restorer = None
+
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            restorer = getattr(quant_method, "restore_weights_before_loading", None)
+
+        if restorer is None and hasattr(module, "scheme"):
+            restorer = getattr(module.scheme, "restore_weights_before_loading", None)
+
+        if callable(restorer):
+            restorer(module)
+
+
 def should_deepgemm_weight_requant_ue8m0(weight_block_size):
     """Should we requant fp8 weights into UE8M0 format when loading the model"""
     return (

@@ -829,6 +829,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if language_weights:
             self.language_model.load_weights(language_weights)
 
+    def post_load_weights(self):
+        """Post-process weights after loading, forwarding to language model"""
+        self.language_model.post_load_weights()
+
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):
         text_config = config.text_config
