@@ -886,6 +886,7 @@ class ServerArgs:
     kt_gpu_prefill_token_threshold: Optional[int] = None
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
+    kt_mmap_experts_dir: Optional[str] = None
     kt_expert_placement_strategy: str = "uniform"
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
@@ -5316,6 +5317,17 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.kt_enable_dynamic_expert_update,
             help="[ktransformers parameter] Enable dynamic GPU expert updates based on runtime statistics. After full GPU fallback computation, updates original layer's GPU experts to match the most frequently activated experts in the current batch.",
+        )
+        parser.add_argument(
+            "--kt-mmap-experts-dir",
+            type=str,
+            default=ServerArgs.kt_mmap_experts_dir,
+            help="[ktransformers parameter] Directory (ideally on fast NVMe) in which to keep the "
+                 "CPU-resident per-expert weight blocks as MAP_SHARED files instead of anonymous "
+                 "RAM. Use when the CPU expert working set is close to total host RAM: cold experts "
+                 "then reclaim without swap and refault from the file. One file per (layer, NUMA "
+                 "part); a few %% of decode throughput is spent on the first pass while pages warm. "
+                 "Unset = keep expert weights in anonymous memory (default).",
         )
         parser.add_argument(
             "--kt-expert-placement-strategy",

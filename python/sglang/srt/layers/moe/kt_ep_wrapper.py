@@ -190,6 +190,7 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
+    mmap_experts_dir: Optional[str] = None
     expert_lora_path: Optional[str] = None
     is_glm5_next: bool = False
 
@@ -4724,6 +4725,7 @@ def create_kt_config_from_server_args(
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
+        mmap_experts_dir=getattr(server_args, "kt_mmap_experts_dir", None),
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
         is_glm5_next=getattr(server_args, "_glm5_next_session_ab_active", False),
     )
@@ -5261,6 +5263,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     swiglu_alpha=_kt_swiglu_alpha,
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
+                    mmap_experts_dir=self.kt_config.mmap_experts_dir,
                 )
 
         # Registration happens during model construction, not on the first
