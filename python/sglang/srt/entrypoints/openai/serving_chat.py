@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -13,7 +14,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import encoding_dsv32
+from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv32, encoding_dsv4
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -57,6 +58,78 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def resolve_dsv4_reasoning_controls(
+    *,
+    request_effort: Optional[str],
+    chat_template_kwargs: Optional[Dict[str, Any]],
+    reasoning_effort_profile: str,
+    dsv4_env_effort: str = "",
+    legacy_env_effort: str = "",
+    legacy_env_thinking: Optional[bool] = None,
+) -> tuple[str, Optional[str]]:
+    """Resolve DSV4 thinking and effort once for Chat and Responses requests.
+
+    A non-null standard API field wins over all SGLang compatibility inputs.
+    Unsupported DSV4 values intentionally fall back to max instead of becoming
+    protocol errors, matching the DSV4 Docker API contract.
+    """
+
+    ctk = chat_template_kwargs or {}
+    if request_effort is not None:
+        effort = request_effort
+        source = "reasoning_effort"
+        thinking_override = None
+    elif ctk.get("reasoning_effort") is not None:
+        effort = ctk["reasoning_effort"]
+        source = "chat_template_kwargs.reasoning_effort"
+        thinking_override = _coerce_optional_bool(ctk.get("thinking"))
+    elif dsv4_env_effort:
+        effort = dsv4_env_effort
+        source = "SGLANG_DSV4_REASONING_EFFORT"
+        thinking_override = _coerce_optional_bool(ctk.get("thinking"))
+    elif legacy_env_effort:
+        effort = legacy_env_effort
+        source = "SGLANG_REASONING_EFFORT"
+        thinking_override = _coerce_optional_bool(ctk.get("thinking"))
+    else:
+        effort = "max"
+        source = "default"
+        thinking_override = _coerce_optional_bool(ctk.get("thinking"))
+
+    if request_effort is None and thinking_override is None:
+        thinking_override = legacy_env_thinking
+
+    if effort == "none":
+        return "chat", None
+
+    accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[reasoning_effort_profile]
+    if not isinstance(effort, str) or effort not in accepted_efforts:
+        logger.warning(
+            "Unsupported DeepSeek-V4 reasoning effort %r from %s; "
+            "falling back to thinking + max",
+            effort,
+            source,
+        )
+        effort = "max"
+
+    thinking_enabled = True if thinking_override is None else thinking_override
+    return ("thinking" if thinking_enabled else "chat"), effort
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -123,6 +196,22 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or None.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
+        self._dsv4_reasoning_effort_profile = (
+            chat_encoding.resolve_dsv4_reasoning_effort_profile(
+                model_path=self.tokenizer_manager.model_path,
+                revision=self.tokenizer_manager.server_args.revision,
+                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
+                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
+                ),
+            )
+            if self.chat_encoding_spec == "dsv4"
+            else None
+        )
+        if self._dsv4_reasoning_effort_profile is not None:
+            logger.info(
+                "DeepSeek-V4 reasoning effort profile=%s default_effort=max",
+                self._dsv4_reasoning_effort_profile,
+            )
 
     def _handle_last_assistant_message(
         self,
@@ -208,6 +297,17 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if self.chat_encoding_spec != "dsv4" and request.reasoning_effort not in (
+            None,
+            "low",
+            "medium",
+            "high",
+        ):
+            return (
+                f"Unsupported reasoning_effort={request.reasoning_effort!r} for "
+                "this model. Expected one of: low, medium, high."
+            )
+
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
@@ -256,13 +356,13 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-        reasoning_effort = (
-            request.chat_template_kwargs.pop("reasoning_effort", None)
-            if request.chat_template_kwargs
-            else None
-        )
-        if reasoning_effort is not None:
-            request.reasoning_effort = reasoning_effort
+        if self.chat_encoding_spec != "dsv4" and request.reasoning_effort is None:
+            legacy_reasoning_effort = (
+                request.chat_template_kwargs.get("reasoning_effort")
+                if request.chat_template_kwargs
+                else None
+            )
+            request.reasoning_effort = legacy_reasoning_effort or "medium"
 
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
@@ -395,12 +495,31 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         if self.chat_encoding_spec is not None:
-            # Per-request wins; env is fallback so existing
-            # `export SGLANG_ENABLE_THINKING=1` workflow keeps working here.
-            thinking_requested = (request.chat_template_kwargs or {}).get(
-                "thinking", envs.SGLANG_ENABLE_THINKING.get()
-            )
-            thinking_mode = "thinking" if thinking_requested else "chat"
+            if self.chat_encoding_spec == "dsv4":
+                assert self._dsv4_reasoning_effort_profile is not None
+                legacy_env_thinking = (
+                    envs.SGLANG_ENABLE_THINKING.get()
+                    if "SGLANG_ENABLE_THINKING" in os.environ
+                    else None
+                )
+                thinking_mode, v4_reasoning_effort = resolve_dsv4_reasoning_controls(
+                    request_effort=request.reasoning_effort,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    reasoning_effort_profile=self._dsv4_reasoning_effort_profile,
+                    dsv4_env_effort=envs.SGLANG_DSV4_REASONING_EFFORT.get(),
+                    legacy_env_effort=envs.SGLANG_REASONING_EFFORT.get(),
+                    legacy_env_thinking=legacy_env_thinking,
+                )
+                if request.chat_template_kwargs is None:
+                    request.chat_template_kwargs = {}
+                # The response parsers need the resolved toggle because the
+                # DSV4 prompt consumes the opening <think> marker.
+                request.chat_template_kwargs["thinking"] = thinking_mode == "thinking"
+            else:
+                thinking_requested = (request.chat_template_kwargs or {}).get(
+                    "thinking", envs.SGLANG_ENABLE_THINKING.get()
+                )
+                thinking_mode = "thinking" if thinking_requested else "chat"
             messages = [msg.model_dump() for msg in request.messages]
 
             for msg in messages:
@@ -429,23 +548,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
 
             if self.chat_encoding_spec == "dsv4":
-                # V4 encoder only accepts "max" / "high" / None.
-                # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
-                # Fallback: if request didn't set it, try env SGLANG_REASONING_EFFORT.
-                effort_source = request.reasoning_effort
-                if effort_source is None:
-                    env_val = envs.SGLANG_REASONING_EFFORT.get()
-                    if env_val:
-                        effort_source = env_val
-                v4_reasoning_effort = (
-                    effort_source if effort_source in ("max", "high") else None
-                )
-                from sglang.srt.entrypoints.openai import encoding_dsv4
-
                 real_input = encoding_dsv4.encode_messages(
                     messages,
                     thinking_mode=thinking_mode,
                     reasoning_effort=v4_reasoning_effort,
+                    reasoning_effort_profile=self._dsv4_reasoning_effort_profile,
                 )
             else:
                 real_input = encoding_dsv32.encode_messages(
@@ -1120,10 +1227,7 @@ class OpenAIServingChat(OpenAIServingBase):
         native_forced_tool_format = self.tool_call_parser == "glm47"
         if not native_forced_tool_format and (
             tool_choice == "required"
-            or (
-                isinstance(tool_choice, ToolChoice)
-                and tool_choice.type == "function"
-            )
+            or (isinstance(tool_choice, ToolChoice) and tool_choice.type == "function")
         ):
             # Set finish reason to tool_calls since we're processing tool calls
             if finish_reason["type"] == "stop":

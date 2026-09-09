@@ -589,12 +589,11 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
-        default="medium",
+    reasoning_effort: Optional[str] = Field(
+        default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
-        "result in faster responses and fewer tokens used on reasoning in a response. "
-        "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
+        "Supported values are model-specific. DeepSeek-V4 accepts low, high, max, and none; "
+        "unsupported values are resolved by its model-specific compatibility policy.",
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -678,7 +677,7 @@ class ChatCompletionRequest(BaseModel):
 
         if isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"low", "medium", "high"}:
+            if isinstance(effort, str) and values.get("reasoning_effort") is None:
                 values["reasoning_effort"] = effort
 
             enabled = (
@@ -1111,24 +1110,34 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
-        default="medium",
+    effort: Optional[str] = Field(
+        default=None,
         description="Constrains effort on reasoning for reasoning models.",
+    )
+    summary: Optional[str] = Field(
+        default=None,
+        description="Requests a reasoning summary in Responses API output.",
     )
 
 
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
-    )
+    model_config = {"extra": "allow"}
+
+    type: str = Field(description="Type of tool to enable")
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
+    tools: Optional[List[Dict[str, Any]]] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
+    Dict[str, Any],
 ]
 
 
@@ -1137,18 +1146,7 @@ class ResponsesRequest(BaseModel):
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
-    include: Optional[
-        List[
-            Literal[
-                "code_interpreter_call.outputs",
-                "computer_call_output.output.image_url",
-                "file_search_call.results",
-                "message.input_image.image_url",
-                "message.output_text.logprobs",
-                "reasoning.encrypted_content",
-            ]
-        ]
-    ] = None
+    include: Optional[List[str]] = None
     input: Union[str, List[ResponseInputOutputItem]]
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
@@ -1162,7 +1160,7 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tool_choice: Union[Literal["auto", "required", "none"], Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
@@ -1182,6 +1180,7 @@ class ResponsesRequest(BaseModel):
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"
     )
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
     # SGLang-specific sampling parameters
     frequency_penalty: float = 0.0
@@ -1253,6 +1252,46 @@ class PromptTokenUsageInfo(BaseModel):
     cached_tokens: int = 0
 
 
+class ResponseInputTokensDetails(BaseModel):
+    """Responses API input token details."""
+
+    cached_tokens: int = 0
+
+
+class ResponseOutputTokensDetails(BaseModel):
+    """Responses API output token details."""
+
+    reasoning_tokens: int = 0
+
+
+class ResponseUsageInfo(BaseModel):
+    """OpenAI-compatible token usage for the Responses API."""
+
+    input_tokens: int
+    input_tokens_details: ResponseInputTokensDetails
+    output_tokens: int
+    output_tokens_details: ResponseOutputTokensDetails
+    total_tokens: int
+
+    @classmethod
+    def from_usage_info(cls, usage: UsageInfo) -> "ResponseUsageInfo":
+        return cls(
+            input_tokens=usage.prompt_tokens,
+            input_tokens_details=ResponseInputTokensDetails(
+                cached_tokens=(
+                    usage.prompt_tokens_details.cached_tokens
+                    if usage.prompt_tokens_details is not None
+                    else 0
+                )
+            ),
+            output_tokens=usage.completion_tokens or 0,
+            output_tokens_details=ResponseOutputTokensDetails(
+                reasoning_tokens=usage.reasoning_tokens or 0
+            ),
+            total_tokens=usage.total_tokens,
+        )
+
+
 class ResponsesResponse(BaseModel):
     """Response body for v1/responses endpoint."""
 
@@ -1265,9 +1304,9 @@ class ResponsesResponse(BaseModel):
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
-    usage: Optional[UsageInfo] = None
+    usage: Optional[ResponseUsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Union[str, Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
@@ -1345,8 +1384,12 @@ class ResponsesResponse(BaseModel):
             model=model_name,
             output=output,
             status=status,
-            usage=usage,
-            parallel_tool_calls=request.parallel_tool_calls or True,
+            usage=(ResponseUsageInfo.from_usage_info(usage) if usage else None),
+            parallel_tool_calls=(
+                True
+                if request.parallel_tool_calls is None
+                else request.parallel_tool_calls
+            ),
             tool_choice=request.tool_choice,
             tools=request.tools,
             # fields for parity with v1/responses
@@ -1357,7 +1400,7 @@ class ResponsesResponse(BaseModel):
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
                 "effort": request.reasoning.effort if request.reasoning else None,
-                "summary": None,  # unused
+                "summary": request.reasoning.summary if request.reasoning else None,
             },
             store=request.store,
             temperature=request.temperature,
@@ -1420,7 +1463,10 @@ class ResponseReasoningTextContent(BaseModel):
 
 
 ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
+    ResponseInputItemParam,
+    "ResponseReasoningItem",
+    ResponseFunctionToolCall,
+    Dict[str, Any],
 ]
 
 
