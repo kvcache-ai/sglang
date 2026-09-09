@@ -486,8 +486,9 @@ class Envs:
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     SGLANG_ENABLE_THINKING = EnvBool(False)
-    # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
-    # Accepts "", "max", "high" (empty string means unset). Other values filtered to None.
+    # Model-specific DeepSeek-V4 effort default. Empty means use the product default.
+    SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # Deprecated compatibility alias for SGLANG_DSV4_REASONING_EFFORT.
     SGLANG_REASONING_EFFORT = EnvStr("")
 
     SGLANG_DSV4_MODE = EnvStr("")
