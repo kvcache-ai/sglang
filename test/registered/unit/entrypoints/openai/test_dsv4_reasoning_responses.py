@@ -10,8 +10,8 @@ from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     RequestResponseMetadata,
-    ResponsesResponse,
     ResponsesRequest,
+    ResponsesResponse,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (

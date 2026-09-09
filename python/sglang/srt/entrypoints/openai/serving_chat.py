@@ -14,7 +14,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv32, encoding_dsv4
+from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
