@@ -371,6 +371,7 @@ class MMReceiverHTTP(MMReceiverBase):
                 if self.scheduler.enable_metrics
                 else None
             ),
+            extra_key=recv_req.extra_key,
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
         )

@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import torch
 
+from sglang.srt.cache_identity import encode_cache_identity
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -629,13 +630,10 @@ class Req(ReqDllmMixin):
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
-        # extra key for classifying the request (e.g. cache_salt)
-        if lora_id is not None:
-            extra_key = (
-                extra_key or ""
-            ) + lora_id  # lora_id is concatenated to the extra key
-
-        self.extra_key = extra_key
+        # Fold the caller namespace and adapter into one unambiguous radix key.
+        self.extra_key = encode_cache_identity(
+            "request", extra_key=extra_key, lora_id=lora_id
+        )
         self.lora_id = lora_id
         self.routing_key = routing_key
 
