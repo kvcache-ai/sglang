@@ -1974,6 +1974,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
+        for name in tuple(unloaded_params):
+            owner = self.get_submodule(name.rsplit(".", 1)[0])
+            is_cpu_owned = getattr(
+                getattr(owner, "quant_method", None),
+                "is_cpu_owned_checkpoint_parameter",
+                None,
+            )
+            if is_cpu_owned is not None and is_cpu_owned(params_dict[name]):
+                unloaded_params.remove(name)
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
         if is_nextn:
@@ -2116,6 +2125,9 @@ def _dequant_fp8_wo_a(
         if name not in weights_dict:
             continue
         if not name.endswith(".wo_a.weight"):
+            continue
+        if weights_dict[name].dtype == torch.bfloat16:
+            # Static LoRA deployment already decoded and merged non-experts.
             continue
         scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
         assert scale_name in weights_dict
