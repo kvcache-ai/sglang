@@ -5981,6 +5981,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Main stream waits for cpu_stream to complete before merging results
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+            # The shared output can be replaced when a subsequent batch changes size.
+            cpu_output.record_stream(torch.cuda.current_stream(x.device))
             output = output + cpu_output
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
