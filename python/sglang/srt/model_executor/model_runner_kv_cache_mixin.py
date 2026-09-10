@@ -559,7 +559,21 @@ class ModelRunnerKVCacheMixin:
     def init_memory_pool(self: ModelRunner):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens_configured = self.server_args.max_total_tokens
-        self.max_total_num_tokens = self.profile_max_num_token()
+        # DeepSeek V4 keeps its KV state in a dedicated compressed-attention pool
+        # whose per-token footprint is far smaller than the generic KV estimate.
+        # set_num_tokens_hybrid_swa_compress() profiles that real layout itself,
+        # but it also treats self.max_total_num_tokens as the ceiling to apply
+        # when --max-total-tokens was given explicitly. Seeding that ceiling from
+        # the generic estimate caps the pool at a number derived from a layout
+        # the model never uses, so seed it with the configured value instead; the
+        # dedicated calculator still profiles VRAM and shrinks the pool from there.
+        if (
+            self.model_config.is_swa_with_compressed_attention
+            and max_total_tokens_configured is not None
+        ):
+            self.max_total_num_tokens = max_total_tokens_configured
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token()
 
         if max_num_reqs is None:
             max_num_reqs = min(
