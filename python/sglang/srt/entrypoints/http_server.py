@@ -151,6 +151,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_communicator_mixin import get_static_kt_lora_ref
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
@@ -1823,6 +1824,9 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    static_kt_lora = get_static_kt_lora_ref(server_args)
+    if static_kt_lora is not None:
+        json_data["lora_path"] = static_kt_lora.lora_name
     try:
         if server_args.disaggregation_mode == "null":
             res = requests.post(
@@ -1851,6 +1855,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
+            if static_kt_lora is not None:
+                json_data["lora_path"] = static_kt_lora.lora_name
             res = requests.post(
                 url + request_name,
                 json=json_data,
