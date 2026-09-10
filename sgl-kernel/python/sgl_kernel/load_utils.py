@@ -71,6 +71,17 @@ def _load_architecture_specific_ops():
 
     ops_pattern = str(sgl_kernel_dir / ops_subdir / "common_ops.*")
     raw_matching_files = glob.glob(ops_pattern)
+    if not raw_matching_files and ops_subdir == "sm100":
+        # PyPI's per-file size limit requires the KT release wheel to ship its
+        # validated CUDA objects in companion payload wheels.  Materialize the
+        # exact, checksummed object lazily when it is not embedded in the base
+        # wheel.  Source builds continue to use the in-wheel object above.
+        try:
+            from sgl_kernel.payload_runtime import materialize_binary
+
+            raw_matching_files = [str(materialize_binary("sm100/common_ops.abi3.so"))]
+        except (ImportError, FileNotFoundError):
+            pass
     matching_files = _filter_compiled_extensions(raw_matching_files)
 
     logger.debug(f"[sgl_kernel] Attempting to load {variant_name}")

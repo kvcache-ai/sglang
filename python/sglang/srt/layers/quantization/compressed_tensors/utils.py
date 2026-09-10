@@ -5,11 +5,12 @@ import re
 from types import MappingProxyType
 from typing import Iterable, List, Mapping, Optional
 
-from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
 
 def is_activation_quantization_format(format: str) -> bool:
+    from compressed_tensors import CompressionFormat
+
     _ACTIVATION_QUANTIZATION_FORMATS = [
         CompressionFormat.naive_quantized.value,
         CompressionFormat.int_quantized.value,

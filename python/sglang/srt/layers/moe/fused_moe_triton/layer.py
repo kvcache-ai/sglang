@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
+import importlib.util
 import logging
 from enum import Enum
 from typing import List, Optional, Tuple
@@ -53,9 +54,6 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsMxInt4MoE,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -71,6 +69,13 @@ from sglang.srt.utils import (
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+
+if importlib.util.find_spec("compressed_tensors") is not None:
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsMxInt4MoE,
+    )
+else:
+    CompressedTensorsMxInt4MoE = ()
 
 if is_flashinfer_available():
     from flashinfer import fp4_quantize

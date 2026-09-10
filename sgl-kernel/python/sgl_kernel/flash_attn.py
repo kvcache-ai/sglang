@@ -1,14 +1,26 @@
 from functools import lru_cache
 from typing import Optional, Union
 
+import importlib.util
+
 import torch
 
 try:
     from sgl_kernel import flash_ops
-except:
-    raise ImportError(
-        "Can not import FA3 in sgl_kernel. Please check your installation."
-    )
+except ImportError as embedded_error:
+    try:
+        from sgl_kernel.payload_runtime import materialize_binary
+
+        flash_ops_path = materialize_binary("flash_ops.abi3.so")
+        spec = importlib.util.spec_from_file_location("sgl_kernel.flash_ops", flash_ops_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load FA3 extension from {flash_ops_path}")
+        flash_ops = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(flash_ops)
+    except Exception as payload_error:
+        raise ImportError(
+            "Can not import FA3 in sgl_kernel. Please check your installation."
+        ) from payload_error
 
 try:
     from ._fa4_interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
