@@ -682,6 +682,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.language_model.get_hidden_dim(module_name, layer_idx)
+
+    def finalize_static_lora_weights(
+        self, adapter_id: str, buffer_id: int, lora_rank: int, scaling: float
+    ) -> None:
+        self.language_model.finalize_static_lora_weights(
+            adapter_id=adapter_id,
+            buffer_id=buffer_id,
+            lora_rank=lora_rank,
+            scaling=scaling,
+        )
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.vision_tower.dtype

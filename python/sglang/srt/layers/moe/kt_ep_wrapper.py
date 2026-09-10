@@ -213,6 +213,7 @@ _KT_SFT_METHOD_BY_INFERENCE_METHOD = {
     "FP8": "AMXFP8_SFT",
     "AMXINT8": "AMXINT8_SFT",
     "AMXINT4": "AMXINT4_SFT",
+    "RAWINT4": "RAWINT4_SFT",
 }
 
 _KT_SFT_METHODS_REQUIRING_SHARED_BACKWARD_BB = frozenset(
@@ -237,6 +238,11 @@ def _configure_kt_sft_wrapper_for_serving(wrapper, method: str) -> None:
 
 def _validate_kt_sft_runtime(method: str) -> None:
     """Feature-probe quantized SFT kernels before allocating layer state."""
+    if method == "RAWINT4_SFT":
+        from kt_kernel.sft import get_rawint4_runtime
+
+        get_rawint4_runtime()
+        return
     if method != "AMXFP8_SFT":
         return
     try:
@@ -247,6 +253,59 @@ def _validate_kt_sft_runtime(method: str) -> None:
             "get_fp8_runtime() and AMXFP8_SFT_MOE."
         ) from exc
     get_fp8_runtime()
+
+
+def _load_rawint4_sft_weights(
+    *,
+    weight_path: str,
+    layer_idx: int,
+    num_experts: int,
+    hidden_size: int,
+    moe_intermediate_size: int,
+    num_experts_per_tok: int,
+):
+    """Read signed group-32 experts from an indexed HF checkpoint."""
+    from kt_kernel.sft import (
+        MOEArchConfig,
+        get_rawint4_checkpoint_contract,
+        load_rawint4_experts_from_checkpoint_files,
+    )
+
+    checkpoint_dir = Path(weight_path)
+    with (checkpoint_dir / "config.json").open(encoding="utf-8") as handle:
+        get_rawint4_checkpoint_contract(json.load(handle))
+    with (checkpoint_dir / "model.safetensors.index.json").open(
+        encoding="utf-8"
+    ) as handle:
+        metadata = json.load(handle)
+    weight_map = metadata.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("RAWINT4 expert LoRA requires a non-empty safetensors index.")
+
+    suffix = f".{layer_idx}.mlp.experts.0.gate_proj.weight_packed"
+    prefixes = {key[: -len(suffix)] for key in weight_map if key.endswith(suffix)}
+    if len(prefixes) != 1:
+        raise ValueError(
+            f"Cannot resolve one RAWINT4 expert prefix for layer {layer_idx}."
+        )
+    moe_config = MOEArchConfig(
+        moe_layer_attr="mlp",
+        router_attr="gate",
+        experts_attr="experts",
+        weight_names=("gate_proj", "up_proj", "down_proj"),
+        expert_num=num_experts,
+        intermediate_size=moe_intermediate_size,
+        num_experts_per_tok=num_experts_per_tok,
+    )
+    return load_rawint4_experts_from_checkpoint_files(
+        checkpoint_files=sorted({str(checkpoint_dir / f) for f in weight_map.values()}),
+        sharded_metadata=metadata,
+        layers_prefix=prefixes.pop(),
+        moe_config=moe_config,
+        layer_idx=layer_idx,
+        hidden_size=hidden_size,
+        group_size=32,
+    )
 
 
 def _load_native_fp8_sft_weights(
@@ -5306,7 +5365,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if self.kt_expert_lora_enabled
                 else None
             )
-            if sft_method == "AMXFP8_SFT":
+            if sft_method == "RAWINT4_SFT":
+                raw_weights = _load_rawint4_sft_weights(
+                    weight_path=self.kt_config.weight_path,
+                    layer_idx=self.kt_config.layer_idx,
+                    num_experts=self.global_num_experts,
+                    hidden_size=self._full_init_args[0],
+                    moe_intermediate_size=self._full_init_args[1] * layer.moe_tp_size,
+                    num_experts_per_tok=layer.top_k,
+                )
+                self.wrapper.load_rawint4_weights(
+                    raw_weights, physical_to_logical_map_cpu
+                )
+            elif sft_method == "AMXFP8_SFT":
                 if not hasattr(self.wrapper, "load_block_fp8_weights"):
                     raise RuntimeError(
                         "The loaded kt-kernel FP8 SFT wrapper has no "

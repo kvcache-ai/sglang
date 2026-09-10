@@ -155,7 +155,7 @@ def _validate_kt_expert_lora_adapter_path(
         )
 
     keys = _safetensor_keys(weight_path)
-    expert_keys = [key for key in keys if _is_kt_expert_lora_key(key)]
+    expert_keys = {key for key in keys if _is_kt_expert_lora_key(key)}
     lora_keys = [
         key
         for key in keys
@@ -278,7 +278,7 @@ def _prepare_kt_composite_lora_adapter(adapter_path: str) -> Optional[tuple[str,
         # Let the normal LoRA loader handle non-safetensors or malformed adapters.
         return None
 
-    expert_keys = [key for key in tensor_keys if _is_kt_expert_lora_key(key)]
+    expert_keys = {key for key in tensor_keys if _is_kt_expert_lora_key(key)}
     if not expert_keys:
         if raw_compact_path.is_file():
             raise ValueError(
