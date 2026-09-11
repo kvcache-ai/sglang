@@ -257,6 +257,14 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
 
+        # With all routed experts handled on CPU (e.g. KT EP wrapper with
+        # --kt-num-gpu-experts 0), the GPU layer owns zero experts and every
+        # weight tensor here is empty; the Marlin repack kernels cannot handle
+        # 0-expert inputs, so there is nothing to convert.
+        if num_experts == 0 or layer.w13_weight_packed.numel() == 0:
+            layer.is_marlin_converted = True
+            return
+
         # when running models with grouped act order,
         # resort to g_idx values provided in checkpoint
         if self.actorder == "group":

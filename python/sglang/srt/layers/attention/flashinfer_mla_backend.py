@@ -1032,6 +1032,10 @@ class FlashInferMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
+    def on_after_cuda_graph_warmup_pass(self):
+        for backend in self.attn_backends:
+            backend.on_after_cuda_graph_warmup_pass()
+
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
