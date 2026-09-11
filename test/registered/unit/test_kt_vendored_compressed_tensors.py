@@ -27,7 +27,7 @@ def test_vendored_files_match_recorded_hashes():
 
 def test_runtime_does_not_import_the_upstream_distribution():
     for path in (ROOT / "python/sglang").rglob("*.py"):
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_bytes(), filename=str(path))
         for node in ast.walk(tree):
             names = [node.module or ""] if isinstance(node, ast.ImportFrom) else [a.name for a in node.names] if isinstance(node, ast.Import) else []
             assert not any(n == "compressed_tensors" or n.startswith("compressed_tensors.") for n in names), path
