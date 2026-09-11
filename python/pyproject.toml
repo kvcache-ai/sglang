@@ -16,6 +16,7 @@ classifiers = [
 
 dependencies = [
   "IPython",
+  "accelerate-kt==1.14.0.post3", # Required by the complete KT native wheel payload.
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
