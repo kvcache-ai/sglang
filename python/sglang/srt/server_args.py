@@ -6272,6 +6272,16 @@ class ServerArgs:
         if getattr(model_config, "is_glm5_next", False):
             return
 
+        # The native Kimi K2.5 MoonViT "3d" encoder embeds individual frames
+        # with nn.Conv2d and merges time with pooling (kimi_k25.py), not Conv3d.
+        # Do not reject PyTorch's pinned cuDNN for an operation this model does
+        # not use. Keep the guard for other VLMs and non-native backends.
+        hf_config = getattr(model_config, "hf_config", None)
+        if self.model_impl in ("auto", "sglang") and getattr(
+            hf_config, "architectures", None
+        ) == ["KimiK25ForConditionalGeneration"]:
+            return
+
         if model_config.is_multimodal:
             import torch
 

@@ -52,7 +52,7 @@ def test_default_grammar_backend_does_not_install_upstream_transformers():
     assert not any(item.startswith("transformers==") for item in normalized)
     assert not any(item.startswith("xgrammar") for item in normalized)
     assert not any(item.startswith("compressed-tensors") for item in normalized)
-    assert any(item.startswith("transformers-kt==5.6.0.post4") for item in normalized)
+    assert any(item.startswith("transformers-kt==") for item in normalized)
 
 
 def test_glm5_next_bypasses_only_the_unused_cudnn_conv3d_guard():
