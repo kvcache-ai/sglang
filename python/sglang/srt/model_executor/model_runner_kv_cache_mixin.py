@@ -568,7 +568,8 @@ class ModelRunnerKVCacheMixin:
         # the model never uses, so seed it with the configured value instead; the
         # dedicated calculator still profiles VRAM and shrinks the pool from there.
         if (
-            self.model_config.is_swa_with_compressed_attention
+            self.model_config.is_hybrid_swa
+            and self.model_config.is_swa_with_compressed_attention
             and max_total_tokens_configured is not None
         ):
             self.max_total_num_tokens = max_total_tokens_configured
