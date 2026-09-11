@@ -425,6 +425,9 @@ class ModelConfig:
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        # KV-pool initialization also reads these flags for non-SWA models.
+        self.is_swa_with_compressed_attention = False
+        self.is_hybrid_swa_compress = False
         self.is_hybrid_swa = (
             is_hybrid_swa_model(self.hf_config.architectures)
             and not self.disable_hybrid_swa_memory

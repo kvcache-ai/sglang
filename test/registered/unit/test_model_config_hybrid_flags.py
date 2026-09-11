@@ -1,0 +1,75 @@
+"""Hybrid KV-pool flags must be defined even when hybrid memory is disabled."""
+
+import ast
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+from typing import List
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def derive(architecture, *, disabled=False):
+    # Execute the actual dependency-light config methods without importing CUDA.
+    source = ROOT / "python/sglang/srt/configs/model_config.py"
+    tree = ast.parse(source.read_bytes())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ModelConfig")
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_derive_hybrid_model")
+    helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("is_hybrid_swa_model", "get_hybrid_layer_ids")]
+    module = ast.Module(body=helpers + [method], type_ignores=[])
+    ns = {"List": List, "PretrainedConfig": object, "logger": logging.getLogger(__name__)}
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), ns)
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[architecture]),
+        hf_text_config=SimpleNamespace(num_hidden_layers=4, hybrid_layer_pattern=[1, 0, 1, 0]),
+        disable_hybrid_swa_memory=disabled,
+    )
+    ns["_derive_hybrid_model"](config)
+    return config
+
+
+@pytest.mark.parametrize("architecture", [
+    "KimiK25ForConditionalGeneration", "DeepseekV3ForCausalLM",
+    "Glm5NextForCausalLM", "Qwen3MoeForCausalLM",
+])
+def test_non_hybrid_models_have_explicit_false_flags(architecture):
+    config = derive(architecture)
+    assert config.is_hybrid_swa is False
+    assert config.is_swa_with_compressed_attention is False
+    assert config.is_hybrid_swa_compress is False
+
+
+@pytest.mark.parametrize("architecture", ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"])
+def test_deepseek_compressed_pool_flags_preserved(architecture):
+    config = derive(architecture)
+    assert config.is_hybrid_swa is True
+    assert config.is_swa_with_compressed_attention is True
+    assert config.is_hybrid_swa_compress is False
+
+
+@pytest.mark.parametrize("architecture", ["MiMoV2FlashForCausalLM", "MiMoV2MTP"])
+def test_mimo_compressed_swa_flags_preserved(architecture):
+    config = derive(architecture)
+    assert config.is_hybrid_swa is True
+    assert config.is_swa_with_compressed_attention is False
+    assert config.is_hybrid_swa_compress is True
+    assert config.swa_attention_layer_ids == ([0, 2] if architecture == "MiMoV2FlashForCausalLM" else [0])
+
+
+@pytest.mark.parametrize("architecture", ["DeepseekV4ForCausalLM", "MiMoV2FlashForCausalLM", "KimiK25ForConditionalGeneration"])
+def test_disabled_hybrid_memory_has_false_flags(architecture):
+    config = derive(architecture, disabled=True)
+    assert config.is_hybrid_swa is False
+    assert config.is_swa_with_compressed_attention is False
+    assert config.is_hybrid_swa_compress is False
+
+
+def test_ordinary_hybrid_layer_mapping_preserved():
+    config = derive("Llama4ForConditionalGeneration")
+    assert config.is_hybrid_swa is True
+    assert config.is_swa_with_compressed_attention is False
+    assert config.is_hybrid_swa_compress is False
+    assert config.swa_attention_layer_ids == [0, 1, 2]
+    assert config.full_attention_layer_ids == [3]
