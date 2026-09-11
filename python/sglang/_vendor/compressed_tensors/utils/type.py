@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from typing import Annotated, Any
+
+import torch
+from pydantic import GetCoreSchemaHandler, GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import core_schema
+
+
+__all__ = ["TorchDtype", "TensorStateDict"]
+
+
+class _TorchDtypeAnnotation:
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        _source_type: Any,
+        _handler: GetCoreSchemaHandler,
+    ) -> core_schema.CoreSchema:
+        # support strings of the form `torch.xxx` or `xxx`
+        def validate_from_str(name: str) -> torch.dtype:
+            name = name.removeprefix("torch.")
+            try:
+                value = getattr(torch, name)
+                assert isinstance(value, torch.dtype)
+            except Exception:
+                raise ValueError(f"No such torch dtype `torch.{name}`")
+
+            return value
+
+        # package validation into a schema (which also validates str type)
+        from_str_schema = core_schema.chain_schema(
+            [
+                core_schema.str_schema(),
+                core_schema.no_info_plain_validator_function(validate_from_str),
+            ]
+        )
+
+        return core_schema.json_or_python_schema(
+            json_schema=from_str_schema,
+            python_schema=core_schema.union_schema(
+                [
+                    # support both torch.dtype or strings
+                    core_schema.is_instance_schema(torch.dtype),
+                    from_str_schema,
+                ]
+            ),
+            # serialize as `torch.xxx`
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda instance: str(instance)
+            ),
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, _core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        return handler(core_schema.str_schema())
+
+
+TorchDtype = Annotated[torch.dtype, _TorchDtypeAnnotation]
+TensorStateDict = dict[str, torch.Tensor | None]

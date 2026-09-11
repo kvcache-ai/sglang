@@ -34,7 +34,7 @@ from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
 
-_has_compressed_tensors = importlib.util.find_spec("compressed_tensors") is not None
+_has_compressed_tensors = importlib.util.find_spec("sglang._vendor.compressed_tensors") is not None
 if _has_compressed_tensors:
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,

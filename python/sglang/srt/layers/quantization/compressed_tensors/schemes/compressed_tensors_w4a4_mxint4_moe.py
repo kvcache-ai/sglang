@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from compressed_tensors import CompressionFormat
+from sglang._vendor.compressed_tensors import CompressionFormat
 
 from sglang.srt.distributed import get_moe_expert_parallel_rank, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (

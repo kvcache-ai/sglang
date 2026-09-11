@@ -9,7 +9,7 @@ from torch.nn import Module
 
 
 def is_activation_quantization_format(format: str) -> bool:
-    from compressed_tensors import CompressionFormat
+    from sglang._vendor.compressed_tensors import CompressionFormat
 
     _ACTIVATION_QUANTIZATION_FORMATS = [
         CompressionFormat.naive_quantized.value,

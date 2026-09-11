@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
+from sglang._vendor.compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW8A8Int8DynamicMoEMethod,

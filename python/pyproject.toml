@@ -35,6 +35,7 @@ dependencies = [
   "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
+  "loguru>=0.7,<1", # Private compressed-tensors runtime.
   "modelscope",
   "msgspec",
   "ninja",
@@ -52,7 +53,7 @@ dependencies = [
   "psutil",
   "py-spy",
   "pybase64",
-  "pydantic",
+  "pydantic>=2.0",
   "python-multipart",
   "pyzmq>=25.1.2",
   "quack-kernels==0.2.4",
@@ -158,12 +159,14 @@ sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
+  "_vendor/**/*",
   "srt/**/*",
   "jit_kernel/**/*"
 ]
 
 [tool.setuptools.packages.find]
 exclude = [
+  "build*",
   "assets*",
   "benchmark*",
   "docs*",

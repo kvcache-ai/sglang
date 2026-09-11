@@ -1,0 +1,276 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import contextlib
+from abc import ABC, abstractmethod
+from collections.abc import Hashable, MutableMapping
+from typing import ClassVar, Literal
+
+import torch
+import torch.distributed as dist
+
+
+class OffloadCache(MutableMapping, ABC):
+    """
+    Base class for offload caches. Subclasses must implement `offload` and `onload`.
+    Instances have similar behavior to dicts, except that tensors are offloaded when
+    assigned and onloaded when accessed.
+
+    Typical usage:
+    ```
+    module._parameters = cache_cls.from_mapping(
+        module._parameters, onload_device, offload_device
+    )
+    tensor = ...
+    module._parameters["name"] = tensor           # tensor is offloaded
+    onloaded_tensor = module._parameters["name"]  # tensor is onloaded
+    ```
+
+    This class implements two contexts for more fine-grained control of device movement:
+    `OffloadCache.disable_offloading` and `OffloadCache.disable_onloading`. For more
+    info, see `compressed_tensors.offload::(disable_offloading|disable_onloading)`
+    """
+
+    onload_device: torch.device | str
+    offload_device: torch.device | Literal["disk"]
+
+    # global flags for disabling
+    offloading_disabled: ClassVar[bool] = False
+    onloading_disabled: ClassVar[bool] = False
+
+    # names -> offloaded tensors (populated from _parameters or _buffers)
+    offloaded_values: dict[Hashable, torch.Tensor]
+
+    # offloaded tensors -> onloaded tensors (only when offloading is disabled)
+    keep_onloaded_values: ClassVar[dict[torch.Tensor, torch.Tensor]] = dict()
+
+    @classmethod
+    def cls_from_device(
+        cls,
+        device: torch.device | str | Literal["disk"] | None = None,
+    ) -> type["OffloadCache"]:
+        """
+        Get the subclass which implements offloading for the given `offload_device`.
+        Use `torch.distributed` to detect if the environment is distributed
+
+        :param device: offload device used to find subclass
+        :return: subclass of `OffloadCache`
+        """
+        from sglang._vendor.compressed_tensors.offload.cache.cpu import CPUCache
+        from sglang._vendor.compressed_tensors.offload.cache.device import DeviceCache
+        from sglang._vendor.compressed_tensors.offload.cache.disk import DiskCache
+        from sglang._vendor.compressed_tensors.offload.cache.dist_cpu import DistributedCPUCache
+        from sglang._vendor.compressed_tensors.offload.cache.dist_device import DistributedDeviceCache
+        from sglang._vendor.compressed_tensors.offload.cache.dist_disk import DistributedDiskCache
+
+        device_type = torch.device(device).type if device != "disk" else "disk"
+        distributed = dist.is_available() and dist.is_initialized()
+
+        match (device_type, distributed):
+            case ("cpu", False):
+                return CPUCache
+            case ("cpu", True):
+                return DistributedCPUCache
+            case ("cuda", False):
+                return DeviceCache
+            case ("cuda", True):
+                return DistributedDeviceCache
+            case ("disk", False):
+                return DiskCache
+            case ("disk", True):
+                return DistributedDiskCache
+            case _:
+                raise NotImplementedError(
+                    f"Offload of type {device} and "
+                    f"distributed={distributed} has not been implemented"
+                )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        mapping: MutableMapping[Hashable, torch.Tensor | None],
+        onload_device: torch.device | str,
+        offload_device: "torch.device | str | Literal['disk'] | None" = None,
+        **kwargs,
+    ):
+        """
+        Initialize an instance from a given mapping, typically `Module._parameters` or
+        `Module._buffers`. Mapping values will be offloaded
+
+        :param mapping: mapping used to populate cache
+        :param onload_device: device which tensors will be onloaded to
+        :param offload_device: device to offload tensors to. For DeviceCache, this
+            sets the offload target (defaults to onload_device if not provided).
+            For CPUCache and DiskCache, this is validated against the fixed
+            offload_device if provided.
+        :param \\**kwargs: keyword arguments for cache constructor
+        """
+        instance = cls(
+            onload_device=onload_device, offload_device=offload_device, **kwargs
+        )
+        instance.offloaded_values = {
+            name: instance.offload(tensor) for name, tensor in mapping.items()
+        }
+
+        return instance
+
+    def __init__(
+        self,
+        onload_device: torch.device | str,
+        offload_device: torch.device | str | Literal["disk"] | None = None,
+    ):
+        super().__init__()
+        self.onload_device = onload_device
+        self.offloaded_values = dict()
+
+        # Validate offload_device for subclasses with a fixed offload_device
+        # (CPUCache, DiskCache). DeviceCache sets offload_device after super().__init__
+        # so this check only applies when offload_device is a class attribute.
+        if offload_device is not None and hasattr(type(self), "offload_device"):
+            assert str(offload_device) == str(self.offload_device)
+
+    @abstractmethod
+    def onload(self, offloaded: torch.Tensor | None) -> torch.Tensor | None:
+        """
+        Given an offloaded tensor, returns that tensor after onloading
+
+        :param offloaded: offloaded tensor
+        :return: onloaded tensor
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def offload(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
+        """
+        Given a tensor, returns that tensor after offloading
+
+        :param tensor: tensor to offload
+        :return: offloaded tensor
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def update_offload(self, offloaded: torch.Tensor, data: torch.Tensor | None):
+        """
+        Update the data of an offloaded tensor
+
+        NOTE: Operation is performed asynchronously. If you need the offloaded value
+        to update across all ranks, call `dist.barrier()` after calling this function
+
+        :param tensor: offloaded tensor to update
+        :param data: new tensor data
+        """
+        raise NotImplementedError()
+
+    def __getitem__(self, key: Hashable) -> torch.Tensor:
+        """
+        Onload a tensor
+
+        If called within the `disable_offloading` context, a strong reference of the
+        onloaded tensor is kept so that future accesses will not require device movement
+
+        :param key: name of tensor to access
+        :return: onloaded tensor
+        """
+        offloaded = self.offloaded_values[key]
+
+        # when onloading is disabled, offloaded tensors can be accessed directly
+        if offloaded is None or self.onloading_disabled:
+            return offloaded
+
+        # check for cache hit
+        if offloaded in self.keep_onloaded_values:
+            return self.keep_onloaded_values[offloaded]
+
+        # onload value
+        onloaded = self.onload(offloaded)
+
+        # when offloading is disabled, populate cache
+        if self.offloading_disabled:
+            self.keep_onloaded_values[offloaded] = onloaded
+
+        return onloaded
+
+    def __setitem__(self, key: Hashable, value: torch.Tensor | None):
+        """
+        Update the offloaded and onloaded values if the key exists, otherwise
+        offload the value and add it to the cache.
+
+        If called within the `disable_onloading` context, the value is assigned directly
+
+        :param key: name of tensor
+        :param value: tensor value to offload
+        """
+        # when onloading is disabled, parameters can be access and assigned directly
+        if self.onloading_disabled:
+            self.offloaded_values[key] = value
+            return
+
+        # if the key already exists, update with the new value
+        offloaded = self.offloaded_values.get(key, None)
+        if offloaded is not None and torch.is_same_size(offloaded, value):
+            self.update_offload(offloaded, value)
+
+            onloaded = self.keep_onloaded_values.get(offloaded, None)
+            if onloaded is not None and onloaded is not offloaded:
+                onloaded.copy_(value)
+
+        # if the key does not exist (or the value is None), offload the new value
+        else:
+            self.offloaded_values[key] = self.offload(value)
+
+    def __delitem__(self, key: Hashable):
+        """
+        Remove the offloaded tensor associated with `key`. Any references to its
+        onloaded tensors held by this class are invalidated.
+
+        :param key: name of tensor to invalidate
+        """
+        offloaded = self.offloaded_values[key]
+        del self.offloaded_values[key]
+
+        # remove strong ref
+        if offloaded in self.keep_onloaded_values:
+            del self.keep_onloaded_values[offloaded]
+
+    def __contains__(self, key) -> bool:
+        return key in self.offloaded_values
+
+    def __iter__(self):
+        return iter(self.offloaded_values)
+
+    def __len__(self):
+        return len(self.offloaded_values)
+
+    @classmethod
+    @contextlib.contextmanager
+    def disable_offloading(cls):
+        """
+        Context to disable all offloading for offloaded modules which share this cache.
+        After a weight has been fetched once, that onloaded value is cached and
+        subsequent fetches will leverage the cache, reducing device movement
+        """
+        if not OffloadCache.offloading_disabled:
+            restore_value = OffloadCache.offloading_disabled
+            OffloadCache.offloading_disabled = True
+            yield
+            OffloadCache.offloading_disabled = restore_value
+            OffloadCache.keep_onloaded_values.clear()
+        else:
+            yield
+
+    @classmethod
+    @contextlib.contextmanager
+    def disable_onloading(cls):
+        """
+        Context to disable all onloading for offloaded modules which share this cache.
+        This is mostly used for debugging purposes, and allows the caller to directly
+        inspect offloaded tensors and directly assign offloaded tensors without copying
+        """
+        if not OffloadCache.onloading_disabled:
+            restore_value = OffloadCache.onloading_disabled
+            OffloadCache.onloading_disabled = True
+            yield
+            OffloadCache.onloading_disabled = restore_value
+        else:
+            yield

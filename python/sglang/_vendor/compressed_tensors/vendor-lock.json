@@ -1,0 +1,430 @@
+{
+  "changes": [
+    "Relocate absolute internal imports into the private namespace",
+    "Use the private module name in Loguru enable/disable filters"
+  ],
+  "dependencies": {
+    "loguru": ">=0.7,<1",
+    "pydantic": ">=2.0",
+    "torch": "==2.9.1",
+    "transformers": "provided by transformers-kt"
+  },
+  "files": {
+    "__init__.py": {
+      "upstream_sha256": "f644407baae033e3fc1e22e45ad1f2982325cdc71c17543877d965138ccef648",
+      "vendored_sha256": "f644407baae033e3fc1e22e45ad1f2982325cdc71c17543877d965138ccef648"
+    },
+    "base.py": {
+      "upstream_sha256": "db8295c1a572bd809777cfaaee70eaa8b0d30252391a371287362f1a73a3f4d1",
+      "vendored_sha256": "db8295c1a572bd809777cfaaee70eaa8b0d30252391a371287362f1a73a3f4d1"
+    },
+    "compressors/__init__.py": {
+      "upstream_sha256": "a3a7b6a6b99ca2894dd6264c9326ddd35a7f53d84b1f31f50781a179faf68877",
+      "vendored_sha256": "a3a7b6a6b99ca2894dd6264c9326ddd35a7f53d84b1f31f50781a179faf68877"
+    },
+    "compressors/base.py": {
+      "upstream_sha256": "6ca8f8176f3e331b70f85dfa3caca532d6ccd4f0de896805ef103b36f7b60be7",
+      "vendored_sha256": "cc8c4523476d1e1fedaced8fec7f6b3315b43b0d392589f84e3a9303d0558319"
+    },
+    "compressors/dense/__init__.py": {
+      "upstream_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e",
+      "vendored_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e"
+    },
+    "compressors/dense/base.py": {
+      "upstream_sha256": "f8cd3a2055afce3d68431dd5f17290870e313dbda64aa243e0eb2edb3e208d37",
+      "vendored_sha256": "e7aefbb1b63aa108c414627bd054d66a880c8c0cabd54f42d6a627b10cd0ca22"
+    },
+    "compressors/format.py": {
+      "upstream_sha256": "ec87fb3d88cdc7c84d98745696c53c7159b0c16c9f709a1a65824850ce3449a3",
+      "vendored_sha256": "5c9cf57bde0fb93f03fb0c4a8bbbc6b333c94334a7f8f9581df9aef133e6149a"
+    },
+    "compressors/helpers.py": {
+      "upstream_sha256": "13059c51a0a962b40ec0e45b09e97cbfcf6105f85f7d45f530c8989cc520a967",
+      "vendored_sha256": "e5027f7ef1fe5937fc45371959c414605abdf7ee0d10566f42c94dcc99dd0a00"
+    },
+    "compressors/model_compressors/__init__.py": {
+      "upstream_sha256": "f0a59b7fa7bb25faf09bca7a88b832ba151a19e730c840a5ea5c4f6522cf96f6",
+      "vendored_sha256": "f0a59b7fa7bb25faf09bca7a88b832ba151a19e730c840a5ea5c4f6522cf96f6"
+    },
+    "compressors/model_compressors/model_compressor.py": {
+      "upstream_sha256": "c0c37f90c495589b452afddaae1e90b88f35e4e08077318ba03582e259ed59b3",
+      "vendored_sha256": "be6344610b55265948ec520a8b667492f150af37fd4ba7e31b591065a2e3e251"
+    },
+    "compressors/mx_utils.py": {
+      "upstream_sha256": "9b116a7e3406199316a58c5e306ac3840c123d014e8d650c168ad284c169ab75",
+      "vendored_sha256": "9b116a7e3406199316a58c5e306ac3840c123d014e8d650c168ad284c169ab75"
+    },
+    "compressors/mxfp4/__init__.py": {
+      "upstream_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e",
+      "vendored_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e"
+    },
+    "compressors/mxfp4/base.py": {
+      "upstream_sha256": "dfadf0d8bf641e39561f282611801964aabdc079265754981d2063499acfed1e",
+      "vendored_sha256": "527ac3e2a84572855c54b88a1e7a01e48672603706f128eb42aa0fccecc94a40"
+    },
+    "compressors/mxfp8/__init__.py": {
+      "upstream_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e",
+      "vendored_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e"
+    },
+    "compressors/mxfp8/base.py": {
+      "upstream_sha256": "99511db3d403041b5d5097e935697f38b3b4c2cbc25c1d44ef16aea6a43822f7",
+      "vendored_sha256": "f01d7614affd75ccbc0ab0410dc91ff26d46899ab861348d7c76bcc9237906b2"
+    },
+    "compressors/naive_quantized/__init__.py": {
+      "upstream_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e",
+      "vendored_sha256": "cd81ce9b09c5a821ef4fd9249c9dd4793e00ad80bde032d2218ca0d9b12db91e"
+    },
+    "compressors/naive_quantized/base.py": {
+      "upstream_sha256": "2afd1016eaf3dfb8e6489d6872e173757c98670af78b2fe93158ec6608ab521d",
+      "vendored_sha256": "3517fa1a67fda2b7d870adce7498a1eac2495fd78ae596ed50132d5da0735a33"
+    },
+    "compressors/nvfp4/__init__.py": {
+      "upstream_sha256": "479b363d43997a2ea4a1c24ba4022e763a5aef940609617b9cf4cc110fcd73e0",
+      "vendored_sha256": "479b363d43997a2ea4a1c24ba4022e763a5aef940609617b9cf4cc110fcd73e0"
+    },
+    "compressors/nvfp4/base.py": {
+      "upstream_sha256": "a43a9be456a1682dffce7c846323c7476fd7345658936fa9ec69a77c5da6d7d0",
+      "vendored_sha256": "e9f1154d7d3b103e4a6441e4a188a018d10469f123f24410815e228d3833cc9c"
+    },
+    "compressors/nvfp4/helpers.py": {
+      "upstream_sha256": "148bb7fddfd33130dcc7ee523d623963fdbddd3143a0767d7b10278ca446901c",
+      "vendored_sha256": "148bb7fddfd33130dcc7ee523d623963fdbddd3143a0767d7b10278ca446901c"
+    },
+    "compressors/pack_quantized/__init__.py": {
+      "upstream_sha256": "479b363d43997a2ea4a1c24ba4022e763a5aef940609617b9cf4cc110fcd73e0",
+      "vendored_sha256": "479b363d43997a2ea4a1c24ba4022e763a5aef940609617b9cf4cc110fcd73e0"
+    },
+    "compressors/pack_quantized/base.py": {
+      "upstream_sha256": "0ced97eebfa73409376621ab541016ac8bf3ac419d14082ee0c0d7bb1a7084e4",
+      "vendored_sha256": "807cf6f62db655281f5dedbc7f757428abc8d9ca21fd42e12e138d758bcf9b5c"
+    },
+    "compressors/pack_quantized/helpers.py": {
+      "upstream_sha256": "cdd40a3e498407899395883014ea0058fca667fcb6daf0f923afe4be89fb542e",
+      "vendored_sha256": "cdd40a3e498407899395883014ea0058fca667fcb6daf0f923afe4be89fb542e"
+    },
+    "config/__init__.py": {
+      "upstream_sha256": "054c7f4d221191d67c2691c4395c849a175d58a2389602a97d6b91825eeffe98",
+      "vendored_sha256": "054c7f4d221191d67c2691c4395c849a175d58a2389602a97d6b91825eeffe98"
+    },
+    "config/base.py": {
+      "upstream_sha256": "5c04759a0de67559c2ea81a6b16859efaabf35321eab76e9d8f7c28926cf1976",
+      "vendored_sha256": "43034c4d2f109b76e0149525093c2bc02f33e293d1760912311efe6f34107254"
+    },
+    "config/dense.py": {
+      "upstream_sha256": "70b86c471d66c714059feb4af11a383f9c199e391cdb3fb1920419be824e8aaf",
+      "vendored_sha256": "abfd31a30ed4b619150013e5ee0f6143855613c6fb8683d89a656848137ca7b5"
+    },
+    "config/sparse_24_bitmask.py": {
+      "upstream_sha256": "f9c7129bac64e1c2eeffbaa2c5b9d2b3418e61ba161ceb3501736fb3b0272b64",
+      "vendored_sha256": "ee4f96f8d72f1d96cf7b1fa4993a47cee5f1b2702f544a5f7dffd82e7b6eef9e"
+    },
+    "config/sparse_bitmask.py": {
+      "upstream_sha256": "0009aa421046a63e7198179f198af86cdf7a057479cb76d53770ef49b63c2404",
+      "vendored_sha256": "357106f945685f2289b511fbd0540155bbb915a6fade6ce6e3140fd4e5dd1124"
+    },
+    "entrypoints/__init__.py": {
+      "upstream_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+      "vendored_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+    },
+    "entrypoints/convert/__init__.py": {
+      "upstream_sha256": "7d7f4ae126d1fb6f93ba3adcf34c27dbad778a0870b1cac091ee81c847451324",
+      "vendored_sha256": "7d7f4ae126d1fb6f93ba3adcf34c27dbad778a0870b1cac091ee81c847451324"
+    },
+    "entrypoints/convert/convert_checkpoint.py": {
+      "upstream_sha256": "d281ae4c03700c7ad0b2a5c0f9cb65127daaf39a4b88b51738c05a3706723501",
+      "vendored_sha256": "c7fc87c87d5995b455804ba057c36b0765131225d0396c0d93d70f63aa591f0e"
+    },
+    "entrypoints/convert/convert_file.py": {
+      "upstream_sha256": "d3abf85972a3a61781281398e71ef6a3ee68030079bf08fede0dd81f365ab74a",
+      "vendored_sha256": "fce1afe15c99a486aedd26bb3d5bcda6150c2597fbd17d014b4c3e27fa7e5230"
+    },
+    "entrypoints/convert/converters/__init__.py": {
+      "upstream_sha256": "91974053577b65994d73f24c230a25cbd64659aa7bd1e7b44994a3c670dc0172",
+      "vendored_sha256": "91974053577b65994d73f24c230a25cbd64659aa7bd1e7b44994a3c670dc0172"
+    },
+    "entrypoints/convert/converters/base.py": {
+      "upstream_sha256": "ca20872a4b8256145033c78f189db9b5ed39d3027ba68af3e502f4c0e4cdce8a",
+      "vendored_sha256": "80b4dab63f35fbec6e9fe13041414f692b01553bb988ac0d9384da627fa928f7"
+    },
+    "entrypoints/convert/converters/modelopt_nvfp4.py": {
+      "upstream_sha256": "9c7604813682cc8e5b70c7b418a513995a5ae5ba7ead056afdb2d1005b3a1040",
+      "vendored_sha256": "cced13319424902e0bfa9a733c8e299b96d690f13c24b5eff6d426211b5bdb5a"
+    },
+    "linear/__init__.py": {
+      "upstream_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+      "vendored_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+    },
+    "linear/compressed_linear.py": {
+      "upstream_sha256": "98138a4626cc4c6fd6e2a74f33fb8bc13ed91470859b713abb99a2ac423092bc",
+      "vendored_sha256": "26f0611f91afbea8ae90603bb9058ce032e55e3285d5d40e0c5e963361537dae"
+    },
+    "logger.py": {
+      "upstream_sha256": "a99a9281d5211a5e55618ee91818711b2d0f4e8f01cfffdd48c8f21f8ac6d0fb",
+      "vendored_sha256": "e7dbe99cf0d554c12da999e84c3f96842ca5dedf4d1ab1e04210a1c98eb63791"
+    },
+    "modeling/__init__.py": {
+      "upstream_sha256": "bdd1c21174e3ee7137b670dd8810f4d807aff25ca6459c25d99f49f6c02ab658",
+      "vendored_sha256": "bdd1c21174e3ee7137b670dd8810f4d807aff25ca6459c25d99f49f6c02ab658"
+    },
+    "modeling/attention.py": {
+      "upstream_sha256": "cb86a805be276b0947be55280dbd705ad7d38b1c2a34fa7a3177cca129971162",
+      "vendored_sha256": "de75e97eb53f6283e681a67ae175131b37f7c3b6e0ee91f3622a0cb71ff0f916"
+    },
+    "modeling/kvcache.py": {
+      "upstream_sha256": "490fed41e7d360b4d88b44443207264536b0cf57e6ef513918a9dc3e89d33119",
+      "vendored_sha256": "3bda0a152f8d0004ceb1e5c23a28e70feb7f1bff188a73521283281ac18ef86c"
+    },
+    "offload/__init__.py": {
+      "upstream_sha256": "374a406c91a17ad7cedbc3fd3ed09c8542d12f76f044b5c5fc5925956f89e585",
+      "vendored_sha256": "f7c191a50a888a446dc9854d9cfa22e2c2ea44f60d8273a7508f27a2957a53f9"
+    },
+    "offload/cache/__init__.py": {
+      "upstream_sha256": "9915ca800e4bed871997dab68c41eedb0c82a7fb8f27fca919fc2cee2ae2b3c6",
+      "vendored_sha256": "9915ca800e4bed871997dab68c41eedb0c82a7fb8f27fca919fc2cee2ae2b3c6"
+    },
+    "offload/cache/base.py": {
+      "upstream_sha256": "e8dbd2f97dd3527c598c5ae8f5393dc49f4f0e5a8a1bae77b0b2bcb35951791b",
+      "vendored_sha256": "2a696d689327b54e3507bf0cac3c2e73c60f2c94435e67fe96bb4e5e9aebe580"
+    },
+    "offload/cache/cpu.py": {
+      "upstream_sha256": "6d14159edfaef29b89889fdbf502da694042f645f4deef94abad93dffb02b9da",
+      "vendored_sha256": "5c1dc49bbc90c208fe04d74968b67b3d12bb3fd4e07ffa7a2542ad7778596b47"
+    },
+    "offload/cache/device.py": {
+      "upstream_sha256": "4d2b0ee715e0f9c1b0c6abbe262a98cc3492abf3c542923562c523ea9ee234d5",
+      "vendored_sha256": "ff546c6de663642dacba4ba65131c59e76985b415090365a43bea7f850f78863"
+    },
+    "offload/cache/disk.py": {
+      "upstream_sha256": "2d77260727c27bf6b245844e99a315c4d43cf775e09237d10ac2f74c5de2e663",
+      "vendored_sha256": "6b36dc30665136826e49033b53892a94713b0db569149dc2a358cb37f840ccd2"
+    },
+    "offload/cache/dist_cpu.py": {
+      "upstream_sha256": "cbf58226706a834b9d46ed6f2a0644046432058bca33c47c5dec1a714f487d98",
+      "vendored_sha256": "bfe921319609127976aef81170994d51d080eecbce655dfbc7bf17759e1c7c9a"
+    },
+    "offload/cache/dist_device.py": {
+      "upstream_sha256": "c10945a9d8074e34939e3004765cfe8ee4256bf400d4ed8ed5b3fc0d6c22267d",
+      "vendored_sha256": "f96af2a9fd91f457305f351fe1c344c700521a64b7d18f0ca9e2c6fe3a47f9be"
+    },
+    "offload/cache/dist_disk.py": {
+      "upstream_sha256": "27195bc3dfb90d7e3ad657bdb63fca4ea3bcece902a24c2bbbd28ecee6003b5f",
+      "vendored_sha256": "6323213dde175f92b06ba5ae373c8d979c0e8baa5e68c64ac875d188492a3bb8"
+    },
+    "offload/convert/__init__.py": {
+      "upstream_sha256": "cb7e5b433482a146913c84c053f0b35d448735ea703eda2925e1d563aac04373",
+      "vendored_sha256": "cb7e5b433482a146913c84c053f0b35d448735ea703eda2925e1d563aac04373"
+    },
+    "offload/convert/from_accelerate.py": {
+      "upstream_sha256": "5b6473a64bfd20202620994c407a66da1e9f1361d9deda6414433eef5ae0a622",
+      "vendored_sha256": "7879a4e8bf32fcb6a44a11e7af67ad07fc8759bbef300a94e35b1bdd23426ea2"
+    },
+    "offload/convert/helpers.py": {
+      "upstream_sha256": "86c2c79a273dc9c35dc110f757cf665de9178063ca412385db93b65960cf55c0",
+      "vendored_sha256": "ae612a427fbddeb9b714f56057171707ca017f1d307a1c31b13ca316208168f7"
+    },
+    "offload/convert/to_accelerate.py": {
+      "upstream_sha256": "1112f9098f03f6ad74d2bfe7a2b5e8f0dc5adbe22274f463ffa679a72e110f79",
+      "vendored_sha256": "d8569de616bd510599bc87b6cba8949fb89066f3aca184098cd4bcc504f4b00e"
+    },
+    "offload/dispatch.py": {
+      "upstream_sha256": "2cb29d9b3544c71907efe787a8ece38228b15c4e818bd8859b2a4a1657aa61c3",
+      "vendored_sha256": "7ede5b45d3879dd900ac5544bbde69dcf065de4d1d2f676553b781c86e7b53ff"
+    },
+    "offload/dist_utils.py": {
+      "upstream_sha256": "d82bccb77132e7082cbcb364fc488da0148b033e2d1ca93a41ec4a045e10f180",
+      "vendored_sha256": "d82bccb77132e7082cbcb364fc488da0148b033e2d1ca93a41ec4a045e10f180"
+    },
+    "offload/load.py": {
+      "upstream_sha256": "a7bf33a5811b195632b8bfc27ff89aa066da8ef27c488c22e180eb82cd2976f7",
+      "vendored_sha256": "52c3ce98cea594cc84100d2425167c55d12651101ce119e70f43c6185d6d9bc6"
+    },
+    "offload/module.py": {
+      "upstream_sha256": "52f0a328f00c5fc1eca07bc70926eba195f855cd5e0c0c12618777b903d7a2f8",
+      "vendored_sha256": "f366471e56a11e2c0d6bf019af9eb695b4335f80dfc71994891f9ae7a454585e"
+    },
+    "offload/utils.py": {
+      "upstream_sha256": "60d7d7a4cd51036ff8009d4be4faf8d6f96a70d1b97a699dfda1efe9690afc70",
+      "vendored_sha256": "95535fe9a6b449d262482f6d35cb52907b49ffa84000f156a9fc386d9b268e67"
+    },
+    "quantization/__init__.py": {
+      "upstream_sha256": "70d969b0ee65ba3da4ecdd52d4d14c46d2500b4dddd28614ca3245841b961581",
+      "vendored_sha256": "70d969b0ee65ba3da4ecdd52d4d14c46d2500b4dddd28614ca3245841b961581"
+    },
+    "quantization/lifecycle/__init__.py": {
+      "upstream_sha256": "cabf0cc4e8d741a5a100f7298e6d5d61aa908a921503cc63bb6c24bb5e6ad082",
+      "vendored_sha256": "cabf0cc4e8d741a5a100f7298e6d5d61aa908a921503cc63bb6c24bb5e6ad082"
+    },
+    "quantization/lifecycle/apply.py": {
+      "upstream_sha256": "d62d9dda51d4d3638115b3c8cddfe844c1c331f00a90020c6cf17adb2238d58d",
+      "vendored_sha256": "148f80966fe278b7fff33a6a0405558262f84020eacb8dddfe9daf9e77a70c37"
+    },
+    "quantization/lifecycle/compressed.py": {
+      "upstream_sha256": "16857a837f7f57507d947eaee4469be5c746da2066894d6c80e74060516636ff",
+      "vendored_sha256": "d789e18e9898928342eeaf4473fdbff113fd9d5215c4269817c8af82220150b9"
+    },
+    "quantization/lifecycle/forward.py": {
+      "upstream_sha256": "37b21c5c383a4d592023dfd1f8ed9755a80b26e16585f4c2c4c3839803e2e98f",
+      "vendored_sha256": "75fc926d342e1b4a7d4fdee9c2c59c705fa2f6168603025b1ddf02118426d155"
+    },
+    "quantization/lifecycle/forward_helpers.py": {
+      "upstream_sha256": "8b3399fda143cc249c231e291d938c987a7da4793eeae35b3136b3390bbde6c8",
+      "vendored_sha256": "ab35992ae2f0046eb669337db07b3bb1438f8eb162eb052da8d113e16adcab59"
+    },
+    "quantization/lifecycle/helpers.py": {
+      "upstream_sha256": "92ebb1cc528d0aea2d9fbc9710af394f27e8de986dfd90cccd8dd8523cc8880d",
+      "vendored_sha256": "92ebb1cc528d0aea2d9fbc9710af394f27e8de986dfd90cccd8dd8523cc8880d"
+    },
+    "quantization/lifecycle/initialize.py": {
+      "upstream_sha256": "afe6e2fdb74b52905bd2e9088600649b369ad7cbf075ef933bf9fb329be8d35b",
+      "vendored_sha256": "8a2efda2a9d84a62666769f9b1fd9c6c5c386f55852b2ff213add8889572e8e3"
+    },
+    "quantization/quant_args.py": {
+      "upstream_sha256": "4d151f37ded071cc2103f39d5475191c16e51cfdb90bb77f213147fe9c154c3e",
+      "vendored_sha256": "5dfb9e345d966990cfd84c7edb90b62849cd4dea74f2e0ce9c22b2f7efc670e5"
+    },
+    "quantization/quant_config.py": {
+      "upstream_sha256": "7cbb50fb598265dae80a02146a7d3cd44592b40b6a0e402dad2a8c065556f878",
+      "vendored_sha256": "72587c7d0901b6003d33bd2f1f5cfec981a993a614ae334b616d8ca1dcc70aa5"
+    },
+    "quantization/quant_metadata.py": {
+      "upstream_sha256": "e6d764053cd144568c711af756ec5c65a74b635b614dde87682eed823b9fdbb5",
+      "vendored_sha256": "c83b0180725b0056f26431587f30c8d5531afb2493812cd18ea2fcd606fd4385"
+    },
+    "quantization/quant_scheme.py": {
+      "upstream_sha256": "0fb0150e6d8c9640b5f05e4b8322bb28a448949ec9997a1413a6a8ac4ba06a7b",
+      "vendored_sha256": "84c7fe05742332906f7811449760e125eaee98e3fbb7fae2d661f8ab6c0d12fa"
+    },
+    "quantization/utils/__init__.py": {
+      "upstream_sha256": "66b076b5eeef9cfdb4aa6d212105557f5f09ba183bb8884bd7abef6f03feeb57",
+      "vendored_sha256": "66b076b5eeef9cfdb4aa6d212105557f5f09ba183bb8884bd7abef6f03feeb57"
+    },
+    "quantization/utils/helpers.py": {
+      "upstream_sha256": "7bdea7dd218f314249f19d72ca8b707de78284b989b05b2f3778b6b065dce91f",
+      "vendored_sha256": "dae89ccfc2ee3bbaa91ad55cd194c32b0298a83103163f265a91dee5f390e22a"
+    },
+    "quantization/utils/mxfp_utils.py": {
+      "upstream_sha256": "21afb6e4c78082b049e15c92b79a213725054c4723bdf53d428fe39d69f19808",
+      "vendored_sha256": "2b464be26bb2acceb686cb9b8ef97bab9fdc1637ee671e2318469a64c2f03bc1"
+    },
+    "registry/__init__.py": {
+      "upstream_sha256": "67566fdb3db8956a998f8f823cc0decc6b845d989d20f53b3376c39d0c6e48ee",
+      "vendored_sha256": "67566fdb3db8956a998f8f823cc0decc6b845d989d20f53b3376c39d0c6e48ee"
+    },
+    "registry/registry.py": {
+      "upstream_sha256": "297d191778ed2ae4300dc84972ae8044051fba6c2087c01d540a316946b667bd",
+      "vendored_sha256": "297d191778ed2ae4300dc84972ae8044051fba6c2087c01d540a316946b667bd"
+    },
+    "transform/__init__.py": {
+      "upstream_sha256": "7cf4f39c1523bfd4384e81d4bebbe96445025ccb50245caea8deb6926836fcf4",
+      "vendored_sha256": "7cf4f39c1523bfd4384e81d4bebbe96445025ccb50245caea8deb6926836fcf4"
+    },
+    "transform/apply.py": {
+      "upstream_sha256": "5e32cf92f0fee9a3313cafd956675db29c47331ce760c0b191216992bb416a1b",
+      "vendored_sha256": "c39cd9ba5344acd56ddde49b41ee89065ab4fbe25710d0e3356df7e9a81629fe"
+    },
+    "transform/factory/__init__.py": {
+      "upstream_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+      "vendored_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+    },
+    "transform/factory/base.py": {
+      "upstream_sha256": "91d31d610b944cbabe77ea451b1cbdbb1407f860a9b84fa51e7e590fbd2a6c4a",
+      "vendored_sha256": "b7cc06ed30031f993600e4b52a8bb69a8c30108c34642ef9b964b0a12bc6e002"
+    },
+    "transform/factory/hadamard.py": {
+      "upstream_sha256": "c68656470af59066612499c5e64ce5503eb7abf87c6043e8dff5cd13791e8cd9",
+      "vendored_sha256": "743bb4236500f728fbb036097b16fcea680793a72a5ef289ff346db5ed44699d"
+    },
+    "transform/factory/matrix_multiply.py": {
+      "upstream_sha256": "d03dca473029c402dbf2d11211d7404e5708bd4d2bf7c093ffa8d65a77642a7a",
+      "vendored_sha256": "d24622f4eee49ab111729c2086738e631a6e8cbf676310a470e5c83ae431b048"
+    },
+    "transform/factory/random_hadamard.py": {
+      "upstream_sha256": "61c4dd96a3936feb4dd277bba3ebc0ad68afa2a74cf544341e231dae59a242d1",
+      "vendored_sha256": "8c69933d4ccdbe6c046c40e6b844f29f5a10706ee7c1179c5e1b69eae1335960"
+    },
+    "transform/transform_args.py": {
+      "upstream_sha256": "64abd1e5bb9f9566f3f3a4e3834f05d636b7786f04d91535449b264c095cd075",
+      "vendored_sha256": "64abd1e5bb9f9566f3f3a4e3834f05d636b7786f04d91535449b264c095cd075"
+    },
+    "transform/transform_config.py": {
+      "upstream_sha256": "c9ac9a649539c869a9f26430371b8346c156c265673ac7e867dae4a814be2f53",
+      "vendored_sha256": "a4b203e4297fce92162bedce5bb723521622f8b6f7ccb8ee5cccd02572593947"
+    },
+    "transform/transform_scheme.py": {
+      "upstream_sha256": "8576f40dc3701603e8af3a84fa4a0c2bb898a52f5036a62def44f6b7b15faf9a",
+      "vendored_sha256": "f75e89205565d4d2117708b9a2a85e2238f4763a2bcc93e545dd90142862076d"
+    },
+    "transform/utils/__init__.py": {
+      "upstream_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+      "vendored_sha256": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58"
+    },
+    "transform/utils/hadamard.py": {
+      "upstream_sha256": "065684ae8deee9120a0b1c513d158173e4adcb5c74a599b62661cb86fb22c072",
+      "vendored_sha256": "065684ae8deee9120a0b1c513d158173e4adcb5c74a599b62661cb86fb22c072"
+    },
+    "transform/utils/hadamards.safetensors": {
+      "upstream_sha256": "9857751b33687461be89f0352281fed271d8cdfada08ebebabf757db3148d41e",
+      "vendored_sha256": "9857751b33687461be89f0352281fed271d8cdfada08ebebabf757db3148d41e"
+    },
+    "transform/utils/matrix.py": {
+      "upstream_sha256": "60c463339bfa8d5f3d45a9ca2e74be4c950f6864546e3fc0b40b45ea60861da8",
+      "vendored_sha256": "bc849f4f81112f2e87769083de2d87348ef5597de309ff8a3fb0ee081192ee38"
+    },
+    "utils/__init__.py": {
+      "upstream_sha256": "66c36895cae53892275dbd88db3cb74da02ca8fd53652f491ebae11d4a567221",
+      "vendored_sha256": "66c36895cae53892275dbd88db3cb74da02ca8fd53652f491ebae11d4a567221"
+    },
+    "utils/binary_search.py": {
+      "upstream_sha256": "4c3e8c708ed863c6dc28942e034dd92807dcb92dadf81ccebbb8e2feb887fcf4",
+      "vendored_sha256": "4c3e8c708ed863c6dc28942e034dd92807dcb92dadf81ccebbb8e2feb887fcf4"
+    },
+    "utils/helpers.py": {
+      "upstream_sha256": "e4995f0da87f3587337ca004835cac3258975109a6e9e2ad6a557bf8cac68d0b",
+      "vendored_sha256": "7b5950c660651ece5cf3345dfb5924b07e438ee20e840089e99e953c1e212450"
+    },
+    "utils/internal.py": {
+      "upstream_sha256": "c7db5b3819f94416f76c695a5431524c67119c32f8b95aeb054948b3e957b69f",
+      "vendored_sha256": "c7db5b3819f94416f76c695a5431524c67119c32f8b95aeb054948b3e957b69f"
+    },
+    "utils/match.py": {
+      "upstream_sha256": "7bb5f2376db07e48badbb668391b5d547fe96b2ccc5ae3371a49706acc6f62cf",
+      "vendored_sha256": "f0b2ebae01d58822ea8d06acdae1fb157fecc1bf783a7c2b0950f8f3c2564528"
+    },
+    "utils/module.py": {
+      "upstream_sha256": "c8ec1274e65d588c9b69f7c3128e7194f35d4df5efde4bebd16b1f1dce3e649d",
+      "vendored_sha256": "bb9064130b065c59ebbb83c19d713d2e4779ca9f47932f574f461ea9d6596845"
+    },
+    "utils/mtp.py": {
+      "upstream_sha256": "ffec851815d4f4bba43ddaf303487ab2713940013e04353f90f228f3b9b3b08b",
+      "vendored_sha256": "a87fa68e9deb0e661c660e12dd666c216599317c2d5ebd7df0441e2919060bf9"
+    },
+    "utils/offload.py": {
+      "upstream_sha256": "bb037c6dd01bd24548ee617bc75f4012a774af9f76b14561fc71ad4dbf81c8b6",
+      "vendored_sha256": "7c14cc807c7da54d002397b30ffe771a4ddf0756595a76df79436198e3a81095"
+    },
+    "utils/permutations_24.py": {
+      "upstream_sha256": "17df204f632a0fd96156c0374bf234816cbb32759a926607d271b3ea7d9915ee",
+      "vendored_sha256": "17df204f632a0fd96156c0374bf234816cbb32759a926607d271b3ea7d9915ee"
+    },
+    "utils/safetensors_load.py": {
+      "upstream_sha256": "4c21f658340d668afcfc5406e218be725ca79b83c902f9c7443c066879753410",
+      "vendored_sha256": "4c21f658340d668afcfc5406e218be725ca79b83c902f9c7443c066879753410"
+    },
+    "utils/semi_structured_conversions.py": {
+      "upstream_sha256": "a4524f5c3cc4c5ac719b150bb219ba983e0f0f90780790bb77e619530027693c",
+      "vendored_sha256": "a4524f5c3cc4c5ac719b150bb219ba983e0f0f90780790bb77e619530027693c"
+    },
+    "utils/type.py": {
+      "upstream_sha256": "c0aa9dcad2d1bc1f9366318bc80f203a95a8b2b5aafc8813e4f642e830d995ee",
+      "vendored_sha256": "c0aa9dcad2d1bc1f9366318bc80f203a95a8b2b5aafc8813e4f642e830d995ee"
+    },
+    "version.py": {
+      "upstream_sha256": "94bc3bf2d608d07aecbb5fb39ec7149a0da2399900378bcce21ff6fba1881507",
+      "vendored_sha256": "94bc3bf2d608d07aecbb5fb39ec7149a0da2399900378bcce21ff6fba1881507"
+    }
+  },
+  "namespace": "sglang._vendor.compressed_tensors",
+  "upstream_wheel_sha256": "e1b1f322e82e475715e242bad46925a304ea8e5c98b5055a15b8eb22fb6bfea9",
+  "upstream_wheel_url": "https://files.pythonhosted.org/packages/a8/52/93833dc1610e017ac5b7dcd59b8304d8ef67d1114c2d124e728a2cbbea12/compressed_tensors-0.15.0.1-py3-none-any.whl",
+  "version": "0.15.0.1"
+}

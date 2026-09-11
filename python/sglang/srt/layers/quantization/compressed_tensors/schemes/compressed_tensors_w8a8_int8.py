@@ -4,7 +4,7 @@
 from typing import Callable, Optional
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
+from sglang._vendor.compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (

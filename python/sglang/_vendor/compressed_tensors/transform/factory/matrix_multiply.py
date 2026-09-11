@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import torch
+from sglang._vendor.compressed_tensors.transform import TransformArgs, TransformScheme
+from sglang._vendor.compressed_tensors.transform.factory.base import TransformBase, TransformFactory
+from sglang._vendor.compressed_tensors.transform.utils.matrix import (
+    apply_transform_weight,
+    get_transform_size,
+)
+from sglang._vendor.compressed_tensors.utils.helpers import ParameterizedDefaultDict
+from sglang._vendor.compressed_tensors.utils.offload import get_offloaded_device
+from torch import Tensor, device, dtype
+from torch.nn import Module, Parameter
+
+
+@TransformFactory.register("random-matrix")
+class RandomMatrixFactory(TransformFactory):
+    """
+    Factory used to apply random matrix transforms to a model
+
+    :param name: name associated with transform scheme
+    :param scheme: transform scheme which defines how transforms should be created
+    :param seed: random seed used to transform weight randomization
+    """
+
+    def __init__(self, name: str, scheme: TransformScheme, seed: int | None = None):
+        super().__init__(name, scheme, seed)
+        self.weights = ParameterizedDefaultDict(self._create_weight)
+        self.inverses = ParameterizedDefaultDict(self._create_inverse)
+
+    def create_transform(self, module: Module, args: TransformArgs):
+        """
+        Create a RandomMatrixTransform for applying to a module. Transforms with the
+        same size, dtype, and device are cached
+
+        :param module: parent module that transform will be applied to
+        :param args: defines how the transform will be applied to the module
+        """
+        size = get_transform_size(module, args.location, self.scheme.head_dim)
+        device = get_offloaded_device(module)
+        precision = self.scheme.precision if args.is_online() else torch.float64
+
+        factory_kwargs = {"device": device, "precision": precision}
+        weight = self.weights.get(size, factory_kwargs=factory_kwargs)
+        if args.inverse:
+            weight = self.inverses[weight]
+
+        return RandomMatrixTransform(weight, self.scheme, args, type(module))
+
+    def _create_weight(self, size: int, device: device, precision: dtype) -> Parameter:
+        # TODO: construct such that weight is invertible (has non-zero determinant)
+        data = torch.rand(
+            (size, size),
+            generator=self.generator,
+            dtype=precision,
+            device=self.generator.device,
+        ).to(device)
+        return Parameter(data, requires_grad=self.scheme.requires_grad)
+
+    def _create_inverse(self, weight: Parameter) -> Parameter:
+        data = high_precision_invert(weight.data)
+        data = data.contiguous()  # ensure proper serialization
+        return Parameter(data, requires_grad=False)
+
+
+class RandomMatrixTransform(TransformBase):
+    def __init__(
+        self,
+        weight: Tensor,
+        scheme: TransformScheme,
+        args: TransformArgs,
+        module_type: type[torch.nn.Module],
+    ):
+        super().__init__()
+        self.weight = weight  # is an inverse if args.inverse
+        self.scheme = scheme
+        self.args = args
+        self.module_type = module_type
+
+    def forward(self, value: Tensor) -> Parameter:
+        return apply_transform_weight(
+            self.weight.to(device=value.device),
+            value.to(dtype=self.weight.dtype),
+            self.args.location,
+            self.module_type,
+        ).to(value.dtype)
+
+    def right_inverse(self, value: Tensor) -> Tensor:
+        inverse = high_precision_invert(self.weight)
+        return apply_transform_weight(
+            inverse.to(device=value.device),
+            value.to(dtype=inverse.dtype),
+            self.args.location,
+            self.module_type,
+        ).to(value.dtype)
+
+
+def _has_cpu_lapack() -> bool:
+    try:
+        torch.linalg.inv(torch.eye(2, dtype=torch.float64))
+        return True
+    except RuntimeError:
+        return False
+
+
+_cpu_lapack_available: bool | None = None
+
+
+def high_precision_invert(weight: Tensor) -> Tensor:
+    global _cpu_lapack_available
+    original_device = weight.device
+    compute_device = original_device
+
+    # If the tensor is on CPU and LAPACK is not available (e.g. ROCm builds),
+    # move to GPU for the inversion
+    if compute_device.type == "cpu":
+        if _cpu_lapack_available is None:
+            _cpu_lapack_available = _has_cpu_lapack()
+        if not _cpu_lapack_available and torch.cuda.is_available():
+            compute_device = torch.device("cuda")
+
+    result = torch.linalg.inv(weight.to(device=compute_device, dtype=torch.float64))
+    return result.to(device=original_device, dtype=weight.dtype)

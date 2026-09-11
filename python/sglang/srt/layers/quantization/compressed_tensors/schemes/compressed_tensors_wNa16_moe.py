@@ -6,7 +6,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch
-from compressed_tensors import CompressionFormat
+from sglang._vendor.compressed_tensors import CompressionFormat
 
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4DynamicMoEMethod,

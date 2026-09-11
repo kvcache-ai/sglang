@@ -899,7 +899,7 @@ class SharedFullContext:
             True if FP8 per-channel quant, False otherwise
         """
         try:
-            from compressed_tensors.quantization import QuantizationStrategy
+            from sglang._vendor.compressed_tensors.quantization import QuantizationStrategy
         except ImportError:
             return False
 

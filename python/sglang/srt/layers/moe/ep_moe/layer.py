@@ -36,7 +36,7 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
-if importlib.util.find_spec("compressed_tensors") is not None:
+if importlib.util.find_spec("sglang._vendor.compressed_tensors") is not None:
     from sglang.srt.layers.quantization.compressed_tensors.schemes import (
         NPUCompressedTensorsW4A16Int4DynamicMoE,
     )

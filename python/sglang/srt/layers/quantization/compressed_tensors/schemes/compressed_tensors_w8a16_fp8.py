@@ -4,7 +4,7 @@
 from typing import Callable, List, Optional
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
+from sglang._vendor.compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,

@@ -17,12 +17,12 @@ from typing import (
 )
 
 import torch
-from compressed_tensors.config import (
+from sglang._vendor.compressed_tensors.config import (
     CompressionFormat,
     SparsityCompressionConfig,
     SparsityStructure,
 )
-from compressed_tensors.quantization import (
+from sglang._vendor.compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationStrategy,
     QuantizationType,

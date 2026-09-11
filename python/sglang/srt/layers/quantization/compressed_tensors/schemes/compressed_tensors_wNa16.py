@@ -5,7 +5,7 @@ import logging
 from typing import Callable, Optional
 
 import torch
-from compressed_tensors.quantization import ActivationOrdering
+from sglang._vendor.compressed_tensors.quantization import ActivationOrdering
 
 # yapf conflicts with isort for this block
 # yapf: disable

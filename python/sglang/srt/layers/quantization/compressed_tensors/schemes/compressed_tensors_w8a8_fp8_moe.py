@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
+from sglang._vendor.compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
