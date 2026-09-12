@@ -37,6 +37,23 @@ from sglang.srt.constrained.utils import is_legacy_structural_tag
 logger = logging.getLogger(__name__)
 
 
+def _create_llguidance_tokenizer(tokenizer, n_vocab: Optional[int]) -> LLTokenizer:
+    tokenizer_type = type(tokenizer)
+    if (
+        tokenizer_type.__name__ == "TikTokenTokenizer"
+        and tokenizer_type.__module__.rsplit(".", 1)[-1] == "tokenization_kimi"
+    ):
+        import tiktoken
+        from llguidance.tiktoken import lltokenizer_from_encoding
+
+        encoding = getattr(tokenizer, "model", None)
+        if isinstance(encoding, tiktoken.Encoding):
+            return lltokenizer_from_encoding(
+                encoding, n_vocab=n_vocab, eos_token=tokenizer.eos_token_id
+            )
+    return from_tokenizer(tokenizer, n_vocab)
+
+
 class GuidanceGrammar(BaseGrammarObject):
 
     def __init__(self, llguidance_tokenizer: LLTokenizer, serialized_grammar: str):
@@ -120,7 +137,9 @@ class GuidanceBackend(BaseGrammarBackend):
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
-        self.llguidance_tokenizer = from_tokenizer(self.tokenizer, n_vocab)
+        self.llguidance_tokenizer = _create_llguidance_tokenizer(
+            self.tokenizer, n_vocab
+        )
 
     def _from_serialized(self, serialized_grammar) -> Optional[GuidanceGrammar]:
         try:
