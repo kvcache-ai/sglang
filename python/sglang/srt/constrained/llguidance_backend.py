@@ -137,7 +137,9 @@ class GuidanceBackend(BaseGrammarBackend):
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
-        self.llguidance_tokenizer = _create_llguidance_tokenizer(self.tokenizer, n_vocab)
+        self.llguidance_tokenizer = _create_llguidance_tokenizer(
+            self.tokenizer, n_vocab
+        )
 
     def _from_serialized(self, serialized_grammar) -> Optional[GuidanceGrammar]:
         try:
