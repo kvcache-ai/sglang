@@ -2,14 +2,14 @@
 
 import ast
 import os
+import unittest
 from pathlib import Path
 from typing import Optional
-import unittest
 from unittest.mock import Mock
 
+import tiktoken
 from llguidance import LLMatcher, LLTokenizer
 from llguidance.hf import from_tokenizer
-import tiktoken
 
 SOURCE = (
     Path(__file__).resolve().parents[3]
