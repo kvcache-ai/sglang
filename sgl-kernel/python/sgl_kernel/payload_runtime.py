@@ -130,6 +130,8 @@ def _materialize_all() -> Path:
 
 def materialize_binary(name: str) -> Path:
     manifest = _manifest()
-    if name not in manifest.FILES:
+    # New carriers retain wheel-relative paths so repaired $ORIGIN links work.
+    relative = getattr(manifest, "BINARIES", {}).get(name, name)
+    if relative not in manifest.FILES:
         raise FileNotFoundError(f"Unknown sgl-kernel-kt payload binary: {name}")
-    return _materialize_all() / name
+    return _materialize_all() / relative
