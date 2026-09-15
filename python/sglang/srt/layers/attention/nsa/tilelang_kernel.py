@@ -223,6 +223,7 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    kv_dtype="bfloat16",
 ):
     assert dim == tilelang.math.next_power_of_2(
         dim
@@ -261,18 +262,30 @@ def sparse_attention_fwd_kernel_v1(
     D = dim
     D_tail = tail_dim
 
-    if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+    # sm_120 (workstation Blackwell) has only ~99KB dynamic smem per block vs
+    # Hopper's 228KB. Split heads into smaller per-block groups so
+    # Q_shared (H_per_block x 576 x 2B) + KV_shared (block_I x 576 x 2B) fits.
+    _h_split = 64
+    try:
+        import torch as _t
+
+        if _t.cuda.get_device_capability()[0] >= 12:
+            _h_split = 16
+    except Exception:
+        pass
+
+    if head_kv > _h_split:
+        assert head_kv % _h_split == 0, "head_kv should be a multiple of the head split"
+        REPLICATE_H = head_kv // _h_split
     else:
         REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = padded_H if REPLICATE_H == 1 else _h_split
 
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
-        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, kv_dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
@@ -306,7 +319,7 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block)
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
@@ -530,17 +543,16 @@ def sparse_attention_fwd_kernel_v2(
                             is_kv_valid_0[bi_i], 0, -T.infinity(acc_s.dtype)
                         )
                     T.gemm(
-                        Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True
                     )
                     T.gemm(
-                        Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True
                     )
                     T.gemm(
                         Q_tail_shared,
                         K_tail_shared_0,
                         acc_s,
                         transpose_B=True,
-                        wg_wait=-1,
                     )
 
                     T.wait_wgmma(0)
@@ -582,17 +594,16 @@ def sparse_attention_fwd_kernel_v2(
                             is_kv_valid_1[bi_i], 0, -T.infinity(acc_s.dtype)
                         )
                     T.gemm(
-                        Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True
                     )
                     T.gemm(
-                        Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True, wg_wait=-1
+                        Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True
                     )
                     T.gemm(
                         Q_tail_shared,
                         K_tail_shared_1,
                         acc_s,
                         transpose_B=True,
-                        wg_wait=-1,
                     )
 
                     T.wait_wgmma(0)
@@ -1018,9 +1029,16 @@ def tilelang_sparse_fwd(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
-    if _is_hip:
+    import torch as _t
+
+    _small_smem = (not _is_hip) and _t.cuda.get_device_capability()[0] >= 12
+    if _is_hip or _small_smem:
+        # v2's tiles need ~226KB dynamic smem (Hopper/SM100). sm_120 workstation
+        # Blackwell caps at ~99KB per block; v1 with num_stages=1 fits.
+        kv_dtype = "float8_e4m3" if kv.dtype == torch.float8_e4m3fn else "bfloat16"
         kernel = sparse_attention_fwd_kernel_v1(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1,
+            threads=128, kv_dtype=kv_dtype,
         )
     else:
         kernel = sparse_attention_fwd_kernel_v2(
