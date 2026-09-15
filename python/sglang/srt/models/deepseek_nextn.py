@@ -247,8 +247,15 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        super().load_weights(weights, is_nextn=True)
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        run_post_load: bool = True,
+    ):
+        # Forward run_post_load so the loader can defer post_load_weights
+        # until quant schemes (e.g. wNa16/Marlin) have repacked their params;
+        # post_load_weights applies kv_b_proj, which crashes pre-repack.
+        super().load_weights(weights, is_nextn=True, run_post_load=run_post_load)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]
