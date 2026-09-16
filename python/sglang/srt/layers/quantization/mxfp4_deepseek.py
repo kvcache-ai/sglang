@@ -316,11 +316,17 @@ class DeepSeekMxfp4MoEMethod:
         # reserved for an ordinary full-expert layer or the manager's full
         # prefill shadow.
         _resident_partial = _resident_experts < _global_experts
+        # SGLANG_V4_MARLIN_PARTIAL=1 opts the resident partial-expert image into
+        # Marlin as well.  The triton_kernels matmul_ogs fallback reserves a
+        # fixed device transient at prefill launch regardless of batch size,
+        # which a 16 GB card that is also holding a large KV pool cannot spare;
+        # Marlin has no such reservation.
+        _allow_partial_marlin = envs.SGLANG_V4_MARLIN_PARTIAL.get()
         _take_marlin_path = (
             not _force_tk
             and not _force_trtllm
             and _capability in _MARLIN_MXFP4_CAPS
-            and not _resident_partial
+            and (not _resident_partial or _allow_partial_marlin)
         )
         if _take_marlin_path:
             from sglang.srt.layers.quantization.v4_marlin_moe import (
