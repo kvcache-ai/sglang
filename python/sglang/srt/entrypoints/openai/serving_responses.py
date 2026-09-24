@@ -68,12 +68,21 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
+from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _serialize_tool_call_constraint(constraint_type: str, constraint_value: Any) -> Any:
+    if constraint_type == "structural_tag":
+        return convert_json_schema_to_str(constraint_value.model_dump(by_alias=True))
+    if constraint_type == "json_schema":
+        return convert_json_schema_to_str(constraint_value)
+    return constraint_value
 
 
 def _response_event(event_type: str, sequence_number: int, **payload: Any) -> str:
@@ -300,6 +309,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                         if processed_messages.tool_call_constraint is not None:
                             constraint_type, constraint_value = (
                                 processed_messages.tool_call_constraint
+                            )
+                            constraint_value = _serialize_tool_call_constraint(
+                                constraint_type, constraint_value
                             )
                             sampling_params[constraint_type] = constraint_value
                         if not getattr(processed_messages, "skip_special_tokens", True):
