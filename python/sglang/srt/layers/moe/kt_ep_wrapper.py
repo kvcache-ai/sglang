@@ -533,6 +533,13 @@ _SHARED_STAGING_BUFFER = None  # Global shared staging buffer for all MoE layers
 _MXFP4_PREFILL_LAYER_REGISTRY = {}
 _MXFP4_LAYERWISE_MANAGERS = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS = {}
+# The generic full-GPU prefill path builds one SharedFullContext lazily and
+# shares it across layers. Its capacity has to be kept out of the KV cache the
+# same way the MXFP4 slots are, so one registered layer is enough to size it.
+_FULL_GPU_PREFILL_LAYER_REGISTRY = {}
+# Set when the shared context could not be allocated, so the gate stops
+# choosing a path that is known not to fit.
+_FULL_GPU_CONTEXT_DISABLED_REASON = None
 # Exact GLM-5-Next block-FP8 has a deliberately separate registry/control
 # plane.  Registration is harmless for ``legacy`` transport, while manager
 # construction is hard-gated on the validated TP/gpu_experts=0 runtime below.
@@ -3422,6 +3429,72 @@ def _mxfp4_raw_slot_storage_nbytes(
     )
 
 
+def get_full_gpu_prefill_reservation_bytes() -> int:
+    """Return the bytes one generic full-GPU prefill slot will need.
+
+    ``SharedFullContext._build_layers`` copies the MoE layer, overrides its
+    expert counts to the global total and calls ``create_weights`` on whatever
+    ``quant_config.get_quant_method`` returns. Repeating those steps on the
+    meta device gives the exact shapes and dtypes for every quantisation
+    method without allocating anything and without a second copy of the
+    per-method formulas.
+    """
+    entry = _FULL_GPU_PREFILL_LAYER_REGISTRY.get("shared")
+    if entry is None:
+        return 0
+    method, layer = entry
+    init_args = getattr(method, "_full_init_args", None)
+    global_num_experts = getattr(method, "global_num_experts", None)
+    if init_args is None or global_num_experts is None:
+        return 0
+    hidden_size, intermediate_size_per_partition, params_dtype = init_args
+
+    try:
+        probe = copy.copy(layer)
+        probe._parameters = {}
+        probe._buffers = {}
+        probe._modules = {}
+        probe.num_experts = global_num_experts
+        probe.num_local_experts = global_num_experts
+        probe.num_gpu_experts = global_num_experts
+        if getattr(probe, "quant_config", None) is not None:
+            probe_method = probe.quant_config.get_quant_method(probe, prefix="")
+        else:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            probe_method = UnquantizedFusedMoEMethod(
+                getattr(probe, "use_triton_kernels", False)
+            )
+        with torch.device("meta"):
+            probe_method.create_weights(
+                layer=probe,
+                num_experts=global_num_experts,
+                hidden_size=hidden_size,
+                intermediate_size_per_partition=intermediate_size_per_partition,
+                params_dtype=params_dtype,
+            )
+        total = 0
+        for tensor in list(probe.parameters()) + list(probe.buffers()):
+            total += tensor.numel() * tensor.element_size()
+    except Exception as exc:  # sizing must never break startup
+        logger.warning(
+            "[kt-ep-wrapper] could not size the full-GPU prefill slot, "
+            "reserving nothing: %s",
+            exc,
+        )
+        return 0
+
+    logger.info(
+        "[kt-ep-wrapper] reserving %.2f GiB a rank for the full-GPU prefill "
+        "slot (%d experts)",
+        total / 2**30,
+        global_num_experts,
+    )
+    return total
+
+
 def get_mxfp4_layerwise_prefill_reservation_bytes() -> int:
     """Return the unallocated MXFP4 slot capacity needed after a long request.
 
@@ -5197,6 +5270,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             intermediate_size_per_partition,
             params_dtype,
         )
+        if (self.gpu_prefill_token_threshold or 0) > 0:
+            # One entry is enough: the generic path shares a single context.
+            _FULL_GPU_PREFILL_LAYER_REGISTRY.setdefault('shared', (self, layer))
 
         # Get required parameters from layer object
         # top_k: number of experts selected per token
@@ -5707,6 +5783,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             and self.gpu_prefill_token_threshold > 0
             and num_tokens >= self.gpu_prefill_token_threshold
             and _full_gpu_fallback_supported
+            and _FULL_GPU_CONTEXT_DISABLED_REASON is None
         )
         _mxfp4_requested = _mxfp4_pipeline_requested(self)
         _mxfp4_signature = getattr(self, "_mxfp4_pipeline_signature", None)
@@ -6218,12 +6295,27 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     )
                 gpu_slot_bytes, host_buffer_bytes = validation_result
             else:
-                context = SharedFullContext(
-                    layer=layer,
-                    init_args=self._full_init_args,
-                    global_num_experts=self.global_num_experts,
-                    moe_runner_config=self.moe_runner_config,
-                )
+                global _FULL_GPU_CONTEXT_DISABLED_REASON
+                try:
+                    context = SharedFullContext(
+                        layer=layer,
+                        init_args=self._full_init_args,
+                        global_num_experts=self.global_num_experts,
+                        moe_runner_config=self.moe_runner_config,
+                    )
+                except Exception as exc:
+                    _FULL_GPU_CONTEXT_DISABLED_REASON = repr(exc)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if isinstance(exc, torch.cuda.OutOfMemoryError):
+                        raise RuntimeError(
+                            "full-GPU prefill could not allocate its shared "
+                            "layer slot; lower --mem-fraction-static or set "
+                            "--kt-gpu-prefill-token-threshold 0. Later "
+                            "requests will use the hybrid CPU/GPU path."
+                        ) from exc
+                    raise
 
             if is_glm5_next_fp8:
                 if self.tp_rank == 0:
