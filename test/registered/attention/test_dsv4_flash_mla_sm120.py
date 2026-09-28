@@ -163,7 +163,9 @@ class TestDsv4FlashInferDecode(unittest.TestCase):
             topk_length=lengths,
             attn_sink=torch.full((64,), -4.0, device=device),
             extra_k_cache=extra_cache,
-            extra_indices_in_kvcache=torch.full((2, 1, 64), -1, dtype=torch.int32, device=device),
+            extra_indices_in_kvcache=torch.full(
+                (2, 1, 64), -1, dtype=torch.int32, device=device
+            ),
             extra_topk_length=torch.ones(2, dtype=torch.int32, device=device),
         )
         expected = _v4_triton_decode_dispatch(**kwargs)[0]

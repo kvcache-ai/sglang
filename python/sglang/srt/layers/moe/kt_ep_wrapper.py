@@ -250,7 +250,9 @@ def _validate_kt_sft_runtime(method: str) -> None:
         try:
             from kt_kernel.sft import get_mxfp4_runtime
         except (ImportError, AttributeError) as exc:
-            raise RuntimeError("Native MXFP4 expert LoRA requires a kt-kernel MXFP4 SFT build.") from exc
+            raise RuntimeError(
+                "Native MXFP4 expert LoRA requires a kt-kernel MXFP4 SFT build."
+            ) from exc
         get_mxfp4_runtime()
         return
     if method != "AMXFP8_SFT":
@@ -5313,7 +5315,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                         "Clamped expert LoRA requires a clamp-aware SFT backend (MXFP4)."
                     )
                 if _kt_swiglu_alpha != 0.0:
-                    raise ValueError("Expert LoRA does not support a nonzero swiglu_alpha.")
+                    raise ValueError(
+                        "Expert LoRA does not support a nonzero swiglu_alpha."
+                    )
                 self.kt_expert_lora_weights = _load_kt_expert_lora_weights(
                     adapter_path=self.kt_expert_lora_path,
                     layer_idx=self.kt_config.layer_idx,
@@ -5324,7 +5328,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 _validate_kt_sft_runtime(sft_method)
                 native_kwargs = (
                     {"group_size": 32, "zero_point": False, "swiglu_limit": _kt_swiglu_limit}
-                    if sft_method == "MXFP4_SFT" else {}
+                    if sft_method == "MXFP4_SFT"
+                    else {}
                 )
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
