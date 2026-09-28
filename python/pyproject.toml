@@ -18,7 +18,7 @@ dependencies = [
   "IPython",
   "accelerate-kt==1.14.0.post4.dev20260928", # Required by the complete KT native wheel payload.
   "aiohttp",
-  "apache-tvm-ffi>=0.1.5,<0.2",
+  "apache-tvm-ffi==0.1.11", # TileLang 0.1.10 conflicts with FFI >=0.1.12; align with KT Docker.
   "anthropic>=0.20.0",
   "av",
   "blobfile==3.0.0",
