@@ -8,33 +8,32 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
-
 from sglang.srt.lora import kt_dsv4
 
 
 @pytest.fixture
 def adapter(tmp_path, monkeypatch):
-    model = dict(
-        num_hidden_layers=43,
-        n_routed_experts=256,
-        n_shared_experts=1,
-        hidden_size=16,
-        moe_intermediate_size=16,
-        q_lora_rank=8,
-        num_attention_heads=2,
-        head_dim=4,
-        o_groups=2,
-        o_lora_rank=4,
-        compress_ratios=[0, 0] + [4, 128] * 20 + [4],
-        swiglu_limit=10,
-    )
-    config = dict(
-        peft_type="LORA",
-        r=8,
-        lora_alpha=16,
-        lora_dropout=0,
-        target_modules=list(kt_dsv4.TARGETS),
-    )
+    model = {
+        "num_hidden_layers": 43,
+        "n_routed_experts": 256,
+        "n_shared_experts": 1,
+        "hidden_size": 16,
+        "moe_intermediate_size": 16,
+        "q_lora_rank": 8,
+        "num_attention_heads": 2,
+        "head_dim": 4,
+        "o_groups": 2,
+        "o_lora_rank": 4,
+        "compress_ratios": [0, 0] + [4, 128] * 20 + [4],
+        "swiglu_limit": 10,
+    }
+    config = {
+        "peft_type": "LORA",
+        "r": 8,
+        "lora_alpha": 16,
+        "lora_dropout": 0,
+        "target_modules": list(kt_dsv4.TARGETS),
+    }
     (tmp_path / "adapter_config.json").write_text(json.dumps(config))
     ordinary, experts = {}, {}
     for layer in range(43):
@@ -49,20 +48,20 @@ def adapter(tmp_path, monkeypatch):
                 )
     save_file(ordinary, str(tmp_path / "adapter_model.safetensors"))
     save_file(experts, str(tmp_path / kt_dsv4.FUSED))
-    manifest = dict(
-        version=1,
-        status="ready",
-        expert_weight_format="mxfp4",
-        lora=dict(rank=8, alpha=16),
-        base=dict(fingerprint="same-base"),
-    )
+    manifest = {
+        "version": 1,
+        "status": "ready",
+        "expert_weight_format": "mxfp4",
+        "lora": {"rank": 8, "alpha": 16},
+        "base": {"fingerprint": "same-base"},
+    }
 
     def seal():
         manifest["artifacts"] = {
-            name: dict(
-                size=(tmp_path / name).stat().st_size,
-                sha256=hashlib.sha256((tmp_path / name).read_bytes()).hexdigest(),
-            )
+            name: {
+                "size": (tmp_path / name).stat().st_size,
+                "sha256": hashlib.sha256((tmp_path / name).read_bytes()).hexdigest(),
+            }
             for name in (
                 "adapter_config.json",
                 "adapter_model.safetensors",
@@ -77,7 +76,7 @@ def adapter(tmp_path, monkeypatch):
     monkeypatch.setattr(
         native,
         "inspect_native_checkpoint",
-        lambda _: dict(fingerprint="same-base", config=model),
+        lambda _: {"fingerprint": "same-base", "config": model},
     )
     return tmp_path, model, manifest, seal
 

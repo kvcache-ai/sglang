@@ -5,7 +5,6 @@ import json
 import re
 from pathlib import Path
 
-
 MANIFEST = "kt_adapter_manifest.json"
 FUSED = "fused_expert_lora.safetensors"
 TARGETS = {
@@ -119,7 +118,7 @@ def load_nonexpert(path, model_config):
     with safe_open(
         str(Path(path) / "adapter_model.safetensors"), framework="pt", device="cpu"
     ) as handle:
-        for key in handle.keys():
+        for key in handle.keys():  # noqa: SIM118 (safe_open is not iterable)
             match = _KEY.fullmatch(key)
             if match is None:
                 raise ValueError(f"Unsupported April LoRA tensor: {key}")
