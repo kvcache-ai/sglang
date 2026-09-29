@@ -150,7 +150,9 @@ class TestDsv4FlashInferDecode(unittest.TestCase):
     def test_triton_ignores_nan_in_unselected_compressed_kv(self):
         device = torch.device("cuda")
         lengths = torch.tensor([29, 22], dtype=torch.int32, device=device)
-        indices = torch.arange(128, dtype=torch.int32, device=device).expand(2, -1).clone()
+        indices = (
+            torch.arange(128, dtype=torch.int32, device=device).expand(2, -1).clone()
+        )
         indices[indices >= lengths[:, None]] = -1
         extra_cache = _build_kv_cache(4, 2, device, seed=31)
         kwargs = dict(

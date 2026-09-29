@@ -481,7 +481,12 @@ def _load_kt_expert_lora_weights(
     if is_native_adapter(adapter_dir):
         return KTExpertLoraWeights(
             **load_expert_layer(
-                adapter_dir, layer_idx, num_experts, hidden_size, moe_intermediate_size, dtype
+                adapter_dir,
+                layer_idx,
+                num_experts,
+                hidden_size,
+                moe_intermediate_size,
+                dtype,
             )
         )
     rank_from_config, alpha = _load_adapter_config(adapter_dir)

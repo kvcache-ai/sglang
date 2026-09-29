@@ -6388,7 +6388,9 @@ class ServerArgs:
                 or self.lora_paths[0].lora_id != self.kt_composite_lora_id
                 or self.lora_paths[0].lora_name != self.kt_composite_lora_name
             ):
-                raise ValueError("Native April LoRA requires its complete static adapter pair")
+                raise ValueError(
+                    "Native April LoRA requires its complete static adapter pair"
+                )
             return
 
         if self.kt_lora_path:
