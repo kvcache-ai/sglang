@@ -1423,6 +1423,32 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    @staticmethod
+    def should_apply_lora(module_name):
+        parts = module_name.split(".")
+        if len(parts) < 5 or parts[:2] != ["model", "layers"] or not parts[2].isdigit():
+            return False
+        target = ".".join(parts[3:])
+        return target in {
+            "self_attn.wq_a",
+            "self_attn.wq_b",
+            "self_attn.wkv",
+            "self_attn.wo_b",
+            "mlp.shared_experts.gate_up_proj",
+            "mlp.shared_experts.down_proj",
+        }
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        layer = self.model.layers[layer_idx]
+        if module_name in {"wq_a", "wq_b", "wkv", "wo_b"}:
+            module = getattr(layer.self_attn, module_name)
+        elif module_name in {"gate_up_proj", "down_proj"}:
+            module = getattr(layer.mlp.shared_experts, module_name)
+        else:
+            raise ValueError(f"Unsupported V4 LoRA module: {module_name}")
+        module = getattr(module, "base_layer", module)
+        return module.input_size, module.output_size
+
     def __init__(
         self,
         config: DeepSeekV4Config,

@@ -889,6 +889,7 @@ class ServerArgs:
     kt_expert_placement_strategy: str = "uniform"
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
+    kt_dsv4_lora_path: Optional[str] = dataclasses.field(default=None, repr=False)
     # Identity of the sole composite adapter internally split from --lora-paths.
     # Kept explicit so request-layer enforcement can bind the static expert
     # half to the matching non-expert LoRA ID instead of treating it as global.
@@ -6379,6 +6380,17 @@ class ServerArgs:
                 "--kt-expert-lora-path is used."
             )
 
+        if self.kt_dsv4_lora_path is not None:
+            if (
+                self.kt_expert_lora_path != self.kt_dsv4_lora_path
+                or len(self.lora_paths or []) != 1
+                or self.lora_paths[0].lora_path != self.kt_dsv4_lora_path
+                or self.lora_paths[0].lora_id != self.kt_composite_lora_id
+                or self.lora_paths[0].lora_name != self.kt_composite_lora_name
+            ):
+                raise ValueError("Native April LoRA requires its complete static adapter pair")
+            return
+
         if self.kt_lora_path:
             _validate_kt_expert_lora_adapter_path(
                 self.kt_lora_path,
@@ -6479,9 +6491,14 @@ class ServerArgs:
                 and len(self.lora_paths) == 1
                 and self.lora_paths[0].lora_name == self.kt_composite_lora_name
                 and self.lora_paths[0].lora_id == self.kt_composite_lora_id
-                and _is_prepared_kt_composite_pair(
-                    self.kt_expert_lora_path,
-                    self.lora_paths[0].lora_path,
+                and (
+                    self.kt_dsv4_lora_path
+                    == self.kt_expert_lora_path
+                    == self.lora_paths[0].lora_path
+                    or _is_prepared_kt_composite_pair(
+                        self.kt_expert_lora_path,
+                        self.lora_paths[0].lora_path,
+                    )
                 )
             )
             if self.kt_expert_lora_path and self.lora_paths and not prepared_pair:
@@ -6496,7 +6513,37 @@ class ServerArgs:
             kt_composite_expert_path: Optional[str] = None
             rewritten_lora_paths: List[LoRARef] = []
             for lora_ref in self.lora_paths:
-                prepared = _prepare_kt_composite_lora_adapter(lora_ref.lora_path)
+                if prepared_pair and self.kt_dsv4_lora_path is not None:
+                    rewritten_lora_paths.append(lora_ref)
+                    continue
+                from sglang.srt.lora.kt_dsv4 import is_native_adapter, validate_adapter
+
+                native_v4 = is_native_adapter(lora_ref.lora_path)
+                if native_v4:
+                    if (
+                        len(self.lora_paths) != 1
+                        or self.kt_expert_lora_path
+                        or not self.kt_weight_path
+                        or Path(self.kt_weight_path).resolve()
+                        != Path(self.model_path).resolve()
+                        or (self.kt_method or "").upper() != "MXFP4"
+                        or self.kt_num_gpu_experts != 0
+                        or self.kt_gpu_prefill_token_threshold != 0
+                        or self.pp_size != 1
+                        or self.enable_lora_overlap_loading
+                        or not self.disable_shared_experts_fusion
+                        or envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+                    ):
+                        raise ValueError(
+                            "Native April LoRA requires one static adapter, the original "
+                            "model as --kt-weight-path, MXFP4 CPU experts, TP only, "
+                            "independent shared experts and SGLANG_OPT_FUSE_WQA_WKV=0"
+                        )
+                    validate_adapter(lora_ref.lora_path, self.model_path)
+                    self.kt_dsv4_lora_path = str(Path(lora_ref.lora_path).resolve())
+                    prepared = (self.kt_dsv4_lora_path, self.kt_dsv4_lora_path)
+                else:
+                    prepared = _prepare_kt_composite_lora_adapter(lora_ref.lora_path)
                 if prepared is None:
                     rewritten_lora_paths.append(lora_ref)
                     continue
@@ -6535,14 +6582,15 @@ class ServerArgs:
                 self.kt_expert_lora_path = kt_composite_expert_path
                 self.kt_composite_lora_name = kt_composite_lora_ref.lora_name
                 self.kt_composite_lora_id = kt_composite_lora_ref.lora_id
-                logger.warning(
-                    "Using merged KT composite LoRA adapter %s as %s. "
-                    "The adapter is internally split into expert/non-expert "
-                    "runtime directories. In this first implementation the KT "
-                    "expert LoRA is loaded statically at server startup.",
-                    kt_composite_lora_ref.lora_path,
-                    kt_composite_lora_ref.lora_name,
-                )
+                if self.kt_dsv4_lora_path is None:
+                    logger.warning(
+                        "Using merged KT composite LoRA adapter %s as %s. "
+                        "The adapter is internally split into expert/non-expert "
+                        "runtime directories. In this first implementation the KT "
+                        "expert LoRA is loaded statically at server startup.",
+                        kt_composite_lora_ref.lora_path,
+                        kt_composite_lora_ref.lora_name,
+                    )
             if self.kt_composite_lora_id is not None and self.pp_size != 1:
                 raise ValueError(
                     "Merged KT composite LoRA serving currently supports "

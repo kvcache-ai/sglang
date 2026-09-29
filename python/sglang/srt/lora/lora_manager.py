@@ -107,6 +107,7 @@ class LoRAManager:
         self.static_kt_lora_id: Optional[str] = getattr(
             server_args, "kt_composite_lora_id", None
         )
+        self.kt_dsv4_lora_path = getattr(server_args, "kt_dsv4_lora_path", None)
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -165,6 +166,10 @@ class LoRAManager:
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
+            if self.kt_dsv4_lora_path is not None:
+                from sglang.srt.lora.kt_dsv4 import runtime_config
+
+                new_adapter = LoRAConfig.from_dict(runtime_config(lora_ref.lora_path))
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -552,6 +557,14 @@ class LoRAManager:
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
         """
+        if self.kt_dsv4_lora_path is not None:
+            from sglang.srt.lora.kt_dsv4 import load_nonexpert
+
+            self.load_lora_weights_from_tensors(
+                lora_ref,
+                load_nonexpert(lora_ref.lora_path, self.base_hf_config.to_dict()),
+            )
+            return
         lora_adapter = LoRAAdapter(
             lora_ref.lora_id,
             self.configs[lora_ref.lora_id],

@@ -476,6 +476,14 @@ def _load_kt_expert_lora_weights(
     dtype: torch.dtype = torch.bfloat16,
 ) -> KTExpertLoraWeights:
     adapter_dir = Path(adapter_path)
+    from sglang.srt.lora.kt_dsv4 import is_native_adapter, load_expert_layer
+
+    if is_native_adapter(adapter_dir):
+        return KTExpertLoraWeights(
+            **load_expert_layer(
+                adapter_dir, layer_idx, num_experts, hidden_size, moe_intermediate_size, dtype
+            )
+        )
     rank_from_config, alpha = _load_adapter_config(adapter_dir)
     weight_file = _find_adapter_weight_file(adapter_dir)
     weight_file_str = str(weight_file)
