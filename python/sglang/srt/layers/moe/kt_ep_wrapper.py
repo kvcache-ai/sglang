@@ -5340,7 +5340,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
                 _validate_kt_sft_runtime(sft_method)
                 native_kwargs = (
-                    {"group_size": 32, "zero_point": False, "swiglu_limit": _kt_swiglu_limit}
+                    {
+                        "group_size": 32,
+                        "zero_point": False,
+                        "swiglu_limit": _kt_swiglu_limit,
+                    }
                     if sft_method == "MXFP4_SFT"
                     else {}
                 )
