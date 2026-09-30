@@ -280,6 +280,20 @@ class ModelRunnerKVCacheMixin:
         rest_memory = available_gpu_memory - self.total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+        # Keep the lazily allocated layerwise prefill slot out of the KV cache.
+        # Only the DSv4 pool sizer honoured this reservation; every other model
+        # let the cache take the card, and the first prefill long enough to
+        # qualify then died allocating the slot.
+        reservation_bytes = getattr(
+            self, 'mxfp4_layerwise_prefill_reservation_bytes', 0
+        )
+        if reservation_bytes:
+            # The whole slot, not just the part the free region fails to
+            # cover: that region belongs to activations, workspaces and graph
+            # pools. A negative rest_memory below is the honest signal that
+            # this fraction cannot hold weights, KV, the slot and the
+            # activations at once.
+            rest_memory -= reservation_bytes / (1 << 30)
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
