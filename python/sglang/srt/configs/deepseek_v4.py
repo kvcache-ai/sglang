@@ -99,7 +99,8 @@ class DeepSeekV4Config(PretrainedConfig):
         self.q_lora_rank = q_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
-        self.quantization_config = quantization_config if quantization_config is not None else {}
+        if quantization_config is not None:
+            self.quantization_config = quantization_config
         self.rms_norm_eps = rms_norm_eps
         self.rope_scaling = rope_scaling if rope_scaling is not None else {}
         self.rope_theta = rope_theta

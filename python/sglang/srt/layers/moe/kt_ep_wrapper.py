@@ -214,6 +214,7 @@ _KT_SFT_METHOD_BY_INFERENCE_METHOD = {
     "AMXINT8": "AMXINT8_SFT",
     "AMXINT4": "AMXINT4_SFT",
     "RAWINT4": "RAWINT4_SFT",
+    "MXFP4": "MXFP4_SFT",
 }
 
 _KT_SFT_METHODS_REQUIRING_SHARED_BACKWARD_BB = frozenset(
@@ -234,6 +235,8 @@ def _map_kt_method_to_sft_method(method: str) -> str:
 def _configure_kt_sft_wrapper_for_serving(wrapper, method: str) -> None:
     if method in _KT_SFT_METHODS_REQUIRING_SHARED_BACKWARD_BB:
         wrapper.share_backward_bb = True
+    elif method == "MXFP4_SFT":
+        wrapper.share_backward_bb = False
 
 
 def _validate_kt_sft_runtime(method: str) -> None:
@@ -242,6 +245,15 @@ def _validate_kt_sft_runtime(method: str) -> None:
         from kt_kernel.sft import get_rawint4_runtime
 
         get_rawint4_runtime()
+        return
+    if method == "MXFP4_SFT":
+        try:
+            from kt_kernel.sft import get_mxfp4_runtime
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "Native MXFP4 expert LoRA requires a kt-kernel MXFP4 SFT build."
+            ) from exc
+        get_mxfp4_runtime()
         return
     if method != "AMXFP8_SFT":
         return
@@ -464,6 +476,19 @@ def _load_kt_expert_lora_weights(
     dtype: torch.dtype = torch.bfloat16,
 ) -> KTExpertLoraWeights:
     adapter_dir = Path(adapter_path)
+    from sglang.srt.lora.kt_dsv4 import is_native_adapter, load_expert_layer
+
+    if is_native_adapter(adapter_dir):
+        return KTExpertLoraWeights(
+            **load_expert_layer(
+                adapter_dir,
+                layer_idx,
+                num_experts,
+                hidden_size,
+                moe_intermediate_size,
+                dtype,
+            )
+        )
     rank_from_config, alpha = _load_adapter_config(adapter_dir)
     weight_file = _find_adapter_weight_file(adapter_dir)
     weight_file_str = str(weight_file)
@@ -5172,6 +5197,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
 
+    def is_cpu_owned_checkpoint_parameter(self, parameter: torch.Tensor) -> bool:
+        """Empty GPU expert slots are populated by the external CPU weight loader."""
+        return (
+            bool(self.kt_config.weight_path)
+            and self.num_gpu_experts == 0
+            and parameter.numel() == 0
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -5289,10 +5322,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
             )
             if self.kt_expert_lora_enabled:
-                if _kt_swiglu_limit != 0.0:
+                sft_method = _map_kt_method_to_sft_method(self.kt_config.method)
+                if _kt_swiglu_limit != 0.0 and sft_method != "MXFP4_SFT":
                     raise ValueError(
-                        "--kt-expert-lora-path uses KT SFT wrappers, which do not "
-                        "support the V4-2604B swiglu_limit path."
+                        "Clamped expert LoRA requires a clamp-aware SFT backend (MXFP4)."
+                    )
+                if _kt_swiglu_alpha != 0.0:
+                    raise ValueError(
+                        "Expert LoRA does not support a nonzero swiglu_alpha."
                     )
                 self.kt_expert_lora_weights = _load_kt_expert_lora_weights(
                     adapter_path=self.kt_expert_lora_path,
@@ -5301,10 +5338,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     hidden_size=hidden_size,
                     moe_intermediate_size=intermediate_size_full,
                 )
-                sft_method = _map_kt_method_to_sft_method(self.kt_config.method)
                 _validate_kt_sft_runtime(sft_method)
+                native_kwargs = (
+                    {
+                        "group_size": 32,
+                        "zero_point": False,
+                        "swiglu_limit": _kt_swiglu_limit,
+                    }
+                    if sft_method == "MXFP4_SFT"
+                    else {}
+                )
                 self.wrapper = KTMoEWrapper(
                     **common_wrapper_kwargs,
+                    **native_kwargs,
                     method=sft_method,
                     mode="sft",
                     num_gpu_experts=0,
@@ -5957,6 +6003,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Main stream waits for cpu_stream to complete before merging results
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
+            # The shared output can be replaced when a subsequent batch changes size.
+            cpu_output.record_stream(torch.cuda.current_stream(x.device))
             output = output + cpu_output
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()

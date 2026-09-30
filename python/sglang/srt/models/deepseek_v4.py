@@ -1423,6 +1423,32 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    @staticmethod
+    def should_apply_lora(module_name):
+        parts = module_name.split(".")
+        if len(parts) < 5 or parts[:2] != ["model", "layers"] or not parts[2].isdigit():
+            return False
+        target = ".".join(parts[3:])
+        return target in {
+            "self_attn.wq_a",
+            "self_attn.wq_b",
+            "self_attn.wkv",
+            "self_attn.wo_b",
+            "mlp.shared_experts.gate_up_proj",
+            "mlp.shared_experts.down_proj",
+        }
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        layer = self.model.layers[layer_idx]
+        if module_name in {"wq_a", "wq_b", "wkv", "wo_b"}:
+            module = getattr(layer.self_attn, module_name)
+        elif module_name in {"gate_up_proj", "down_proj"}:
+            module = getattr(layer.mlp.shared_experts, module_name)
+        else:
+            raise ValueError(f"Unsupported V4 LoRA module: {module_name}")
+        module = getattr(module, "base_layer", module)
+        return module.input_size, module.output_size
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1974,6 +2000,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
+        for name in tuple(unloaded_params):
+            owner = self.get_submodule(name.rsplit(".", 1)[0])
+            is_cpu_owned = getattr(
+                getattr(owner, "quant_method", None),
+                "is_cpu_owned_checkpoint_parameter",
+                None,
+            )
+            if is_cpu_owned is not None and is_cpu_owned(params_dict[name]):
+                unloaded_params.remove(name)
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
         if is_nextn:
@@ -2116,6 +2151,9 @@ def _dequant_fp8_wo_a(
         if name not in weights_dict:
             continue
         if not name.endswith(".wo_a.weight"):
+            continue
+        if weights_dict[name].dtype == torch.bfloat16:
+            # Static LoRA deployment already decoded and merged non-experts.
             continue
         scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
         assert scale_name in weights_dict

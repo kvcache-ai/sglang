@@ -16,9 +16,9 @@ classifiers = [
 
 dependencies = [
   "IPython",
-  "accelerate-kt==1.14.0.post3", # Required by the complete KT native wheel payload.
+  "accelerate-kt==1.14.0.post4.dev20260928", # Required by the complete KT native wheel payload.
   "aiohttp",
-  "apache-tvm-ffi>=0.1.5,<0.2",
+  "apache-tvm-ffi==0.1.11", # TileLang 0.1.10 conflicts with FFI >=0.1.12; align with KT Docker.
   "anthropic>=0.20.0",
   "av",
   "blobfile==3.0.0",
@@ -61,9 +61,10 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "kt-kernel==0.7.0.post4",
+  "kt-kernel==0.7.2.dev20260928",
   "soundfile==0.13.1",
   "tiktoken",
+  "tilelang==0.1.10", # V4 compressed indexer on consumer GPUs; align with KT Docker.
   "timm==1.0.16",
   "torch_memory_saver==0.0.9",
   "torch==2.9.1",
@@ -72,7 +73,7 @@ dependencies = [
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision==0.24.1",
   "tqdm",
-  "transformers-kt==5.6.0.post5",
+  "transformers-kt==5.6.0.post6.dev20260928",
   "uvicorn",
   "uvloop",
 

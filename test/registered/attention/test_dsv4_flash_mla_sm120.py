@@ -115,7 +115,7 @@ class TestDsv4TouchedPageSplit(unittest.TestCase):
             out.shape,
             (num_pages * ratio, sm120._PBS_DST, 1, sm120._BYTES_PER_TOKEN),
         )
-        self.assertEqual(sm120._MASK_BUFFERS[key].tolist(), [1, 0, 1])
+        self.assertEqual(sm120._MASK_BUFFERS[key][:num_pages].tolist(), [1, 0, 1])
 
         data_size = sm120._PBS_DST * sm120._NOPE_ROPE_STRIDE
         scale_size = sm120._PBS_DST * sm120._SCALE_STRIDE
@@ -147,6 +147,36 @@ class TestDsv4TouchedPageSplit(unittest.TestCase):
 
 @unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestDsv4FlashInferDecode(unittest.TestCase):
+    def test_triton_ignores_nan_in_unselected_compressed_kv(self):
+        device = torch.device("cuda")
+        lengths = torch.tensor([29, 22], dtype=torch.int32, device=device)
+        indices = (
+            torch.arange(128, dtype=torch.int32, device=device).expand(2, -1).clone()
+        )
+        indices[indices >= lengths[:, None]] = -1
+        extra_cache = _build_kv_cache(4, 2, device, seed=31)
+        kwargs = dict(
+            q=torch.ones(2, 1, 64, 512, dtype=torch.bfloat16, device=device),
+            k_cache=_build_kv_cache(4, 128, device, seed=23),
+            head_dim_v=512,
+            softmax_scale=512**-0.5,
+            is_fp8_kvcache=True,
+            indices=indices[:, None],
+            topk_length=lengths,
+            attn_sink=torch.full((64,), -4.0, device=device),
+            extra_k_cache=extra_cache,
+            extra_indices_in_kvcache=torch.full(
+                (2, 1, 64), -1, dtype=torch.int32, device=device
+            ),
+            extra_topk_length=torch.ones(2, dtype=torch.int32, device=device),
+        )
+        expected = _v4_triton_decode_dispatch(**kwargs)[0]
+        # Invalid indices must not consume FP8/BF16 NaNs from unused cache slots.
+        extra_cache.fill_(255)
+        actual = _v4_triton_decode_dispatch(**kwargs)[0]
+        self.assertTrue(bool(torch.isfinite(actual).all()))
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
     def test_flashinfer_matches_existing_triton_reference(self):
         if not sm120.is_flashinfer_dsv4_available():
             self.skipTest("FlashInfer SM120 DSV4 sparse MLA API unavailable")
