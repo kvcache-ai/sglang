@@ -17,7 +17,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import (
     resolve_dsv4_reasoning_controls,
 )
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.entrypoints.openai.serving_responses import (
+    OpenAIServingResponses,
+    _serialize_tool_call_constraint,
+)
 
 
 class TestDSV4ReasoningAndResponses(unittest.TestCase):
@@ -292,6 +295,12 @@ class TestDSV4ReasoningAndResponses(unittest.TestCase):
         self.assertEqual(output[0].type, "function_call")
         self.assertEqual(output[0].name, "exec_command")
         self.assertEqual(json.loads(output[0].arguments), {"cmd": "pwd"})
+
+    def test_required_tool_schema_is_serialized_for_scheduler(self):
+        schema = _serialize_tool_call_constraint("json_schema", {"type": "object"})
+        self.assertIsInstance(schema, str)
+        self.assertEqual(json.loads(schema), {"type": "object"})
+        hash(("json_schema", schema))
 
 
 class TestDSV4ResponsesStream(unittest.IsolatedAsyncioTestCase):
