@@ -10,6 +10,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.cache_identity import encode_cache_identity
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -144,17 +145,12 @@ class OpenAIServingBase(ABC):
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
     def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
-        parts = []
-        for key in ["cache_salt", "extra_key"]:
-            value = getattr(request, key, None)
-            if value:
-                if not isinstance(value, str):
-                    raise TypeError(
-                        f"Value of {key} must be a string, but got {type(value).__name__}"
-                    )
-                parts.append(value)
-        return "".join(parts) if parts else None
+        """Compute a collision-free OpenAI cache namespace."""
+        return encode_cache_identity(
+            "openai",
+            cache_salt=getattr(request, "cache_salt", None),
+            extra_key=getattr(request, "extra_key", None),
+        )
 
     @abstractmethod
     def _convert_to_internal_request(
