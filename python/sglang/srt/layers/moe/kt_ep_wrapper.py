@@ -2188,6 +2188,12 @@ class SharedFullContext:
         tp_world_size = get_tensor_model_parallel_world_size()
         do_write = tp_rank == 0 and wrapper is not None
 
+        # Rank 0 writes every rank's CPU staging slots. Drain all previous
+        # readers before starting a new load, including reuse across layers.
+        if dist.is_initialized() and tp_world_size > 1:
+            torch.cuda.synchronize(device)
+            dist.barrier(group=get_tp_group().device_group)
+
         if do_write:
             # Calculate per-expert byte sizes (buffer is double-buffered: [2, ...])
             w13_weight_buf = self.cpu_buffers["w13_weight"]
@@ -2242,14 +2248,19 @@ class SharedFullContext:
         for idx, e in enumerate(cpu_expert_ids):
             slot = idx % 2  # Double buffering based on iteration index
 
+            # The next write reuses the slot read by expert idx-1. Every
+            # rank must finish that H2D copy before rank 0 can overwrite it;
+            # the publication barrier below alone does not protect readers.
+            if idx > 0 and idx + 1 < len(cpu_expert_ids):
+                events[idx - 1].synchronize()
+                if dist.is_initialized() and tp_world_size > 1:
+                    dist.barrier(group=get_tp_group().device_group)
+
             # Sync write for expert e, submit write for next CPU expert
             if do_write:
                 wrapper.sync_write_weight_scale_to_buffer()
                 if idx + 1 < len(cpu_expert_ids):
                     next_slot = (idx + 1) % 2
-                    # Before writing to next_slot, ensure copy from that slot is complete.
-                    if idx > 0:
-                        events[idx - 1].synchronize()
                     submit_write_expert(cpu_expert_ids[idx + 1], next_slot)
 
             # Barrier to ensure all ranks see the written data
