@@ -161,7 +161,9 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+    if num_sms is None or "deep_gemm" not in globals():
+        # deep_gemm is only imported when JIT DeepGEMM is enabled; on
+        # unsupported archs (e.g. sm_120) it stays unimported.
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()
