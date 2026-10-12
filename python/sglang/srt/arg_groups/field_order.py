@@ -559,5 +559,6 @@ POSITIONAL_FIELD_ORDER = (
     "moe_ascend_ops_config",
     "cp_kv_layout",
     "elastic_ep_retiree_lifecycle",
+    "elastic_ep_reuse_cuda_graph",
 )
 # fmt: on
