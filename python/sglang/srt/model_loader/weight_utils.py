@@ -11,6 +11,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -710,6 +711,30 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+# KT CPU experts are not read from the checkpoint: the GPU MoE weight_loader drops their
+# tensors unread (fused_moe_triton/layer.py, the GPU-experts masks), but the shard loaders
+# had already materialised them with get_tensor (Qwen3.8-Flash-Next NVFP4: 158 GB a rank,
+# 107 s of the load, for nothing). KT_LOAD_SKIP_CPU_EXPERTS=0 restores the full read.
+_KT_SKIP_CPU_EXPERTS = os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS", "1") == "1"
+_KT_SKIP_CPU_EXPERTS_RE = re.compile(
+    os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS_RE", r"(?:^|\.)layers\.(\d+)\..*\.experts\.(\d+)\.")
+)
+
+
+def _kt_cpu_expert_key(name: str) -> bool:
+    """True for a checkpoint key of a routed expert that runs on the KT CPU side."""
+    if not _KT_SKIP_CPU_EXPERTS:
+        return False
+    m = _KT_SKIP_CPU_EXPERTS_RE.search(name)
+    if m is None:
+        return False
+    try:
+        from sglang.srt.layers.moe.kt_ep_wrapper import checkpoint_expert_is_cpu
+    except Exception:
+        return False
+    return checkpoint_expert_is_cpu(int(m.group(1)), int(m.group(2)))
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -733,6 +758,8 @@ def safetensors_weights_iterator(
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if _kt_cpu_expert_key(name):
+                        continue
                     yield name, f.get_tensor(name)
 
 
@@ -848,7 +875,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {k: f.get_tensor(k) for k in f.keys() if not _kt_cpu_expert_key(k)}
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.
