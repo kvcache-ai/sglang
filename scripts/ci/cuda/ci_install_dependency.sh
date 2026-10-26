@@ -819,13 +819,7 @@ install_extra_deps() {
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
 
     # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #4581 wheels -----------
-    MOONCAKE_WHEEL_ZIP_URL=""
-    if [ "$(uname -m)" = "x86_64" ]; then
-        case "${CI_PYTHON_VER}" in
-            3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/12142414037.zip" ;;
-            3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/11739257022.zip" ;;
-        esac
-    fi
+    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/12549768466.zip"
     if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
         MOONCAKE_WHEEL_DIR="$(mktemp -d)"
         curl -fSL --retry 3 --retry-delay 2 \
