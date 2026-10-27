@@ -1,9 +1,9 @@
-"""Manual single-host Elastic EP recovery test.
+"""Registered single-host Elastic EP recovery test.
 
 Run:
 
     CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \
-        test/manual/ep/test_elastic_recover.py -v -s
+        test/registered/ep/test_elastic_recover.py -v -s
 """
 
 import os
@@ -16,6 +16,7 @@ from pathlib import Path
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -40,6 +41,8 @@ RECOVER_TIMEOUT_SECONDS = float(
 )
 RANDOM_SEED = int(os.environ.get("SGLANG_ELASTIC_RECOVER_RANDOM_SEED", "42"))
 ib_devices = get_rdma_devices_args()
+
+register_cuda_ci(est_time=600, stage="nightly", runner_config="8-gpu-h200")
 
 
 def _visible_device_ids() -> list[str]:

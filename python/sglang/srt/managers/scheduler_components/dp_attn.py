@@ -61,12 +61,17 @@ def exchange_sync_rows(
     local_row: torch.Tensor,
     group: torch.distributed.ProcessGroup,
 ) -> None:
-    """Fill ``global_flat`` with every rank's ``local_row`` in group-rank order,
-    like ``all_gather_single``. On gloo the all-gather is a ring of world_size - 1
-    serial hops; gather + broadcast is one hop plus a log-depth tree. At two
-    ranks the ring is the single hop, so it stays."""
+    """Fill ``global_flat`` with every rank's ``local_row`` in group-rank order.
+
+    The gather + broadcast exchange is a Gloo-only optimization for CPU groups
+    wider than two ranks. Other backends use the regular all-gather path.
+    """
     world_size = torch.distributed.get_world_size(group)
-    if local_row.device.type != "cpu" or world_size <= 2:
+    if (
+        torch.distributed.get_backend(group) != "gloo"
+        or local_row.device.type != "cpu"
+        or world_size <= 2
+    ):
         all_gather_single(global_flat, local_row, group=group)
         return
     root = torch.distributed.get_global_rank(group, 0)
