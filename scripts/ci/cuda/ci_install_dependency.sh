@@ -818,8 +818,8 @@ install_extra_deps() {
     NIXL_BIN_NAME="nixl-cu13"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
 
-    # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #4900 wheels -----------
-    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/12640513577.zip"
+    # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #4581 wheel -----------
+    MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/12715939595.zip"
     if [ -n "$MOONCAKE_WHEEL_ZIP_URL" ]; then
         MOONCAKE_WHEEL_DIR="$(mktemp -d)"
         curl -fSL --retry 3 --retry-delay 2 \
