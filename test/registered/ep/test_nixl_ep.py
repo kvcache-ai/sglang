@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
