@@ -9,7 +9,7 @@ Quantization methods prepare a small quant_info payload and route through
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -36,6 +36,19 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+class _EPMxfp4DispatchView(NamedTuple):
+    """Standard top-k view consumed by the MXFP4 CUTLASS fused kernel.
+
+    DeepEP V1 and Mooncake low-latency dispatch expose top-k ids/weights as
+    direct fields.  The existing MXFP4 kernel takes the same payload through
+    ``StandardDispatchOutput.topk_output``; this adapter keeps the kernel
+    implementation shared by both EP transports.
+    """
+
+    hidden_states: torch.Tensor
+    topk_output: object
 
 
 @dataclass
@@ -393,3 +406,49 @@ def fused_experts_none_to_flashinfer_mxfp4(
         out = out[:, :origin_hidden].contiguous()
 
     return StandardCombineInput(hidden_states=out)
+
+
+def _fused_experts_ep_to_flashinfer_mxfp4(
+    dispatch_output,
+    quant_info: FlashInferCutlassMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    """Run the same MXFP4 CUTLASS kernel on DeepEP-family LL payloads."""
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    view = _EPMxfp4DispatchView(
+        hidden_states=dispatch_output.hidden_states,
+        topk_output=StandardTopKOutput(
+            topk_weights=dispatch_output.topk_weights,
+            topk_ids=dispatch_output.topk_ids,
+            router_logits=None,
+        ),
+    )
+    result = fused_experts_none_to_flashinfer_mxfp4(
+        view, quant_info, runner_config
+    )
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
+    return DeepEPLLCombineInput(
+        hidden_states=result.hidden_states,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
+    )
+
+
+@register_fused_func("deepep", "flashinfer_mxfp4")
+def fused_experts_deepep_to_flashinfer_mxfp4(
+    dispatch_output, quant_info, runner_config
+):
+    return _fused_experts_ep_to_flashinfer_mxfp4(
+        dispatch_output, quant_info, runner_config
+    )
+
+
+@register_fused_func("mooncake", "flashinfer_mxfp4")
+def fused_experts_mooncake_to_flashinfer_mxfp4(
+    dispatch_output, quant_info, runner_config
+):
+    return _fused_experts_ep_to_flashinfer_mxfp4(
+        dispatch_output, quant_info, runner_config
+    )

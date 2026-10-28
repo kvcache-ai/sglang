@@ -1365,6 +1365,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        # DeepEP V1 and Mooncake low-latency dispatch expose the packed
+        # MXFP4 payload directly.  Reuse the CUTLASS fused runner before the
+        # standard dispatcher-specific top-k unpack below.
+        if dispatch_output.format.is_deepep_ll():
+            if self._fi_kernel == "cutlass_sm120" and get_moe_runner_backend().is_flashinfer_mxfp4():
+                return self._apply_sm120_cutlass(layer, dispatch_output)
+            if self._fi_kernel == "cutlass_sm90" and get_moe_runner_backend().is_flashinfer_mxfp4():
+                return self._apply_sm90_cutlass(layer, dispatch_output)
+
         if self.use_deep_gemm:
             # Handles standard AND deepep_ll/deepep_normal dispatch formats via
             # the runner's registered pre/post-permute functions. Must run
