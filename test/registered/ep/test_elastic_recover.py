@@ -42,7 +42,7 @@ RECOVER_TIMEOUT_SECONDS = float(
 RANDOM_SEED = int(os.environ.get("SGLANG_ELASTIC_RECOVER_RANDOM_SEED", "42"))
 ib_devices = get_rdma_devices_args()
 
-register_cuda_ci(est_time=600, stage="nightly", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=600, stage="base-c", runner_config="8-gpu-h200")
 
 
 def _visible_device_ids() -> list[str]:

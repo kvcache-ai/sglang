@@ -26,14 +26,18 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=1200, stage="base-c", runner_config="8-gpu-h200")
 
 TEST_MODEL = os.environ.get("NIXL_EP_TEST_MODEL", DEFAULT_MODEL_NAME_FOR_TEST_MLA)
 os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
@@ -198,6 +202,10 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
     def setUpClass(cls):
         if cls is _ElasticScaleUpEndToEndBase:
             raise unittest.SkipTest("Abstract base")
+        if is_in_ci() and cls.__name__ != "TestElasticScaleUp4To5To6CudaGraph":
+            raise unittest.SkipTest(
+                "CI keeps only the repeated CUDA Graph scale-up case"
+            )
         cls.model = TEST_MODEL
         cls.base_url = BASE_URL_A
         cls._joining_procs = []
