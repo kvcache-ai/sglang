@@ -412,6 +412,7 @@ def _fused_experts_ep_to_flashinfer_mxfp4(
     dispatch_output,
     quant_info: FlashInferCutlassMxfp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
+    combine_input_type,
 ):
     """Run the same MXFP4 CUTLASS kernel on DeepEP-family LL payloads."""
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -427,9 +428,7 @@ def _fused_experts_ep_to_flashinfer_mxfp4(
     result = fused_experts_none_to_flashinfer_mxfp4(
         view, quant_info, runner_config
     )
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
-
-    return DeepEPLLCombineInput(
+    return combine_input_type(
         hidden_states=result.hidden_states,
         topk_ids=dispatch_output.topk_ids,
         topk_weights=dispatch_output.topk_weights,
@@ -440,8 +439,10 @@ def _fused_experts_ep_to_flashinfer_mxfp4(
 def fused_experts_deepep_to_flashinfer_mxfp4(
     dispatch_output, quant_info, runner_config
 ):
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+
     return _fused_experts_ep_to_flashinfer_mxfp4(
-        dispatch_output, quant_info, runner_config
+        dispatch_output, quant_info, runner_config, DeepEPLLCombineInput
     )
 
 
@@ -449,6 +450,8 @@ def fused_experts_deepep_to_flashinfer_mxfp4(
 def fused_experts_mooncake_to_flashinfer_mxfp4(
     dispatch_output, quant_info, runner_config
 ):
+    from sglang.srt.layers.moe.token_dispatcher.mooncake import MooncakeCombineInput
+
     return _fused_experts_ep_to_flashinfer_mxfp4(
-        dispatch_output, quant_info, runner_config
+        dispatch_output, quant_info, runner_config, MooncakeCombineInput
     )

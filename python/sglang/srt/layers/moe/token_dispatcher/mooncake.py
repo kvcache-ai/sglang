@@ -46,7 +46,9 @@ assert isinstance(MooncakeDispatchOutput, DispatchOutput)
 class MooncakeCombineInput(NamedTuple):
     """Mooncake EP combine input."""
 
-    pass
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
 
     @property
     def format(self) -> CombineInputFormat:
