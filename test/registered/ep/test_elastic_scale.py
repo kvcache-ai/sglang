@@ -1,630 +1,276 @@
-"""Manual tests for elastic EP scale-up.
+"""Registered single-host Elastic EP recovery test.
 
-Test classes:
-  TestElasticScaleUp4To5CudaGraph       single-rank decode graph recapture
-  TestElasticScaleUpDP2TP4ToDP4TP8     two attention-TP2 scale-ups (8 GPUs)
-  TestElasticScaleUp4To6                primary + joiner scale-up (6 GPUs)
-  TestElasticScaleUp4To5To6             two consecutive single-rank scale-ups
-  TestElasticScaleUp4To8                full primary + joiner scale-up (8 GPUs)
-  TestElasticScaleUp4To6CudaGraph       mixed-TP decode graph recapture
-  TestElasticScaleUp4To5To6CudaGraph    repeated decode graph recapture
-  TestElasticScaleUp4To8CudaGraph       scale-up with decode graph recapture
+Run:
 
-Run (8-GPU CUDA graph scale-up):
-
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \\
-        test/manual/ep/test_elastic_scale.py::TestElasticScaleUp4To8CudaGraph \\
-        -v -s
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m pytest \
+        test/registered/ep/test_elastic_recover.py -v -s
 """
 
 import os
+import shlex
 import subprocess
 import time
 import unittest
-from types import SimpleNamespace
+from pathlib import Path
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
-    is_in_ci,
-    popen_launch_server,
+    try_cached_model,
 )
+from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="8-gpu-h200")
-
-TEST_MODEL = os.environ.get("NIXL_EP_TEST_MODEL", DEFAULT_MODEL_NAME_FOR_TEST_MLA)
-os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
-
+TEST_MODEL = os.environ.get(
+    "SGLANG_ELASTIC_RECOVER_TEST_MODEL",
+    try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA),
+)
+EP_SIZE = 8
+LOCAL_EP_SIZE = 4
+DIST_INIT_ADDR = os.environ.get("SGLANG_ELASTIC_RECOVER_DIST_INIT", "127.0.0.1:25555")
+PRIMARY_PORT = int(os.environ.get("SGLANG_ELASTIC_RECOVER_PRIMARY_PORT", "21000"))
+JOINER_PORT = int(os.environ.get("SGLANG_ELASTIC_RECOVER_JOINER_PORT", "22000"))
+RECOVER_WAIT_SECONDS = float(os.environ.get("SGLANG_ELASTIC_RECOVER_WAIT_SECONDS", "5"))
+RECOVER_TIMEOUT_SECONDS = float(
+    os.environ.get("SGLANG_ELASTIC_RECOVER_TIMEOUT_SECONDS", "300")
+)
+RANDOM_SEED = int(os.environ.get("SGLANG_ELASTIC_RECOVER_RANDOM_SEED", "42"))
 ib_devices = get_rdma_devices_args()
 
-
-def _extra_server_args() -> list[str]:
-    """Extra `--flag [value]` tokens appended to every spawned server.
-
-    Set via ``SGLANG_ELASTIC_EXTRA_SERVER_ARGS`` as a single space-separated
-    string, e.g. ``--disable-overlap-schedule``.
-    """
-    raw = os.environ.get("SGLANG_ELASTIC_EXTRA_SERVER_ARGS", "").strip()
-    return raw.split() if raw else []
-
-
-DISABLED_CUDA_GRAPH_ARGS = [
-    "--cuda-graph-backend-decode",
-    "disabled",
-    "--cuda-graph-backend-prefill",
-    "disabled",
-]
-ELASTIC_CUDA_GRAPH_ARGS = [
-    "--cuda-graph-backend-decode",
-    "full",
-    "--cuda-graph-backend-prefill",
-    "disabled",
-    "--cuda-graph-bs-decode",
-    "1",
-    "2",
-    "4",
-    "8",
-    "16",
-]
-
-
-def _assert_generate_logprob_ok(testcase: unittest.TestCase, base_url: str) -> None:
-    response = requests.post(
-        f"{base_url}/generate",
-        json={
-            "text": "The answer is",
-            "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
-            "return_logprob": True,
-            "top_logprobs_num": 1,
-            "logprob_start_len": 0,
-        },
-        timeout=60,
-    )
-    testcase.assertEqual(response.status_code, 200, response.text)
-    input_logprobs = response.json()["meta_info"]["input_token_logprobs"]
-    testcase.assertGreater(len(input_logprobs), 0)
-
-
-def _count_visible_gpus() -> int:
-    env = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if env:
-        return len([x for x in env.split(",") if x.strip()])
-    try:
-        import torch
-
-        return torch.cuda.device_count() if torch.cuda.is_available() else 0
-    except Exception:
-        return 0
+register_cuda_ci(est_time=600, stage="base-c", runner_config="8-gpu-h200")
 
 
 def _visible_device_ids() -> list[str]:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible:
         return [device.strip() for device in visible.split(",") if device.strip()]
-    return [str(index) for index in range(_count_visible_gpus())]
+    try:
+        import torch
+
+        return [str(index) for index in range(torch.cuda.device_count())]
+    except Exception:
+        return []
 
 
-LAUNCH_EP_SIZE = 4
-MAX_EP_SIZE = 8
-
-DIST_INIT_ADDR = os.environ.get("SGLANG_ELASTIC_SCALE_DIST_INIT", "127.0.0.1:24555")
-PORT_A = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_A", "21000"))
-PORT_B = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_B", "10000"))
-PORT_C = int(os.environ.get("SGLANG_ELASTIC_SCALE_PORT_C", "11000"))
-HOST_A = os.environ.get("SGLANG_ELASTIC_SCALE_HOST_A", "127.0.0.1")
-BASE_URL_A = f"http://{HOST_A}:{PORT_A}"
-PRE_SCALE_JOINER_DELAY_SEC = float(
-    os.environ.get("SGLANG_ELASTIC_PRE_SCALE_JOINER_DELAY_SEC", "0")
-)
-
-
-def _scale_up_common_args(
-    dist_init_addr: str,
-    tp_size: int,
-    dp_size: int,
-    nnodes: int,
-    node_rank: int,
-    cuda_graph_args: list[str],
-    moe_dense_tp_size: int | None,
-    dcp_size: int,
-) -> list[str]:
+def _server_args(node_rank: int, port: int, recover: bool = False) -> list[str]:
     args = [
+        "sglang",
+        "serve",
+        "--model-path",
+        TEST_MODEL,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--device",
+        "cuda",
         "--trust-remote-code",
-        "--moe-a2a-backend",
-        "nixl",
-        "--deepep-mode",
-        "low_latency",
         "--tp",
-        str(tp_size),
+        str(EP_SIZE),
         "--attn-dp-size",
-        str(dp_size),
-        "--dcp-size",
-        str(dcp_size),
+        str(EP_SIZE),
+        "--nnodes",
+        "2",
+        "--node-rank",
+        str(node_rank),
+        "--dist-init-addr",
+        DIST_INIT_ADDR,
+        "--random-seed",
+        str(RANDOM_SEED),
         "--enable-dp-lm-head",
         "--elastic-ep-backend",
         "mooncake",
         "--mooncake-ib-device",
         ib_devices,
+        "--moe-a2a-backend",
+        "mooncake",
+        "--deepep-mode",
+        "low_latency",
+        "--moe-dense-tp-size",
+        "1",
+        "--disable-custom-all-reduce",
         "--enable-eplb",
         "--ep-num-redundant-experts",
-        "24",
-        "--elastic-ep-initial-size",
-        str(LAUNCH_EP_SIZE),
-        "--max-ep-size",
-        str(MAX_EP_SIZE),
+        "72",
+        "--chunked-prefill-size",
+        "512",
+        "--cuda-graph-max-bs-decode",
+        "16",
         "--mem-fraction-static",
         "0.5",
-        "--chunked-prefill-size",
-        "1024",
-        "--nnodes",
-        str(nnodes),
-        "--node-rank",
-        str(node_rank),
-        "--dist-init-addr",
-        dist_init_addr,
     ]
-    if moe_dense_tp_size is not None:
-        args.extend(["--moe-dense-tp-size", str(moe_dense_tp_size)])
-    return args + cuda_graph_args + _extra_server_args()
+    if recover:
+        args.extend(["--elastic-ep-join-mode", "recover"])
+    extra_args = os.environ.get("SGLANG_ELASTIC_RECOVER_EXTRA_SERVER_ARGS", "")
+    return args + shlex.split(extra_args)
 
 
-class _ElasticScaleUpEndToEndBase(CustomTestCase):
-    """Shared scale-up E2E plumbing for physical EP and logical DP growth."""
-
-    PRIMARY_TP: int = LAUNCH_EP_SIZE
-    PRIMARY_DP: int = LAUNCH_EP_SIZE
-    JOIN_TP: int
-    JOIN_DP: int
-    JOIN_NNODES: int
-    JOIN_NODE_RANK: int
-    TARGET_EP_SIZE: int
-    TARGET_DP_SIZE: int
-    CUDA_GRAPH_ARGS: list[str]
-    MOE_DENSE_TP_SIZE: int | None = 1
-    DCP_SIZE: int = 1
-    ATTENTION_BACKEND_ARGS: list[str] = []
-
-    def setUp(self):
-        if (
-            not hasattr(type(self), "JOIN_TP")
-            or type(self) is _ElasticScaleUpEndToEndBase
-        ):
-            self.skipTest("Abstract base — run a concrete subclass instead")
+@unittest.skipUnless(
+    len(_visible_device_ids()) >= EP_SIZE,
+    "Elastic EP recovery E2E needs 8 visible GPUs.",
+)
+class TestElasticRecover4To4(CustomTestCase):
+    """Kill one four-rank node and recover it with a fresh process group."""
 
     @classmethod
     def setUpClass(cls):
-        if cls is _ElasticScaleUpEndToEndBase:
-            raise unittest.SkipTest("Abstract base")
-        if is_in_ci() and cls.__name__ != "TestElasticScaleUp4To5To6CudaGraph":
-            raise unittest.SkipTest(
-                "CI keeps only the repeated CUDA Graph scale-up case"
-            )
-        cls.model = TEST_MODEL
-        cls.base_url = BASE_URL_A
-        cls._joining_procs = []
-        cls._joining_log_fhs = []
-
-        primary_args = _scale_up_common_args(
-            DIST_INIT_ADDR,
-            tp_size=cls.PRIMARY_TP,
-            dp_size=cls.PRIMARY_DP,
-            nnodes=1,
-            node_rank=0,
-            cuda_graph_args=cls.CUDA_GRAPH_ARGS,
-            moe_dense_tp_size=cls.MOE_DENSE_TP_SIZE,
-            dcp_size=cls.DCP_SIZE,
-        )
-        primary_args.extend(cls.ATTENTION_BACKEND_ARGS)
-        primary_env = os.environ.copy()
+        cls.base_url = f"http://127.0.0.1:{PRIMARY_PORT}"
+        cls.processes: list[subprocess.Popen] = []
+        cls.log_files = []
+        cls.log_paths: dict[str, Path] = {}
         visible_devices = _visible_device_ids()
-        if len(visible_devices) < cls.PRIMARY_TP:
-            raise RuntimeError(
-                f"Scale-up requires {cls.PRIMARY_TP} visible GPUs, got "
-                f"{len(visible_devices)}"
+
+        cls.primary = cls._launch(
+            node_rank=0,
+            port=PRIMARY_PORT,
+            visible_devices=visible_devices[:LOCAL_EP_SIZE],
+            name="primary",
+        )
+        cls.initial_joiner = cls._launch(
+            node_rank=1,
+            port=JOINER_PORT,
+            visible_devices=visible_devices[LOCAL_EP_SIZE:EP_SIZE],
+            name="initial_joiner",
+        )
+        try:
+            wait_for_http_ready(
+                f"{cls.base_url}/health_generate",
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                process=cls.primary,
             )
-        primary_env["CUDA_VISIBLE_DEVICES"] = ",".join(
-            visible_devices[: cls.PRIMARY_TP]
-        )
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=primary_args,
-            env=primary_env,
-        )
+        except Exception:
+            cls._print_server_logs()
+            raise
 
     @classmethod
-    def _launch_joining_group(
+    def _print_server_logs(cls) -> None:
+        """Expose child-server failures in CI, where /tmp is otherwise hidden."""
+        for name, log_path in cls.log_paths.items():
+            print(f"\n===== {name} log: {log_path} =====", flush=True)
+            if log_path.exists():
+                print(log_path.read_text(errors="replace")[-20000:], flush=True)
+            process = getattr(cls, name, None)
+            if process is not None:
+                print(f"{name} returncode: {process.poll()}", flush=True)
+
+    @classmethod
+    def _launch(
         cls,
         *,
-        rank_offset: int,
-        join_tp: int,
-        join_dp: int,
+        node_rank: int,
         port: int,
+        visible_devices: list[str],
+        name: str,
+        recover: bool = False,
     ) -> subprocess.Popen:
-        cmd = [
-            "sglang",
-            "serve",
-            "--model-path",
-            cls.model,
-            *_scale_up_common_args(
-                DIST_INIT_ADDR,
-                tp_size=join_tp,
-                dp_size=join_dp,
-                nnodes=cls.JOIN_NNODES,
-                node_rank=cls.JOIN_NODE_RANK,
-                cuda_graph_args=cls.CUDA_GRAPH_ARGS,
-                moe_dense_tp_size=cls.MOE_DENSE_TP_SIZE,
-                dcp_size=cls.DCP_SIZE,
-            ),
-            *cls.ATTENTION_BACKEND_ARGS,
-            "--elastic-ep-join-mode",
-            "scale",
-            "--elastic-ep-join-rank-offset",
-            str(rank_offset),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--device",
-            "cuda",
-        ]
+        log_path = Path(f"/tmp/elastic_ep_recover_{name}_{int(time.time())}.log")
+        log_file = open(log_path, "w", buffering=1)
         env = os.environ.copy()
-        visible_devices = _visible_device_ids()
-        join_end = rank_offset + join_tp
-        if join_end > len(visible_devices):
-            raise RuntimeError(
-                f"Scale-up requires {join_end} visible GPUs, got {len(visible_devices)}"
-            )
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices[rank_offset:join_end])
-        base_joining_log = os.environ.get(
-            "SGLANG_ELASTIC_SCALE_JOINING_LOG",
-            f"/tmp/elastic_scale_joining_nnodes{cls.JOIN_NNODES}_{int(time.time())}.log",
-        )
-        if cls._joining_procs:
-            root, ext = os.path.splitext(base_joining_log)
-            joining_log = f"{root}_step{len(cls._joining_procs) + 1}{ext}"
-        else:
-            joining_log = base_joining_log
-        joining_log_fh = open(joining_log, "w")
-        joining_proc = subprocess.Popen(
-            cmd,
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+        env["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
+            _server_args(node_rank, port, recover),
             env=env,
-            stdout=joining_log_fh,
+            stdout=log_file,
             stderr=subprocess.STDOUT,
         )
-        cls._joining_procs.append(joining_proc)
-        cls._joining_log_fhs.append(joining_log_fh)
-        return joining_proc
+        cls.processes.append(process)
+        cls.log_files.append(log_file)
+        cls.log_paths[name] = log_path
+        print(f"Started {name}; log: {log_path}")
+        return process
 
     @classmethod
     def tearDownClass(cls):
-        processes = [
-            *reversed(cls._joining_procs),
-            getattr(cls, "process", None),
-        ]
-        for proc in processes:
-            if proc is None:
-                continue
-            try:
-                kill_process_tree(proc.pid)
-            except Exception:
-                pass
-        for proc in processes:
-            if proc is None:
-                continue
-            try:
-                proc.wait(timeout=15)
-            except Exception:
-                pass
-        for fh in cls._joining_log_fhs:
-            try:
-                fh.close()
-            except Exception:
-                pass
-        time.sleep(2)
+        for process in reversed(getattr(cls, "processes", [])):
+            if process.poll() is None:
+                kill_process_tree(process.pid, wait_timeout=60)
+        for log_file in getattr(cls, "log_files", []):
+            log_file.close()
 
-    def _post(self, path: str, **kwargs) -> requests.Response:
-        return requests.post(f"{self.base_url}{path}", timeout=60, **kwargs)
-
-    def _generate_ok(self, msg_suffix: str, routed_dp_rank: int | None = None) -> None:
+    def _generate(self, routed_dp_rank: int | None = None) -> requests.Response:
         payload = {
-            "text": "Hello",
+            "text": "The capital of France is",
             "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
         }
         if routed_dp_rank is not None:
             payload["routed_dp_rank"] = routed_dp_rank
-        resp = self._post(
-            "/generate",
-            json=payload,
-        )
-        self.assertEqual(
-            resp.status_code,
-            200,
-            f"/generate {msg_suffix} failed: {resp.text}",
+        return requests.post(f"{self.base_url}/generate", json=payload, timeout=90)
+
+    def _generate_ok(self, description: str, routed_dp_rank: int | None = None) -> None:
+        response = self._generate(routed_dp_rank)
+        self.assertEqual(response.status_code, 200, f"{description}: {response.text}")
+        payload = response.json()
+        generated_text = payload.get("text", "")
+        self.assertIn(
+            "paris",
+            generated_text.casefold(),
+            f"{description}: unexpected generation: {generated_text!r}",
         )
 
-    def _generate_logprob_ok(self, msg_suffix: str) -> None:
-        try:
-            _assert_generate_logprob_ok(self, self.base_url)
-        except AssertionError as exc:
-            raise AssertionError(
-                f"/generate logprob {msg_suffix} failed: {exc}"
-            ) from exc
-
-    def _scale_once(
-        self,
-        *,
-        old_ep_size: int,
-        target_ep_size: int,
-        target_dp_size: int,
-        join_tp: int,
-        join_dp: int,
-        port: int,
-    ) -> None:
-        joining_proc = self._launch_joining_group(
-            rank_offset=old_ep_size,
-            join_tp=join_tp,
-            join_dp=join_dp,
-            port=port,
-        )
-        self.assertIsNone(
-            joining_proc.poll(),
-            "Joining group exited before scale request; see joining log",
-        )
-        if PRE_SCALE_JOINER_DELAY_SEC > 0:
-            time.sleep(PRE_SCALE_JOINER_DELAY_SEC)
+    def _wait_for_recover_capture(self) -> None:
+        deadline = time.monotonic() + RECOVER_TIMEOUT_SECONDS
+        log_path = self.log_paths["recover_joiner"]
+        marker = "Capture target decode CUDA graph end"
+        while time.monotonic() < deadline:
             self.assertIsNone(
-                joining_proc.poll(),
-                "Joining group exited before scale request; see joining log",
+                self.recover_joiner.poll(),
+                "Recover joiner exited during CUDA graph capture",
             )
-
-        resp = self._post("/scale_elastic_ep", json={"new_ep_size": target_ep_size})
-        self.assertEqual(resp.status_code, 200, resp.text)
-        body = resp.json()
-        self.assertEqual(body["old_ep_size"], old_ep_size)
-        self.assertEqual(body["new_ep_size"], target_ep_size)
-
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            resp = requests.get(f"{self.base_url}/is_scaling_elastic_ep", timeout=60)
-            state = resp.json() if resp.ok else None
-            if state is not None and not state.get("is_scaling_elastic_ep", True):
-                self.assertEqual(state.get("effective_ep_size"), target_ep_size)
-                self.assertEqual(state.get("scale_phase"), "serving_expanded")
-                self.assertIsNone(state.get("last_error"))
-                self._generate_ok(
-                    "on newest joiner",
-                    routed_dp_rank=target_dp_size - 1,
-                )
+            if log_path.exists() and log_path.read_text(errors="replace").count(
+                marker
+            ) >= (EP_SIZE - LOCAL_EP_SIZE):
                 return
-            try:
-                self._post(
-                    "/generate",
-                    json={
-                        "text": "ping",
-                        "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
-                    },
-                )
-            except Exception:
-                pass
             time.sleep(2)
-        self.fail("Timed out waiting for scaling to complete (300s)")
+        self.fail(f"Timed out waiting for recover CUDA graph capture: {log_path}")
 
-    def _run_post_scale_gsm8k(self) -> None:
-        metrics = run_sgl_eval(
-            SimpleNamespace(
-                base_url=self.base_url,
-                model=self.model,
-                eval_name="gsm8k",
-                max_tokens=512,
-                num_examples=256,
-                num_threads=50,
+    def _wait_for_recovered_ranks(self) -> None:
+        self._wait_for_recover_capture()
+        self._generate_ok("recovery trigger")
+        deadline = time.monotonic() + RECOVER_TIMEOUT_SECONDS
+        marker = f"recover ranks {list(range(LOCAL_EP_SIZE, EP_SIZE))} done"
+        primary_log = self.log_paths["primary"]
+        while time.monotonic() < deadline:
+            self.assertIsNone(
+                self.recover_joiner.poll(), "Recover joiner exited before rejoining"
             )
+            if (
+                primary_log.exists()
+                and primary_log.read_text(errors="replace").count(marker)
+                >= LOCAL_EP_SIZE
+            ):
+                for request_index in range(3):
+                    self._generate_ok(f"post-recovery request {request_index + 1}")
+                return
+            time.sleep(2)
+        self.fail(f"Timed out waiting for recovery collective: {primary_log}")
+
+    def test_recover_four_ranks(self):
+        self._generate_ok("initial service")
+
+        kill_process_tree(self.initial_joiner.pid, wait_timeout=60)
+        # Give the terminated schedulers time to disappear before fault handling.
+        time.sleep(RECOVER_WAIT_SECONDS)
+        self._generate_ok("degraded service after node1 failure")
+
+        visible_devices = _visible_device_ids()
+        self.recover_joiner = self._launch(
+            node_rank=1,
+            port=JOINER_PORT,
+            visible_devices=visible_devices[LOCAL_EP_SIZE:EP_SIZE],
+            name="recover_joiner",
+            recover=True,
         )
-        print(f"[TEST] Post-scale GSM8K accuracy: {metrics['score']:.2%}")
-        self.assertGreater(
-            metrics["score"],
-            0.50,
-            f"Post-scale GSM8K accuracy too low: {metrics['score']:.2%}",
-        )
-
-    def test_scale_up_on_demand(self):
-        """Scale the primary group to the configured target."""
-        self._generate_ok("pre-scale")
-
-        self._scale_once(
-            old_ep_size=LAUNCH_EP_SIZE,
-            target_ep_size=self.TARGET_EP_SIZE,
-            target_dp_size=self.TARGET_DP_SIZE,
-            join_tp=self.JOIN_TP,
-            join_dp=self.JOIN_DP,
-            port=PORT_B,
-        )
-
-        self._generate_ok("post-scale")
-        self._generate_logprob_ok("post-scale")
-
-        self._run_post_scale_gsm8k()
-        self._generate_logprob_ok("after post-scale workload")
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= MAX_EP_SIZE,
-    f"Repeated attention-TP2 scale-up E2E needs {MAX_EP_SIZE} GPUs.",
-)
-class TestElasticScaleUpDP2TP4ToDP4TP8(_ElasticScaleUpEndToEndBase):
-    """Admit two complete attention-TP2/DCP2 replicas."""
-
-    PRIMARY_DP = 2
-    JOIN_TP = 2
-    JOIN_DP = 1
-    JOIN_NNODES = 2
-    JOIN_NODE_RANK = 1
-    TARGET_EP_SIZE = 8
-    TARGET_DP_SIZE = 4
-    CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
-    DCP_SIZE = 2
-    ATTENTION_BACKEND_ARGS = [
-        "--dcp-comm-backend=ag_rs",
-        "--attention-backend=flashinfer",
-        "--flashinfer-mla-disable-ragged",
-    ]
-
-    def test_scale_up_on_demand(self):
-        self._generate_ok("pre-scale")
-
-        for old_ep, new_ep, new_dp, port in (
-            (4, 6, 3, PORT_B),
-            (6, 8, 4, PORT_C),
-        ):
-            self._scale_once(
-                old_ep_size=old_ep,
-                target_ep_size=new_ep,
-                target_dp_size=new_dp,
-                join_tp=2,
-                join_dp=1,
-                port=port,
-            )
-            self._generate_logprob_ok(f"after scale to EP{new_ep}")
-
-        self._run_post_scale_gsm8k()
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= 6,
-    "4-to-6 scale-up E2E needs 6 GPUs.",
-)
-class TestElasticScaleUp4To6(_ElasticScaleUpEndToEndBase):
-    """Scale from four to six ranks."""
-
-    JOIN_TP = 2
-    JOIN_DP = 2
-    JOIN_NNODES = 2
-    JOIN_NODE_RANK = 1
-    TARGET_EP_SIZE = 6
-    TARGET_DP_SIZE = 6
-    CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
-    MOE_DENSE_TP_SIZE = None
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= 6,
-    "4-to-5-to-6 scale-up E2E needs 6 GPUs.",
-)
-class TestElasticScaleUp4To5To6(_ElasticScaleUpEndToEndBase):
-    """Scale from four to five and then from five to six ranks."""
-
-    JOIN_TP = 1
-    JOIN_DP = 1
-    JOIN_NNODES = 2
-    JOIN_NODE_RANK = 1
-    TARGET_EP_SIZE = 6
-    TARGET_DP_SIZE = 6
-    CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
-
-    def test_scale_up_on_demand(self):
-        self._generate_ok("pre-scale")
-
-        self._scale_once(
-            old_ep_size=4,
-            target_ep_size=5,
-            target_dp_size=5,
-            join_tp=1,
-            join_dp=1,
-            port=PORT_B,
-        )
-        self._generate_ok("after first scale")
-        self._generate_logprob_ok("after first scale")
-
-        self._scale_once(
-            old_ep_size=5,
-            target_ep_size=6,
-            target_dp_size=6,
-            join_tp=1,
-            join_dp=1,
-            port=PORT_C,
-        )
-        self._generate_ok("after second scale")
-        self._generate_logprob_ok("after second scale")
-        self._run_post_scale_gsm8k()
-        self._generate_logprob_ok("after post-scale workload")
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= MAX_EP_SIZE,
-    f"Full scale-up E2E needs {MAX_EP_SIZE} GPUs.",
-)
-class TestElasticScaleUp4To8(_ElasticScaleUpEndToEndBase):
-    """Scale from four to eight ranks."""
-
-    JOIN_TP = LAUNCH_EP_SIZE
-    JOIN_DP = LAUNCH_EP_SIZE
-    JOIN_NNODES = 2
-    JOIN_NODE_RANK = 1
-    TARGET_EP_SIZE = MAX_EP_SIZE
-    TARGET_DP_SIZE = MAX_EP_SIZE
-    CUDA_GRAPH_ARGS = DISABLED_CUDA_GRAPH_ARGS
-    MOE_DENSE_TP_SIZE = None
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= 5,
-    "4-to-5 CUDA graph scale-up E2E needs 5 GPUs.",
-)
-class TestElasticScaleUp4To5CudaGraph(_ElasticScaleUpEndToEndBase):
-    """Scale from four to five ranks and recapture decode CUDA graphs."""
-
-    JOIN_TP = 1
-    JOIN_DP = 1
-    JOIN_NNODES = 2
-    JOIN_NODE_RANK = 1
-    TARGET_EP_SIZE = 5
-    TARGET_DP_SIZE = 5
-    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= MAX_EP_SIZE,
-    f"Full scale-up E2E needs {MAX_EP_SIZE} GPUs.",
-)
-class TestElasticScaleUp4To8CudaGraph(_ElasticScaleUpEndToEndBase):
-    """Scale from four to eight ranks and recapture decode CUDA graphs."""
-
-    JOIN_TP = LAUNCH_EP_SIZE
-    JOIN_DP = LAUNCH_EP_SIZE
-    JOIN_NNODES = 2
-    JOIN_NODE_RANK = 1
-    TARGET_EP_SIZE = MAX_EP_SIZE
-    TARGET_DP_SIZE = MAX_EP_SIZE
-    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= 6,
-    "4-to-6 CUDA graph scale-up E2E needs 6 GPUs.",
-)
-class TestElasticScaleUp4To6CudaGraph(TestElasticScaleUp4To6):
-    """Recapture decode CUDA graphs across different local TP sizes."""
-
-    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
-
-
-@unittest.skipUnless(
-    _count_visible_gpus() >= 6,
-    "4-to-5-to-6 CUDA graph scale-up E2E needs 6 GPUs.",
-)
-class TestElasticScaleUp4To5To6CudaGraph(TestElasticScaleUp4To5To6):
-    """Recapture decode CUDA graphs across two scale operations."""
-
-    CUDA_GRAPH_ARGS = ELASTIC_CUDA_GRAPH_ARGS
+        try:
+            self._wait_for_recovered_ranks()
+        except Exception:
+            self._print_server_logs()
+            raise
 
 
 if __name__ == "__main__":
