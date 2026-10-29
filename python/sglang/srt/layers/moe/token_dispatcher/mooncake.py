@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import NamedTuple, Optional
@@ -292,7 +293,7 @@ class _MooncakeEPDispatcherImpl:
         return torch.ones(self.group.size(), dtype=torch.int32, device="cuda")
 
     def _get_buffer(self):
-        return EPBuffer.get_ep_buffer(
+        buffer = EPBuffer.get_ep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
@@ -300,6 +301,38 @@ class _MooncakeEPDispatcherImpl:
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+        # Temporary CI diagnosis: distinguish a deliberate Mooncake transport
+        # fallback from an SGLang dispatch/recovery decision.
+        if not getattr(self, "_logged_mooncake_path", False):
+            runtime = getattr(buffer, "runtime", None)
+            ibgda_disabled = None
+            use_fast_path = None
+            if runtime is not None:
+                try:
+                    ibgda_disabled = bool(runtime.ibgda_disabled())
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    ibgda_disabled = f"error:{type(exc).__name__}"
+                try:
+                    use_fast_path = bool(runtime.use_fast_path())
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    use_fast_path = f"error:{type(exc).__name__}"
+            logger.warning(
+                "Mooncake EP path: fallback=%r transport=%r group_size=%r "
+                "rank=%r ibgda_disabled=%r use_fast_path=%r "
+                "MC_TE_FILTERS=%r SGLANG_CI_RDMA_ALL_DEVICES=%r "
+                "MOONCAKE_EP_TRANSPORT=%r",
+                getattr(buffer, "_use_fallback", None),
+                getattr(buffer, "transport", None),
+                getattr(buffer, "group_size", None),
+                getattr(buffer, "rank", None),
+                ibgda_disabled,
+                use_fast_path,
+                os.environ.get("MC_TE_FILTERS"),
+                os.environ.get("SGLANG_CI_RDMA_ALL_DEVICES"),
+                os.environ.get("MOONCAKE_EP_TRANSPORT"),
+            )
+            self._logged_mooncake_path = True
+        return buffer
 
 
 @dataclass
