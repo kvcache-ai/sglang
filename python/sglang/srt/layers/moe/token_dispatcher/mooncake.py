@@ -320,7 +320,7 @@ class _MooncakeEPDispatcherImpl:
                 "Mooncake EP path: fallback=%r transport=%r group_size=%r "
                 "rank=%r ibgda_disabled=%r use_fast_path=%r "
                 "MC_TE_FILTERS=%r SGLANG_CI_RDMA_ALL_DEVICES=%r "
-                "MOONCAKE_EP_TRANSPORT=%r",
+                "MOONCAKE_EP_TRANSPORT=%r MOONCAKE_EP_DEVICE_FILTER=%r",
                 getattr(buffer, "_use_fallback", None),
                 getattr(buffer, "transport", None),
                 getattr(buffer, "group_size", None),
@@ -330,6 +330,7 @@ class _MooncakeEPDispatcherImpl:
                 os.environ.get("MC_TE_FILTERS"),
                 os.environ.get("SGLANG_CI_RDMA_ALL_DEVICES"),
                 os.environ.get("MOONCAKE_EP_TRANSPORT"),
+                os.environ.get("MOONCAKE_EP_DEVICE_FILTER"),
             )
             self._logged_mooncake_path = True
         return buffer
