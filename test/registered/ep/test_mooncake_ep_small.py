@@ -290,6 +290,11 @@ class TestElasticRecover4To4(CustomTestCase):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
         env["PYTHONUNBUFFERED"] = "1"
+        if is_in_ci():
+            # The CI recovery harness uses two logical four-rank processes on
+            # one NVLink host. Allow Mooncake to probe IPC across that logical
+            # split while retaining normal reachability checks.
+            env["MC_DEVICE_API_P2P_ALLOW_CROSS_LOGICAL_NODE"] = "1"
         process = subprocess.Popen(
             _server_args(node_rank, port, recover),
             env=env,
