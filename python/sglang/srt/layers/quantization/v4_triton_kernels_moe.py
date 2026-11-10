@@ -34,6 +34,7 @@ Force-override env (diagnostic only):
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import logging
 from typing import Optional, Tuple
@@ -212,8 +213,15 @@ def _use_strided_layout() -> bool:
     return torch.cuda.get_device_capability() not in _TRTLLM_FP4_CAPS
 
 
+def _triton_older_than(version: str) -> bool:
+    from packaging.version import Version
+
+    return Version(triton.__version__.split("+")[0]) < Version(version)
+
+
 def _patch_strided_mxfp():
-    """Strided-layout enablement for triton_kernels MXFP4 path. Two patches:
+    """Strided-layout enablement for triton_kernels MXFP4 path. Patches (1)
+    and (2) below; (3) is an SM_90-only correctness workaround (see inline):
 
     (1) `target_info.has_native_mxfp()` must return False on non-trtllm-
         whitelist capabilities so matmul_ogs takes the simulated MXFP non-
@@ -289,6 +297,28 @@ def _patch_strided_mxfp():
                     _of._v4_make_default_opt_flags_nvidia
                 )
                 _of._v4_assert_patched = True
+
+        # (3) SM_90 + Triton < 3.8: when the heuristic picks block_m >= 128
+        # (it then also picks num_warps=8), num_stages >= 3 makes this
+        # simulated-MXFP matmul_ogs kernel return wrong, run-to-run
+        # nondeterministic results (garbage layerwise prefill, wrong tokens in
+        # hybrid prefill). num_stages <= 2 is bit-exact vs block_m=64 and
+        # Triton 3.8.0 is fixed, so cap the stages only for that case.
+        if (
+            torch.cuda.get_device_capability() == (9, 0)
+            and _triton_older_than("3.8.0")
+            and not getattr(_of, "_v4_sm90_stage_cap", False)
+        ):
+            _inner = _of.make_default_opt_flags_nvidia
+
+            def _sm90_stage_capped(*args, **kwargs):
+                flags = _inner(*args, **kwargs)
+                if flags.block_m >= 128 and flags.num_stages > 2:
+                    flags = dataclasses.replace(flags, num_stages=2)
+                return flags
+
+            _of.make_default_opt_flags_nvidia = _sm90_stage_capped
+            _of._v4_sm90_stage_cap = True
     except Exception:
         pass
 
