@@ -4755,6 +4755,22 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     return _KT_GPU_EXPERTS_MASKS
 
 
+
+def checkpoint_expert_is_cpu(layer_idx: int, expert_id: int) -> bool:
+    """Whether the checkpoint tensors of routed expert `expert_id` in layer `layer_idx` are
+    ones the GPU MoE weight_loader drops unread (a KT CPU expert by the GPU-experts masks),
+    so the shard loader need not read them either. False whenever the wrapper is disabled
+    (a draft model's load) or no masks exist."""
+    from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
+
+    masks = _KT_GPU_EXPERTS_MASKS
+    if masks is None or is_kt_ep_wrapper_disabled():
+        return False
+    if layer_idx < 0 or layer_idx >= masks.shape[0] or expert_id < 0 or expert_id >= masks.shape[1]:
+        return False
+    return not bool(masks[layer_idx, expert_id])
+
+
 def create_kt_config_from_server_args(
     server_args: "ServerArgs", layer_idx: int
 ) -> Optional[KTConfig]:
