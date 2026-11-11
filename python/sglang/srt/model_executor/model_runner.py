@@ -594,17 +594,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # for their future capacity before KV-cache profiling, otherwise the
         # pool can consume the VRAM needed by the first long prefill request.
         self.mxfp4_layerwise_prefill_reservation_bytes = 0
-        if (
-            (server_args.kt_method or "").upper() == "MXFP4"
-            and (server_args.kt_gpu_prefill_token_threshold or 0) > 0
-        ):
-            from sglang.srt.layers.moe.kt_ep_wrapper import (
-                get_mxfp4_layerwise_prefill_reservation_bytes,
-            )
+        if (server_args.kt_gpu_prefill_token_threshold or 0) > 0:
+            if (server_args.kt_method or "").upper() == "MXFP4":
+                from sglang.srt.layers.moe.kt_ep_wrapper import (
+                    get_mxfp4_layerwise_prefill_reservation_bytes,
+                )
 
-            self.mxfp4_layerwise_prefill_reservation_bytes = (
-                get_mxfp4_layerwise_prefill_reservation_bytes()
-            )
+                self.mxfp4_layerwise_prefill_reservation_bytes = (
+                    get_mxfp4_layerwise_prefill_reservation_bytes()
+                )
+            else:
+                # Every other method takes the generic full-GPU path, whose
+                # single shared slot was never accounted for: the KV cache
+                # took the card and the first qualifying prefill died with
+                # CUDA OOM inside SharedFullContext._build_layers.
+                from sglang.srt.layers.moe.kt_ep_wrapper import (
+                    get_full_gpu_prefill_reservation_bytes,
+                )
+
+                self.mxfp4_layerwise_prefill_reservation_bytes = (
+                    get_full_gpu_prefill_reservation_bytes()
+                )
 
         # Init memory pool and attention backends
         self.init_memory_pool()
